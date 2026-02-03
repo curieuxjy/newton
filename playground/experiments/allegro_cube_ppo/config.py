@@ -1,4 +1,7 @@
-"""Hyperparameters for Allegro Hand Cube Rotation PPO training."""
+"""Hyperparameters for Allegro Hand Cube Rotation PPO training.
+
+Reference: IsaacLab DextrEme / Allegro Hand environments
+"""
 
 from dataclasses import dataclass, field
 
@@ -8,30 +11,45 @@ class EnvConfig:
     """Environment configuration."""
 
     num_envs: int = 4096
-    episode_length: int = 600  # 12 seconds at 50Hz
+    episode_length: int = 400  # 8 seconds at 50Hz (matching IsaacLab)
 
-    # Simulation
-    fps: int = 50
-    sim_substeps: int = 4
-    control_decimation: int = 2  # control at 25Hz
+    # Simulation (IsaacLab uses 1/120s timestep with decimation 4)
+    fps: int = 60
+    sim_substeps: int = 2
+    control_decimation: int = 2  # control at 30Hz
 
-    # Robot (matching original allegro example)
-    hand_stiffness: float = 150.0
-    hand_damping: float = 5.0
+    # Robot
+    hand_stiffness: float = 40.0  # Lower for more compliant motion
+    hand_damping: float = 2.0
+
+    # Action
+    action_scale: float = 0.3  # Scale from [-1,1] to joint space
 
     # Cube
     cube_size: float = 0.065  # 6.5cm cube
     cube_mass: float = 0.1  # 100g
 
-    # Reward weights
-    reward_rotation: float = 1.0
-    reward_fingertip: float = 0.5
-    reward_action_penalty: float = 0.02
-    reward_action_rate_penalty: float = 0.01
+    # Reward weights (matching IsaacLab style)
+    reward_dist_scale: float = -10.0  # Distance to target (negative = penalty)
+    reward_rot_scale: float = 1.0  # Rotation alignment
+    reward_rot_eps: float = 0.1  # Rotation reward shaping epsilon
+    reward_action_penalty: float = 0.0002  # Very small (IsaacLab uses 0.0002)
+    reward_action_rate_penalty: float = 0.0001
+    reward_success_bonus: float = 250.0  # Bonus for reaching goal
+    reward_fall_penalty: float = -50.0  # Penalty if cube falls
+    reward_fingertip_scale: float = 0.5  # Fingertips near cube
+
+    # Success/Failure thresholds
+    success_tolerance: float = 0.2  # Quaternion distance threshold
+    fall_height: float = 0.05  # Cube fall threshold (m)
 
     # Goal
     goal_rotation_axis: tuple = (0.0, 0.0, 1.0)  # rotate around z-axis
-    goal_rotation_speed: float = 1.0  # rad/s
+    goal_rotation_speed: float = 0.5  # rad/s (slower for learning)
+
+    # Domain randomization (optional)
+    randomize_cube_mass: bool = False
+    randomize_friction: bool = False
 
 
 @dataclass
@@ -51,10 +69,10 @@ class PPOConfig:
     num_epochs: int = 5
     num_minibatches: int = 4
     total_timesteps: int = 100_000_000
-    rollout_steps: int = 16
+    rollout_steps: int = 24  # Longer rollouts for dexterous tasks
 
-    # Network
-    hidden_dims: tuple = (256, 256, 128)
+    # Network (larger for complex task)
+    hidden_dims: tuple = (512, 256, 128)
     activation: str = "elu"
 
 
@@ -64,11 +82,11 @@ class WandbConfig:
 
     enabled: bool = True
     project: str = "allegro-cube-ppo"
-    entity: str | None = None  # Your wandb username or team
+    entity: str | None = None
     group: str | None = None
-    tags: list[str] = field(default_factory=lambda: ["ppo", "allegro", "newton"])
-    mode: str = "online"  # "online", "offline", or "disabled"
-    save_model: bool = True  # Save model artifacts to wandb
+    tags: list[str] = field(default_factory=lambda: ["ppo", "allegro", "newton", "dextreme"])
+    mode: str = "online"
+    save_model: bool = True
 
 
 @dataclass

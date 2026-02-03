@@ -18,26 +18,36 @@ allegro_cube_ppo/
 
 ## 환경 설명
 
-### Observation (43 dims)
+IsaacLab DextrEme 환경을 참고하여 설계되었습니다.
+
+### Observation (49 dims)
 | 항목 | 차원 | 설명 |
 |------|------|------|
-| Joint positions | 16 | 손가락 관절 위치 |
-| Joint velocities | 16 | 손가락 관절 속도 |
+| Joint positions (normalized) | 16 | 손가락 관절 위치 |
+| Joint velocities (×0.2) | 16 | 손가락 관절 속도 |
 | Cube relative position | 3 | 손바닥 기준 큐브 위치 |
 | Cube orientation | 4 | 큐브 쿼터니언 |
+| Cube linear velocity (×0.2) | 3 | 큐브 선속도 |
+| Cube angular velocity (×0.2) | 3 | 큐브 각속도 |
 | Goal orientation | 4 | 목표 쿼터니언 |
 
 ### Action (16 dims)
-- 16개 손가락 관절의 position target (PD control)
-- 범위: [-1, 1] → joint limits로 스케일링
+- **Delta position control**: 현재 위치에서의 변화량
+- 범위: [-1, 1] × action_scale (0.3) → joint limits로 클램핑
+- 더 부드러운 움직임을 위한 delta action 방식
 
-### Reward
-- **Rotation alignment**: 큐브와 목표 회전의 쿼터니언 거리
-- **Action penalty**: 액션 크기 페널티
-- **Action rate penalty**: 액션 변화율 페널티
+### Reward (IsaacLab 스타일)
+| 항목 | 가중치 | 설명 |
+|------|--------|------|
+| Rotation reward | 1.0 / (quat_dist + 0.1) | 쿼터니언 정렬 보상 |
+| Distance penalty | -10.0 × dist | 큐브가 손에서 멀어지면 페널티 |
+| Action penalty | -0.0002 × ||a||² | 매우 작은 액션 페널티 |
+| Action rate penalty | -0.0001 × ||Δa||² | 액션 변화율 페널티 |
+| Success bonus | +250 / episode_len | 목표 도달 시 보너스 |
+| Fall penalty | -50 | 큐브 낙하 시 페널티 |
 
 ### Termination
-- Episode timeout (기본 600 steps = 12초)
+- Episode timeout (기본 400 steps = 8초 @ 50Hz)
 - 큐브 낙하 (z < 0.05m)
 
 ## 실행 방법
@@ -125,12 +135,19 @@ uv run --extra examples --extra torch-cu12 python -m playground.experiments.alle
 ### EnvConfig (config.py)
 ```python
 num_envs: int = 4096
-episode_length: int = 600      # 12초 @ 50Hz
-fps: int = 50
-sim_substeps: int = 4
-control_decimation: int = 2    # 25Hz 제어
-hand_stiffness: float = 150.0
-hand_damping: float = 5.0
+episode_length: int = 400      # 8초 @ 50Hz (IsaacLab 스타일)
+fps: int = 60
+sim_substeps: int = 2
+control_decimation: int = 2    # 30Hz 제어
+hand_stiffness: float = 40.0   # 낮은 강성 (더 유연한 움직임)
+hand_damping: float = 2.0
+action_scale: float = 0.3      # Delta action 스케일
+
+# Reward weights (IsaacLab 스타일)
+reward_dist_scale: float = -10.0
+reward_rot_scale: float = 1.0
+reward_action_penalty: float = 0.0002  # 매우 작음!
+reward_success_bonus: float = 250.0
 ```
 
 ### PPOConfig (config.py)
@@ -142,8 +159,8 @@ clip_epsilon: float = 0.2
 entropy_coef: float = 0.01
 num_epochs: int = 5
 num_minibatches: int = 4
-rollout_steps: int = 16
-hidden_dims: tuple = (256, 256, 128)
+rollout_steps: int = 24        # 긴 rollout
+hidden_dims: tuple = (512, 256, 128)  # 더 큰 네트워크
 ```
 
 ## 체크포인트 구조
@@ -162,3 +179,9 @@ hidden_dims: tuple = (256, 256, 128)
 - [ ] Asymmetric actor-critic (privileged info)
 - [ ] 다른 오브젝트 (구, 실린더 등)
 - [ ] Right hand 버전
+
+## 참고 자료
+
+- [IsaacLab Allegro Hand Environment](https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab_tasks/isaaclab_tasks/direct/allegro_hand/allegro_hand_env_cfg.py)
+- [IsaacGymEnvs DextrEme](https://github.com/NVIDIA-Omniverse/IsaacGymEnvs/blob/main/docs/rl_examples.md)
+- [Newton Examples](https://github.com/nvidia-warp/newton/tree/main/newton/examples)
