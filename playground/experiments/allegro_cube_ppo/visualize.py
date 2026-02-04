@@ -435,7 +435,7 @@ def main():
     parser = newton.examples.create_parser()
     parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained checkpoint")
     parser.add_argument("--num-envs", type=int, default=4, help="Number of environments to visualize")
-    parser.add_argument("--show-collision", action="store_true", default=True, help="Show collision shapes")
+    parser.add_argument("--show-collision", action="store_true", default=False, help="Show collision shapes")
     parser.add_argument("--hide-collision", action="store_false", dest="show_collision", help="Hide collision shapes")
 
     viewer, args = newton.examples.init(parser)

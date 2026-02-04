@@ -21,6 +21,7 @@ allegro_cube_ppo/
 **목표**: Allegro Hand로 큐브를 잡고 목표 방향(quaternion)으로 회전시키기
 
 ### Observation (49 dims)
+
 | 항목 | 차원 | 설명 |
 |------|------|------|
 | Joint positions (normalized) | 16 | 손가락 관절 위치 [-1, 1] |
@@ -32,6 +33,7 @@ allegro_cube_ppo/
 | Goal orientation | 4 | 목표 쿼터니언 |
 
 ### Action (16 dims)
+
 - **Delta position control**: 현재 위치에서의 변화량
 - 범위: [-1, 1] × action_scale (0.5)
 - joint limits로 클램핑
@@ -53,17 +55,20 @@ reward = rot_reward + dist_penalty - action_penalty - action_delta_penalty - vel
 | **Fall penalty** | `-50` | 큐브 낙하/이탈 시 |
 
 **Rotation distance (DextrEme 방식)**:
+
 ```python
 q_diff = q_cube × conjugate(q_goal)
 rot_dist = 2 × arcsin(||q_diff.xyz||)  # radians
 ```
 
 ### Success Condition
+
 - Rotation distance < `success_tolerance` (0.4 rad ≈ 23°)
 - `consecutive_successes` (5) 회 연속 유지
 - 성공 시 새로운 랜덤 목표 생성
 
 ### Termination
+
 - Episode timeout (400 steps = 8초)
 - 큐브 낙하 (z < 0.05m)
 - 큐브 이탈 (dist > 0.3m)
@@ -76,9 +81,8 @@ rot_dist = 2 × arcsin(||q_diff.xyz||)  # radians
 # 랜덤 액션으로 시뮬레이터 확인
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.visualize --num-envs 4
 
-# Collision 표시/숨기기
+# Collision shapes 표시 (기본: 숨김)
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.visualize --show-collision
-uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.visualize --hide-collision
 
 # 학습된 정책으로 시각화
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.visualize \
@@ -86,6 +90,7 @@ uv run --extra examples --extra torch-cu12 python -m playground.experiments.alle
 ```
 
 **Orientation Frame Visualization**:
+
 - 큐브의 현재 orientation을 3축 좌표계(RGB = XYZ)로 표시합니다
 - 목표 orientation도 동일한 방식으로 각 환경 위에 표시됩니다
 - 실제 큐브가 goal orientation에 5회 연속 도달하면 새로운 랜덤 목표가 생성됩니다
@@ -102,7 +107,6 @@ Newton의 viewer는 두 가지 방식으로 다중 환경을 배치합니다:
 1. **Physical Spacing** (`builder.replicate()`의 `spacing` 파라미터)
    - 시뮬레이션 내 실제 물리적 위치 오프셋
    - `body_q` 등 상태 배열에 이미 반영됨
-
 2. **Visual World Offset** (`viewer.set_world_offsets()`)
    - 렌더링 시에만 적용되는 시각적 오프셋
    - `set_model()` 호출 시 자동으로 계산됨
@@ -160,7 +164,6 @@ viewer.log_lines("/my_lines", adjusted_starts, adjusted_ends, colors)
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.train \
     --num-envs 4096 \
     --total-timesteps 100000000 \
-    --no-wandb
 
 # 빠른 테스트
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.train \
@@ -178,12 +181,13 @@ tensorboard --logdir runs/
 # Wandb
 pip install wandb && wandb login
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.train \
-    --wandb-project allegro-cube-ppo
+    --wandb-project newton-allegro-cube
 ```
 
 ## 하이퍼파라미터
 
 ### EnvConfig
+
 ```python
 # Simulation
 fps: int = 60
@@ -211,6 +215,7 @@ fall_penalty: float = -50.0
 ```
 
 ### PPOConfig
+
 ```python
 learning_rate: float = 3e-4
 gamma: float = 0.99

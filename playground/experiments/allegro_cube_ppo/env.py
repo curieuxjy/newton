@@ -77,6 +77,9 @@ class AllegroHandCubeEnv:
         self.successes = torch.zeros(self.num_envs, dtype=torch.int32, device=self.torch_device)
         self.consecutive_successes = torch.zeros(self.num_envs, dtype=torch.int32, device=self.torch_device)
 
+        # Reward components for logging
+        self.reward_components: dict[str, float] = {}
+
         # Initial state storage
         self._store_initial_state()
 
@@ -104,7 +107,8 @@ class AllegroHandCubeEnv:
             ignore_paths=[".*Dummy", ".*CollisionPlane", ".*goal"],
         )
 
-        self.num_hand_dofs = hand_builder.joint_dof_count
+        self.num_hand_dofs = hand_builder.joint_dof_count  # for joint_qd
+        self.num_hand_q = hand_builder.joint_count  # for joint_q (may differ due to quaternion joints)
         self.num_hand_bodies = hand_builder.body_count
 
         # Set joint control parameters
@@ -114,13 +118,20 @@ class AllegroHandCubeEnv:
             hand_builder.joint_target_pos[i] = 0.0
             hand_builder.joint_act_mode[i] = int(ActuatorMode.POSITION)
 
-        # Store joint limits
+        # Store joint limits for actuated joints
+        # Actuated revolute joints are at indices 2-5, 6-9, 11-14, 16-19
+        actuated_joint_indices = [2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19]
         self.joint_lower = torch.tensor(
-            hand_builder.joint_limit_lower[6:22], dtype=torch.float32, device=self.torch_device
+            [hand_builder.joint_limit_lower[i] for i in actuated_joint_indices],
+            dtype=torch.float32, device=self.torch_device
         )
         self.joint_upper = torch.tensor(
-            hand_builder.joint_limit_upper[6:22], dtype=torch.float32, device=self.torch_device
+            [hand_builder.joint_limit_upper[i] for i in actuated_joint_indices],
+            dtype=torch.float32, device=self.torch_device
         )
+        # Clamp extreme values (thumb joints have unlimited range in USD)
+        self.joint_lower = torch.clamp(self.joint_lower, min=-3.14)
+        self.joint_upper = torch.clamp(self.joint_upper, max=3.14)
 
         # Compute joint range for normalization
         self.joint_range = self.joint_upper - self.joint_lower
@@ -155,8 +166,13 @@ class AllegroHandCubeEnv:
         self.control = self.model.control()
         self.contacts = self.model.collide(self.state_0)
 
+        # Calculate actual sizes per environment from state arrays
+        self.joint_q_per_env = self.state_0.joint_q.shape[0] // self.num_envs
+        self.joint_qd_per_env = self.state_0.joint_qd.shape[0] // self.num_envs
+
         self.cube_body_offset = self.num_hand_bodies - 1
-        self.hand_joint_offset = 6
+        # Actuated DOFs start at index 0 in joint_qd (first 16 DOFs are actuated revolute joints)
+        self.hand_joint_offset = 0
 
     def _store_initial_state(self):
         """Store initial state for resetting environments."""
@@ -164,12 +180,12 @@ class AllegroHandCubeEnv:
         self.initial_joint_qd = wp.clone(self.state_0.joint_qd)
         newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
 
-        # Initialize current targets to initial joint positions
-        joint_q_np = self.initial_joint_q.numpy()
-        for i in range(self.num_envs):
-            start = i * self.num_hand_dofs + self.hand_joint_offset
-            end = start + self.num_actions
-            self.current_targets[i] = torch.from_numpy(joint_q_np[start:end]).to(self.torch_device)
+        # Initialize current targets to initial joint positions (vectorized)
+        # Use joint_qd for DOF-based indexing (positions are in joint_q but same DOF indexing)
+        joint_qd_np = self.initial_joint_qd.numpy().reshape(self.num_envs, self.joint_qd_per_env)
+        actuated_joints = joint_qd_np[:, self.hand_joint_offset:self.hand_joint_offset + self.num_actions]
+        # Use zeros as initial targets (matching initial joint positions)
+        self.current_targets = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float32, device=self.torch_device)
 
     def _simulate_step(self):
         """Run one frame of simulation."""
@@ -196,7 +212,7 @@ class AllegroHandCubeEnv:
         return q
 
     def reset(self, env_ids: torch.Tensor | None = None) -> torch.Tensor:
-        """Reset specified environments."""
+        """Reset specified environments (vectorized)."""
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.torch_device)
 
@@ -204,27 +220,34 @@ class AllegroHandCubeEnv:
         if num_reset == 0:
             return self._compute_observations()
 
+        env_ids_np = env_ids.cpu().numpy()
+
         # Reset episode counters
         self.episode_step[env_ids] = 0
         self.successes[env_ids] = 0
         self.consecutive_successes[env_ids] = 0
 
-        # Reset joint states with small noise
+        # Reset joint states with small noise (vectorized)
         joint_q_np = self.state_0.joint_q.numpy()
         joint_qd_np = self.state_0.joint_qd.numpy()
         initial_q_np = self.initial_joint_q.numpy()
         initial_qd_np = self.initial_joint_qd.numpy()
 
-        dofs_per_env = self.num_hand_dofs
-        for idx in env_ids.cpu().numpy():
-            start = idx * dofs_per_env
-            end = start + dofs_per_env
-            noise = np.random.uniform(-0.1, 0.1, size=dofs_per_env) * 0.1
-            joint_q_np[start:end] = initial_q_np[start:end] + noise
-            joint_qd_np[start:end] = initial_qd_np[start:end]
+        # Generate noise for actuated joints only
+        noise_q = np.random.uniform(-0.01, 0.01, size=(num_reset, self.joint_q_per_env)).astype(np.float32)
+        noise_qd = np.zeros((num_reset, self.joint_qd_per_env), dtype=np.float32)
 
-        self.state_0.joint_q = wp.array(joint_q_np, dtype=wp.float32, device=self.device)
-        self.state_0.joint_qd = wp.array(joint_qd_np, dtype=wp.float32, device=self.device)
+        # Vectorized reset using reshape
+        joint_q_reshaped = joint_q_np.reshape(self.num_envs, self.joint_q_per_env)
+        joint_qd_reshaped = joint_qd_np.reshape(self.num_envs, self.joint_qd_per_env)
+        initial_q_reshaped = initial_q_np.reshape(self.num_envs, self.joint_q_per_env)
+        initial_qd_reshaped = initial_qd_np.reshape(self.num_envs, self.joint_qd_per_env)
+
+        joint_q_reshaped[env_ids_np] = initial_q_reshaped[env_ids_np] + noise_q
+        joint_qd_reshaped[env_ids_np] = initial_qd_reshaped[env_ids_np] + noise_qd
+
+        self.state_0.joint_q = wp.array(joint_q_reshaped.flatten(), dtype=wp.float32, device=self.device)
+        self.state_0.joint_qd = wp.array(joint_qd_reshaped.flatten(), dtype=wp.float32, device=self.device)
 
         # Recompute FK
         newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
@@ -244,11 +267,10 @@ class AllegroHandCubeEnv:
         self.prev_actions[env_ids] = 0.0
         self.actions[env_ids] = 0.0
 
-        # Reset current targets
-        for idx in env_ids.cpu().numpy():
-            start = idx * self.num_hand_dofs + self.hand_joint_offset
-            end = start + self.num_actions
-            self.current_targets[idx] = torch.from_numpy(joint_q_np[start:end]).to(self.torch_device)
+        # Reset current targets (vectorized) - use joint_q for positions
+        joint_q_reshaped = self.state_0.joint_q.numpy().reshape(self.num_envs, self.joint_q_per_env)
+        actuated_joints = joint_q_reshaped[env_ids_np, self.hand_joint_offset:self.hand_joint_offset + self.num_actions]
+        self.current_targets[env_ids] = torch.from_numpy(actuated_joints.copy()).to(self.torch_device)
 
         return self._compute_observations()
 
@@ -296,18 +318,21 @@ class AllegroHandCubeEnv:
         return obs, rewards, dones, self.info_buf
 
     def _apply_actions(self, target_pos: torch.Tensor):
-        """Apply joint position targets to control buffer."""
+        """Apply joint position targets to control buffer (vectorized)."""
         control_np = self.control.joint_target_pos.numpy()
+        target_np = target_pos.cpu().numpy()
 
-        for i in range(self.num_envs):
-            start = i * self.num_hand_dofs + self.hand_joint_offset
-            end = start + self.num_actions
-            control_np[start:end] = target_pos[i].cpu().numpy()
+        # Vectorized assignment - control uses DOF indexing (joint_qd_per_env)
+        env_indices = np.arange(self.num_envs)
+        starts = env_indices * self.joint_qd_per_env + self.hand_joint_offset
+
+        for j in range(self.num_actions):
+            control_np[starts + j] = target_np[:, j]
 
         self.control.joint_target_pos = wp.array(control_np, dtype=wp.float32, device=self.device)
 
     def _compute_observations(self) -> torch.Tensor:
-        """Compute observations for all environments."""
+        """Compute observations for all environments (vectorized)."""
         joint_q = torch.from_numpy(self.state_0.joint_q.numpy()).to(self.torch_device)
         joint_qd = torch.from_numpy(self.state_0.joint_qd.numpy()).to(self.torch_device)
         body_q = torch.from_numpy(self.state_0.body_q.numpy()).to(self.torch_device)
@@ -316,35 +341,42 @@ class AllegroHandCubeEnv:
         # Clamp velocities
         joint_qd = torch.clamp(joint_qd, -50.0, 50.0)
 
-        for i in range(self.num_envs):
-            q_start = i * self.num_hand_dofs + self.hand_joint_offset
-            q_end = q_start + self.num_actions
+        # Reshape joint data with correct sizes per env
+        # joint_q has extra elements due to quaternion representation (23 per env)
+        # joint_qd has DOF count (22 per env)
+        joint_q_reshaped = joint_q.reshape(self.num_envs, self.joint_q_per_env)
+        joint_qd_reshaped = joint_qd.reshape(self.num_envs, self.joint_qd_per_env)
 
-            # Joint positions (normalized to [-1, 1])
-            joint_pos = joint_q[q_start:q_end]
-            self.obs_buf[i, 0:16] = (joint_pos - self.joint_mid) / (self.joint_range / 2 + 1e-6)
+        # Extract actuated joints (indices 0:16 for actuated DOFs)
+        joint_pos = joint_q_reshaped[:, self.hand_joint_offset:self.hand_joint_offset + self.num_actions]
+        joint_vel = joint_qd_reshaped[:, self.hand_joint_offset:self.hand_joint_offset + self.num_actions]
 
-            # Joint velocities (scaled by 0.2)
-            self.obs_buf[i, 16:32] = joint_qd[q_start:q_end] * 0.2
+        # Joint positions (normalized to [-1, 1])
+        self.obs_buf[:, 0:16] = (joint_pos - self.joint_mid) / (self.joint_range / 2 + 1e-6)
 
-            # Cube state
-            cube_idx = i * self.num_hand_bodies + self.cube_body_offset
-            hand_idx = i * self.num_hand_bodies
+        # Joint velocities (scaled by 0.2)
+        self.obs_buf[:, 16:32] = joint_vel * 0.2
 
-            # Cube position relative to hand
-            cube_pos = body_q[cube_idx, :3]
-            hand_pos = body_q[hand_idx, :3]
-            self.obs_buf[i, 32:35] = cube_pos - hand_pos
+        # Reshape body data: (num_envs, num_hand_bodies, 7) for body_q
+        body_q_reshaped = body_q.reshape(self.num_envs, self.num_hand_bodies, 7)
+        body_qd_reshaped = body_qd.reshape(self.num_envs, self.num_hand_bodies, 6)
 
-            # Cube orientation (x, y, z, w)
-            self.obs_buf[i, 35:39] = body_q[cube_idx, 3:7]
+        # Cube and hand positions
+        cube_pos = body_q_reshaped[:, self.cube_body_offset, :3]
+        hand_pos = body_q_reshaped[:, 0, :3]
 
-            # Cube velocities (scaled)
-            self.obs_buf[i, 39:42] = body_qd[cube_idx, :3] * 0.2
-            self.obs_buf[i, 42:45] = body_qd[cube_idx, 3:6] * 0.2
+        # Cube position relative to hand
+        self.obs_buf[:, 32:35] = cube_pos - hand_pos
 
-            # Goal orientation
-            self.obs_buf[i, 45:49] = self.goal_quat[i]
+        # Cube orientation (x, y, z, w)
+        self.obs_buf[:, 35:39] = body_q_reshaped[:, self.cube_body_offset, 3:7]
+
+        # Cube velocities (scaled)
+        self.obs_buf[:, 39:42] = body_qd_reshaped[:, self.cube_body_offset, :3] * 0.2
+        self.obs_buf[:, 42:45] = body_qd_reshaped[:, self.cube_body_offset, 3:6] * 0.2
+
+        # Goal orientation
+        self.obs_buf[:, 45:49] = self.goal_quat
 
         # Handle NaN
         self.obs_buf = torch.nan_to_num(self.obs_buf, nan=0.0, posinf=5.0, neginf=-5.0)
@@ -383,91 +415,104 @@ class AllegroHandCubeEnv:
         return 2.0 * torch.asin(xyz_norm)
 
     def _compute_rewards(self) -> torch.Tensor:
-        """Compute rewards (DextrEme style)."""
+        """Compute rewards (DextrEme style, vectorized)."""
         body_q = torch.from_numpy(self.state_0.body_q.numpy()).to(self.torch_device)
         joint_qd = torch.from_numpy(self.state_0.joint_qd.numpy()).to(self.torch_device)
 
-        for i in range(self.num_envs):
-            cube_idx = i * self.num_hand_bodies + self.cube_body_offset
-            hand_idx = i * self.num_hand_bodies
+        # Reshape for vectorized access
+        body_q_reshaped = body_q.reshape(self.num_envs, self.num_hand_bodies, 7)
+        joint_qd_reshaped = joint_qd.reshape(self.num_envs, self.joint_qd_per_env)
 
-            # Get cube and hand states
-            cube_quat = body_q[cube_idx, 3:7]  # x, y, z, w
-            cube_pos = body_q[cube_idx, :3]
-            hand_pos = body_q[hand_idx, :3]
+        # Get cube and hand states (all envs at once)
+        cube_quat = body_q_reshaped[:, self.cube_body_offset, 3:7]  # (num_envs, 4)
+        cube_pos = body_q_reshaped[:, self.cube_body_offset, :3]   # (num_envs, 3)
+        hand_pos = body_q_reshaped[:, 0, :3]                        # (num_envs, 3)
 
-            # 1. Rotation reward: 1 / (rot_dist + eps) * scale
-            rot_dist = self._rotation_distance(cube_quat.unsqueeze(0), self.goal_quat[i].unsqueeze(0)).squeeze()
-            rot_reward = self.config.rot_reward_scale / (rot_dist + self.config.rot_eps)
+        # 1. Rotation reward: 1 / (rot_dist + eps) * scale
+        rot_dist = self._rotation_distance(cube_quat, self.goal_quat)  # (num_envs,)
+        rot_reward = self.config.rot_reward_scale / (rot_dist + self.config.rot_eps)
 
-            # 2. Distance penalty (cube too far from hand)
-            dist = torch.norm(cube_pos - hand_pos)
-            dist_penalty = self.config.dist_reward_scale * dist
+        # 2. Distance penalty (cube too far from hand)
+        dist = torch.norm(cube_pos - hand_pos, dim=-1)  # (num_envs,)
+        dist_penalty = self.config.dist_reward_scale * dist
 
-            # 3. Action penalty
-            action_penalty = self.config.action_penalty_scale * torch.sum(self.actions[i] ** 2)
+        # 3. Action penalty
+        action_penalty = self.config.action_penalty_scale * torch.sum(self.actions ** 2, dim=-1)
 
-            # 4. Action delta penalty
-            action_delta = self.actions[i] - self.prev_actions[i]
-            action_delta_penalty = self.config.action_delta_penalty_scale * torch.sum(action_delta ** 2)
+        # 4. Action delta penalty
+        action_delta = self.actions - self.prev_actions
+        action_delta_penalty = self.config.action_delta_penalty_scale * torch.sum(action_delta ** 2, dim=-1)
 
-            # 5. Velocity penalty (DextrEme: -0.05 * sum((dof_vel/4)^2))
-            q_start = i * self.num_hand_dofs + self.hand_joint_offset
-            q_end = q_start + self.num_actions
-            dof_vel = joint_qd[q_start:q_end]
-            vel_penalty = self.config.velocity_penalty_scale * torch.sum((dof_vel / self.config.velocity_norm) ** 2)
+        # 5. Velocity penalty
+        dof_vel = joint_qd_reshaped[:, self.hand_joint_offset:self.hand_joint_offset + self.num_actions]
+        vel_penalty = self.config.velocity_penalty_scale * torch.sum((dof_vel / self.config.velocity_norm) ** 2, dim=-1)
 
-            # 6. Success bonus (consecutive successes)
-            success_bonus = 0.0
-            if rot_dist < self.config.success_tolerance:
-                self.consecutive_successes[i] += 1
-                if self.consecutive_successes[i] >= self.config.consecutive_successes:
-                    success_bonus = self.config.reach_goal_bonus
-                    self.successes[i] += 1
-                    # Generate new goal after success
-                    if self.config.randomize_goal:
-                        self.goal_quat[i] = self._random_quaternion(1).squeeze()
-                    self.consecutive_successes[i] = 0
-            else:
-                self.consecutive_successes[i] = 0
+        # 6. Success tracking (vectorized)
+        is_success = rot_dist < self.config.success_tolerance
+        self.consecutive_successes = torch.where(is_success, self.consecutive_successes + 1, torch.zeros_like(self.consecutive_successes))
 
-            # 7. Fall penalty
-            fall_penalty = 0.0
-            if dist > self.config.fall_dist or cube_pos[2] < 0.05:
-                fall_penalty = self.config.fall_penalty
+        # Check for goal reached (consecutive successes threshold)
+        goal_reached = self.consecutive_successes >= self.config.consecutive_successes
+        success_bonus = torch.where(goal_reached, torch.full_like(rot_reward, self.config.reach_goal_bonus), torch.zeros_like(rot_reward))
+        self.successes = torch.where(goal_reached, self.successes + 1, self.successes)
 
-            # Total reward
-            self.reward_buf[i] = (
-                rot_reward
-                + dist_penalty
-                - action_penalty
-                - action_delta_penalty
-                - vel_penalty
-                + success_bonus
-                + fall_penalty
-            )
+        # Generate new goals for successful envs
+        if goal_reached.any() and self.config.randomize_goal:
+            num_reached = goal_reached.sum().item()
+            new_goals = self._random_quaternion(int(num_reached))
+            self.goal_quat[goal_reached] = new_goals
+
+        # Reset consecutive successes for goal reached envs
+        self.consecutive_successes = torch.where(goal_reached, torch.zeros_like(self.consecutive_successes), self.consecutive_successes)
+
+        # 7. Fall penalty
+        cube_fell = cube_pos[:, 2] < 0.05
+        cube_far = dist > self.config.fall_dist
+        fall_penalty = torch.where(cube_fell | cube_far, torch.full_like(rot_reward, self.config.fall_penalty), torch.zeros_like(rot_reward))
+
+        # Total reward
+        self.reward_buf = (
+            rot_reward
+            + dist_penalty
+            - action_penalty
+            - action_delta_penalty
+            - vel_penalty
+            + success_bonus
+            + fall_penalty
+        )
+
+        # Store individual reward components for logging
+        self.reward_components = {
+            "rot_reward": rot_reward.mean().item(),
+            "dist_penalty": dist_penalty.mean().item(),
+            "action_penalty": -action_penalty.mean().item(),
+            "action_delta_penalty": -action_delta_penalty.mean().item(),
+            "vel_penalty": -vel_penalty.mean().item(),
+            "success_bonus": success_bonus.mean().item(),
+            "fall_penalty": fall_penalty.mean().item(),
+            "rot_dist": rot_dist.mean().item(),
+            "cube_dist": dist.mean().item(),
+        }
 
         return self.reward_buf
 
     def _compute_dones(self) -> torch.Tensor:
-        """Check termination conditions."""
+        """Check termination conditions (vectorized)."""
         body_q = torch.from_numpy(self.state_0.body_q.numpy()).to(self.torch_device)
 
-        for i in range(self.num_envs):
-            timeout = self.episode_step[i] >= self.max_episode_length
+        # Reshape for vectorized access
+        body_q_reshaped = body_q.reshape(self.num_envs, self.num_hand_bodies, 7)
 
-            cube_idx = i * self.num_hand_bodies + self.cube_body_offset
-            hand_idx = i * self.num_hand_bodies
+        cube_pos = body_q_reshaped[:, self.cube_body_offset, :3]
+        hand_pos = body_q_reshaped[:, 0, :3]
+        dist = torch.norm(cube_pos - hand_pos, dim=-1)
 
-            cube_pos = body_q[cube_idx, :3]
-            hand_pos = body_q[hand_idx, :3]
-            dist = torch.norm(cube_pos - hand_pos)
+        # Termination conditions
+        timeout = self.episode_step >= self.max_episode_length
+        cube_fell = cube_pos[:, 2] < 0.05
+        cube_far = dist > self.config.fall_dist
 
-            # Fail if cube falls or goes too far
-            cube_fell = cube_pos[2] < 0.05
-            cube_far = dist > self.config.fall_dist
-
-            self.done_buf[i] = timeout or cube_fell or cube_far
+        self.done_buf = timeout | cube_fell | cube_far
 
         return self.done_buf
 

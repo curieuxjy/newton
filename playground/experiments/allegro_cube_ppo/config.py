@@ -91,7 +91,7 @@ class WandbConfig:
     """Weights & Biases configuration."""
 
     enabled: bool = True
-    project: str = "allegro-cube-ppo"
+    project: str = "newton-allegro-cube"
     entity: str | None = None
     group: str | None = None
     tags: list[str] = field(default_factory=lambda: ["ppo", "allegro", "newton", "dextreme"])

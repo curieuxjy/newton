@@ -154,6 +154,10 @@ def train(config: TrainConfig):
     print("[INFO] Starting training...")
     print("-" * 60)
 
+    # Reward component tracking
+    reward_component_sums = {}
+    reward_component_counts = 0
+
     for update in range(1, num_updates + 1):
         update_start = time.time()
 
@@ -169,6 +173,14 @@ def train(config: TrainConfig):
 
             # Store in buffer
             buffer.add(obs, action, log_prob, reward, done, value)
+
+            # Track reward components
+            if hasattr(env, "reward_components"):
+                for key, val in env.reward_components.items():
+                    if key not in reward_component_sums:
+                        reward_component_sums[key] = 0.0
+                    reward_component_sums[key] += val
+                reward_component_counts += 1
 
             # Track episode metrics
             episode_rewards += reward
@@ -212,6 +224,25 @@ def train(config: TrainConfig):
                 f"Ent {metrics['entropy']:6.3f}"
             )
 
+            # Compute average reward components
+            avg_reward_components = {}
+            if reward_component_counts > 0:
+                for key, val in reward_component_sums.items():
+                    avg_reward_components[key] = val / reward_component_counts
+
+            # Print reward components
+            if avg_reward_components:
+                rc = avg_reward_components
+                print(
+                    f"  Rewards: rot={rc.get('rot_reward', 0):.2f} "
+                    f"dist={rc.get('dist_penalty', 0):.2f} "
+                    f"act={rc.get('action_penalty', 0):.3f} "
+                    f"vel={rc.get('vel_penalty', 0):.3f} "
+                    f"fall={rc.get('fall_penalty', 0):.2f} "
+                    f"| rot_dist={rc.get('rot_dist', 0):.3f} "
+                    f"cube_dist={rc.get('cube_dist', 0):.3f}"
+                )
+
             # TensorBoard logging
             if writer:
                 writer.add_scalar("train/policy_loss", metrics["policy_loss"], global_step)
@@ -220,32 +251,40 @@ def train(config: TrainConfig):
                 writer.add_scalar("episode/reward_mean", avg_reward, global_step)
                 writer.add_scalar("episode/length_mean", avg_length, global_step)
                 writer.add_scalar("perf/fps", fps, global_step)
+                # Log reward components
+                for key, val in avg_reward_components.items():
+                    writer.add_scalar(f"reward/{key}", val, global_step)
 
             # Wandb logging
             if use_wandb:
-                wandb.log(
-                    {
-                        # Training metrics
-                        "train/policy_loss": metrics["policy_loss"],
-                        "train/value_loss": metrics["value_loss"],
-                        "train/entropy": metrics["entropy"],
-                        "train/total_loss": metrics["total_loss"],
-                        # Episode metrics
-                        "episode/reward_mean": avg_reward,
-                        "episode/length_mean": avg_length,
-                        "episode/completed": completed_episodes,
-                        # Performance
-                        "perf/fps": fps,
-                        "perf/global_step": global_step,
-                        "perf/update": update,
-                    },
-                    step=global_step,
-                )
+                log_dict = {
+                    # Training metrics
+                    "train/policy_loss": metrics["policy_loss"],
+                    "train/value_loss": metrics["value_loss"],
+                    "train/entropy": metrics["entropy"],
+                    "train/total_loss": metrics["total_loss"],
+                    # Episode metrics
+                    "episode/reward_mean": avg_reward,
+                    "episode/length_mean": avg_length,
+                    "episode/completed": completed_episodes,
+                    # Performance
+                    "perf/fps": fps,
+                    "perf/global_step": global_step,
+                    "perf/update": update,
+                }
+                # Add reward components
+                for key, val in avg_reward_components.items():
+                    log_dict[f"reward/{key}"] = val
+                wandb.log(log_dict, step=global_step)
 
             # Reset episode tracking
             completed_episodes = 0
             total_episode_reward = 0.0
             total_episode_length = 0
+
+            # Reset reward component tracking
+            reward_component_sums = {}
+            reward_component_counts = 0
 
         # Save checkpoint
         if update % config.save_interval == 0:
@@ -297,7 +336,7 @@ def main():
     # Wandb arguments
     parser.add_argument("--wandb", action="store_true", default=True, help="Enable wandb logging")
     parser.add_argument("--no-wandb", action="store_false", dest="wandb", help="Disable wandb logging")
-    parser.add_argument("--wandb-project", type=str, default="allegro-cube-ppo", help="Wandb project name")
+    parser.add_argument("--wandb-project", type=str, default="newton-allegro-cube", help="Wandb project name")
     parser.add_argument("--wandb-entity", type=str, default=None, help="Wandb entity (username or team)")
     parser.add_argument("--wandb-group", type=str, default=None, help="Wandb run group")
     args = parser.parse_args()
