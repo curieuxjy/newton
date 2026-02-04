@@ -1,6 +1,6 @@
 """Hyperparameters for Allegro Hand Cube Rotation PPO training.
 
-Reference: IsaacLab DextrEme / Allegro Hand environments
+Reference: IsaacGymEnvs DextrEme (allegro_hand_dextreme.py)
 """
 
 from dataclasses import dataclass, field
@@ -11,41 +11,51 @@ class EnvConfig:
     """Environment configuration."""
 
     num_envs: int = 4096
-    episode_length: int = 400  # 8 seconds at 50Hz (matching IsaacLab)
+    episode_length: int = 400  # 8 seconds at 50Hz
 
-    # Simulation (IsaacLab uses 1/120s timestep with decimation 4)
+    # Simulation
     fps: int = 60
     sim_substeps: int = 2
     control_decimation: int = 2  # control at 30Hz
 
     # Robot
-    hand_stiffness: float = 40.0  # Lower for more compliant motion
+    hand_stiffness: float = 40.0
     hand_damping: float = 2.0
 
-    # Action
-    action_scale: float = 0.3  # Scale from [-1,1] to joint space
+    # Action (DextrEme style)
+    action_scale: float = 0.5  # Larger for more movement
+    use_relative_control: bool = True  # Delta position control
 
     # Cube
-    cube_size: float = 0.065  # 6.5cm cube
-    cube_mass: float = 0.1  # 100g
+    cube_size: float = 0.065
+    cube_mass: float = 0.1
 
-    # Reward weights (matching IsaacLab style)
-    reward_dist_scale: float = -10.0  # Distance to target (negative = penalty)
-    reward_rot_scale: float = 1.0  # Rotation alignment
-    reward_rot_eps: float = 0.1  # Rotation reward shaping epsilon
-    reward_action_penalty: float = 0.0002  # Very small (IsaacLab uses 0.0002)
-    reward_action_rate_penalty: float = 0.0001
-    reward_success_bonus: float = 250.0  # Bonus for reaching goal
-    reward_fall_penalty: float = -50.0  # Penalty if cube falls
-    reward_fingertip_scale: float = 0.5  # Fingertips near cube
+    # Reward weights (DextrEme style)
+    # Rotation reward: 1 / (rot_dist + rot_eps) * rot_reward_scale
+    rot_reward_scale: float = 1.0
+    rot_eps: float = 0.1
 
-    # Success/Failure thresholds
-    success_tolerance: float = 0.2  # Quaternion distance threshold
-    fall_height: float = 0.05  # Cube fall threshold (m)
+    # Distance penalty (object too far from hand)
+    dist_reward_scale: float = -10.0
+
+    # Action penalties (very small in DextrEme)
+    action_penalty_scale: float = 0.0002
+    action_delta_penalty_scale: float = 0.0001
+
+    # Velocity penalty (DextrEme: -0.05 * sum((dof_vel/4)^2))
+    velocity_penalty_scale: float = 0.05
+    velocity_norm: float = 4.0
+
+    # Success/Failure
+    reach_goal_bonus: float = 250.0
+    fall_penalty: float = -50.0
+    success_tolerance: float = 0.4  # radians (~23 degrees)
+    consecutive_successes: int = 5  # Hold for N steps
+    fall_dist: float = 0.3  # meters
 
     # Goal
-    goal_rotation_axis: tuple = (0.0, 0.0, 1.0)  # rotate around z-axis
-    goal_rotation_speed: float = 0.5  # rad/s (slower for learning)
+    goal_rotation_speed: float = 0.0  # Static goal (DextrEme style)
+    randomize_goal: bool = True
 
     # Domain randomization (optional)
     randomize_cube_mass: bool = False
@@ -69,7 +79,7 @@ class PPOConfig:
     num_epochs: int = 5
     num_minibatches: int = 4
     total_timesteps: int = 100_000_000
-    rollout_steps: int = 24  # Longer rollouts for dexterous tasks
+    rollout_steps: int = 24
 
     # Network (larger for complex task)
     hidden_dims: tuple = (512, 256, 128)

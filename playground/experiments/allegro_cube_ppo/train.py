@@ -49,8 +49,8 @@ def init_wandb(config: TrainConfig, actor_critic: ActorCritic) -> bool:
         "control_decimation": config.env.control_decimation,
         "hand_stiffness": config.env.hand_stiffness,
         "hand_damping": config.env.hand_damping,
-        "reward_rotation": config.env.reward_rotation,
-        "reward_action_penalty": config.env.reward_action_penalty,
+        "rot_reward_scale": config.env.rot_reward_scale,
+        "action_penalty_scale": config.env.action_penalty_scale,
         # PPO config
         "learning_rate": config.ppo.learning_rate,
         "gamma": config.ppo.gamma,

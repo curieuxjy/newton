@@ -1,156 +1,216 @@
 # Allegro Hand Cube Rotation with PPO
 
 Newton 물리 엔진을 사용한 Allegro Hand 큐브 회전 강화학습 예제입니다.
-IsaacLab의 DextrEme를 IsaacSim 없이 Newton만으로 구현한 프로젝트입니다.
+IsaacGymEnvs의 [DextrEme](https://github.com/isaac-sim/IsaacGymEnvs/tree/main/isaacgymenvs/tasks/dextreme)를 참고하여 구현되었습니다.
 
 ## 프로젝트 구조
 
 ```
 allegro_cube_ppo/
 ├── __init__.py      # 패키지 export
-├── config.py        # 하이퍼파라미터 설정
+├── config.py        # 하이퍼파라미터 설정 (DextrEme 스타일)
 ├── env.py           # AllegroHandCubeEnv (Newton 기반 환경)
 ├── ppo.py           # PPO 알고리즘 (CleanRL 스타일)
 ├── train.py         # 학습 스크립트
 ├── visualize.py     # Newton viewer로 시각화
-└── README.md        # 이 파일
+└── README.md
 ```
 
-## 환경 설명
+## Task 설명
 
-IsaacLab DextrEme 환경을 참고하여 설계되었습니다.
+**목표**: Allegro Hand로 큐브를 잡고 목표 방향(quaternion)으로 회전시키기
 
 ### Observation (49 dims)
 | 항목 | 차원 | 설명 |
 |------|------|------|
-| Joint positions (normalized) | 16 | 손가락 관절 위치 |
+| Joint positions (normalized) | 16 | 손가락 관절 위치 [-1, 1] |
 | Joint velocities (×0.2) | 16 | 손가락 관절 속도 |
 | Cube relative position | 3 | 손바닥 기준 큐브 위치 |
-| Cube orientation | 4 | 큐브 쿼터니언 |
+| Cube orientation | 4 | 큐브 쿼터니언 (x,y,z,w) |
 | Cube linear velocity (×0.2) | 3 | 큐브 선속도 |
 | Cube angular velocity (×0.2) | 3 | 큐브 각속도 |
 | Goal orientation | 4 | 목표 쿼터니언 |
 
 ### Action (16 dims)
 - **Delta position control**: 현재 위치에서의 변화량
-- 범위: [-1, 1] × action_scale (0.3) → joint limits로 클램핑
-- 더 부드러운 움직임을 위한 delta action 방식
+- 범위: [-1, 1] × action_scale (0.5)
+- joint limits로 클램핑
 
-### Reward (IsaacLab 스타일)
-| 항목 | 가중치 | 설명 |
-|------|--------|------|
-| Rotation reward | 1.0 / (quat_dist + 0.1) | 쿼터니언 정렬 보상 |
-| Distance penalty | -10.0 × dist | 큐브가 손에서 멀어지면 페널티 |
-| Action penalty | -0.0002 × ||a||² | 매우 작은 액션 페널티 |
-| Action rate penalty | -0.0001 × ||Δa||² | 액션 변화율 페널티 |
-| Success bonus | +250 / episode_len | 목표 도달 시 보너스 |
-| Fall penalty | -50 | 큐브 낙하 시 페널티 |
+### Reward (DextrEme 스타일)
+
+```python
+reward = rot_reward + dist_penalty - action_penalty - action_delta_penalty - vel_penalty + success_bonus + fall_penalty
+```
+
+| 항목 | 공식 | 설명 |
+|------|------|------|
+| **Rotation reward** | `1.0 / (rot_dist + 0.1)` | 쿼터니언 정렬 보상 |
+| **Distance penalty** | `-10.0 × dist` | 큐브가 손에서 멀어지면 페널티 |
+| **Action penalty** | `-0.0002 × Σ(a²)` | 액션 크기 페널티 |
+| **Action delta penalty** | `-0.0001 × Σ(Δa²)` | 액션 변화율 페널티 |
+| **Velocity penalty** | `-0.05 × Σ((v/4)²)` | 관절 속도 페널티 |
+| **Success bonus** | `+250` | N회 연속 성공 시 |
+| **Fall penalty** | `-50` | 큐브 낙하/이탈 시 |
+
+**Rotation distance (DextrEme 방식)**:
+```python
+q_diff = q_cube × conjugate(q_goal)
+rot_dist = 2 × arcsin(||q_diff.xyz||)  # radians
+```
+
+### Success Condition
+- Rotation distance < `success_tolerance` (0.4 rad ≈ 23°)
+- `consecutive_successes` (5) 회 연속 유지
+- 성공 시 새로운 랜덤 목표 생성
 
 ### Termination
-- Episode timeout (기본 400 steps = 8초 @ 50Hz)
+- Episode timeout (400 steps = 8초)
 - 큐브 낙하 (z < 0.05m)
+- 큐브 이탈 (dist > 0.3m)
 
 ## 실행 방법
 
 ### 1. 시각화 (Newton Viewer)
 
-학습 없이 시뮬레이터 확인:
 ```bash
-uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.visualize
-```
+# 랜덤 액션으로 시뮬레이터 확인
+uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.visualize --num-envs 4
 
-학습된 정책으로 시각화:
-```bash
+# Collision 표시/숨기기
+uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.visualize --show-collision
+uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.visualize --hide-collision
+
+# 학습된 정책으로 시각화
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.visualize \
     --checkpoint checkpoints/allegro_cube_ppo_XXXXXX/final.pt
 ```
 
-여러 환경 동시 시각화:
-```bash
-uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.visualize \
-    --num-envs 16
+**Orientation Frame Visualization**:
+- 큐브의 현재 orientation을 3축 좌표계(RGB = XYZ)로 표시합니다
+- 목표 orientation도 동일한 방식으로 각 환경 위에 표시됩니다
+- 실제 큐브가 goal orientation에 5회 연속 도달하면 새로운 랜덤 목표가 생성됩니다
+- 축 색상: **빨강(X)**, **초록(Y)**, **파랑(Z)**
+
+## Multi-Environment 시각화 주의사항
+
+Newton에서 다중 환경을 시각화할 때 좌표계 처리에 주의가 필요합니다.
+
+### World Offset 메커니즘
+
+Newton의 viewer는 두 가지 방식으로 다중 환경을 배치합니다:
+
+1. **Physical Spacing** (`builder.replicate()`의 `spacing` 파라미터)
+   - 시뮬레이션 내 실제 물리적 위치 오프셋
+   - `body_q` 등 상태 배열에 이미 반영됨
+
+2. **Visual World Offset** (`viewer.set_world_offsets()`)
+   - 렌더링 시에만 적용되는 시각적 오프셋
+   - `set_model()` 호출 시 자동으로 계산됨
+
+### 문제점
+
+`viewer.log_lines()` 등 커스텀 시각화 함수는 **world offset을 자동 적용하지 않습니다**.
+따라서 `replicate()`로 physical spacing을 설정한 후, viewer가 추가로 visual offset을 적용하면
+커스텀 시각화 좌표가 렌더링된 모델 위치와 불일치합니다.
+
+### 해결책
+
+Physical spacing을 사용하는 경우, viewer의 world offset을 비활성화합니다:
+
+```python
+# 방법 1: Physical spacing 사용 시 visual offset 비활성화 (권장)
+builder.replicate(hand_builder, num_envs, spacing=(0.5, 0.5, 0.0))
+model = builder.finalize()
+viewer.set_model(model)
+viewer.set_world_offsets((0.0, 0.0, 0.0))  # visual offset 비활성화
+
+# 이제 body_q 좌표를 그대로 log_lines()에 사용 가능
+body_pos = state.body_q.numpy()[body_idx, :3]
+viewer.log_lines("/my_lines", starts, ends, colors)
 ```
+
+```python
+# 방법 2: Visual offset만 사용 (physical spacing 없이)
+builder.replicate(hand_builder, num_envs, spacing=(0.0, 0.0, 0.0))
+model = builder.finalize()
+viewer.set_model(model)  # 자동으로 visual offset 계산
+
+# log_lines() 호출 시 world_offset을 수동으로 더해야 함
+world_offset = viewer.world_offsets.numpy()[env_idx]
+adjusted_pos = body_pos + world_offset
+viewer.log_lines("/my_lines", adjusted_starts, adjusted_ends, colors)
+```
+
+### 내장 시각화 vs 커스텀 시각화
+
+| 함수 | World Offset 자동 적용 |
+|------|----------------------|
+| `viewer.log_state()` | O (shapes, bodies) |
+| `viewer.log_contacts()` | O |
+| `viewer.log_joint_basis()` | O |
+| `viewer.log_lines()` | **X** |
+| `viewer.log_shapes()` | **X** |
+
+커스텀 시각화 시에는 위 테이블을 참고하여 좌표를 적절히 조정해야 합니다.
 
 ### 2. 학습
 
-기본 학습:
 ```bash
+# 기본 학습 (4096 envs)
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.train \
     --num-envs 4096 \
-    --total-timesteps 100000000
-```
+    --total-timesteps 100000000 \
+    --no-wandb
 
-빠른 테스트 (적은 환경):
-```bash
+# 빠른 테스트
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.train \
     --num-envs 256 \
     --total-timesteps 1000000 \
     --no-wandb
 ```
 
-### 3. 로깅 옵션
+### 3. 로깅
 
-#### TensorBoard (기본 활성화)
 ```bash
-# 학습 실행 후 별도 터미널에서:
+# TensorBoard (기본 활성화)
 tensorboard --logdir runs/
-# 브라우저에서 http://localhost:6006 접속
-```
 
-#### Wandb (선택)
-```bash
-# 설치
-pip install wandb
-wandb login
-
-# wandb와 함께 학습
+# Wandb
+pip install wandb && wandb login
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.train \
-    --num-envs 4096 \
-    --wandb-project allegro-cube-ppo \
-    --wandb-entity YOUR_USERNAME
+    --wandb-project allegro-cube-ppo
 ```
-
-## CLI 인자
-
-### train.py
-| 인자 | 기본값 | 설명 |
-|------|--------|------|
-| `--num-envs` | 4096 | 병렬 환경 수 |
-| `--total-timesteps` | 100M | 총 학습 스텝 |
-| `--seed` | 42 | 랜덤 시드 |
-| `--device` | cuda | 디바이스 (cuda/cpu) |
-| `--checkpoint-dir` | checkpoints | 체크포인트 저장 경로 |
-| `--wandb` / `--no-wandb` | 활성화 | wandb 로깅 on/off |
-| `--wandb-project` | allegro-cube-ppo | wandb 프로젝트명 |
-| `--wandb-entity` | None | wandb 사용자/팀명 |
-
-### visualize.py
-| 인자 | 기본값 | 설명 |
-|------|--------|------|
-| `--checkpoint` | None | 학습된 체크포인트 경로 |
-| `--num-envs` | 4 | 시각화할 환경 수 |
 
 ## 하이퍼파라미터
 
-### EnvConfig (config.py)
+### EnvConfig
 ```python
-num_envs: int = 4096
-episode_length: int = 400      # 8초 @ 50Hz (IsaacLab 스타일)
+# Simulation
 fps: int = 60
 sim_substeps: int = 2
-control_decimation: int = 2    # 30Hz 제어
-hand_stiffness: float = 40.0   # 낮은 강성 (더 유연한 움직임)
-hand_damping: float = 2.0
-action_scale: float = 0.3      # Delta action 스케일
+control_decimation: int = 2      # 30Hz control
+episode_length: int = 400        # 8 seconds
 
-# Reward weights (IsaacLab 스타일)
-reward_dist_scale: float = -10.0
-reward_rot_scale: float = 1.0
-reward_action_penalty: float = 0.0002  # 매우 작음!
-reward_success_bonus: float = 250.0
+# Robot
+hand_stiffness: float = 40.0
+hand_damping: float = 2.0
+action_scale: float = 0.5
+
+# Reward (DextrEme style)
+rot_reward_scale: float = 1.0
+rot_eps: float = 0.1
+dist_reward_scale: float = -10.0
+action_penalty_scale: float = 0.0002
+velocity_penalty_scale: float = 0.05
+
+# Success/Failure
+success_tolerance: float = 0.4   # radians (~23°)
+consecutive_successes: int = 5
+reach_goal_bonus: float = 250.0
+fall_penalty: float = -50.0
 ```
 
-### PPOConfig (config.py)
+### PPOConfig
 ```python
 learning_rate: float = 3e-4
 gamma: float = 0.99
@@ -158,30 +218,12 @@ gae_lambda: float = 0.95
 clip_epsilon: float = 0.2
 entropy_coef: float = 0.01
 num_epochs: int = 5
-num_minibatches: int = 4
-rollout_steps: int = 24        # 긴 rollout
-hidden_dims: tuple = (512, 256, 128)  # 더 큰 네트워크
+rollout_steps: int = 24
+hidden_dims: tuple = (512, 256, 128)
 ```
-
-## 체크포인트 구조
-
-```python
-{
-    "actor_critic": model.state_dict(),
-    "optimizer": optimizer.state_dict(),
-}
-```
-
-## 확장 아이디어
-
-- [ ] Fingertip 접촉 보상 추가
-- [ ] Domain randomization (물리 파라미터)
-- [ ] Asymmetric actor-critic (privileged info)
-- [ ] 다른 오브젝트 (구, 실린더 등)
-- [ ] Right hand 버전
 
 ## 참고 자료
 
-- [IsaacLab Allegro Hand Environment](https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab_tasks/isaaclab_tasks/direct/allegro_hand/allegro_hand_env_cfg.py)
-- [IsaacGymEnvs DextrEme](https://github.com/NVIDIA-Omniverse/IsaacGymEnvs/blob/main/docs/rl_examples.md)
-- [Newton Examples](https://github.com/nvidia-warp/newton/tree/main/newton/examples)
+- [IsaacGymEnvs DextrEme](https://github.com/isaac-sim/IsaacGymEnvs/tree/main/isaacgymenvs/tasks/dextreme)
+- [IsaacLab Allegro Hand](https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab_tasks/isaaclab_tasks/direct/allegro_hand/)
+- [Newton Examples](https://github.com/nvidia-warp/newton)

@@ -1,6 +1,6 @@
 """Allegro Hand Cube Rotation Environment for RL training with Newton.
 
-Reference: IsaacLab DextrEme / Allegro Hand environments
+Reference: IsaacGymEnvs DextrEme (allegro_hand_dextreme.py)
 """
 
 from typing import Any
@@ -16,17 +16,16 @@ from .config import EnvConfig
 
 
 class AllegroHandCubeEnv:
-    """Vectorized environment for Allegro Hand cube rotation task.
+    """Vectorized environment for Allegro Hand cube rotation task (DextrEme style).
 
-    Observation space (65 dims):
-        - Hand joint positions (16)
-        - Hand joint velocities (16) * 0.2
+    Observation space (49 dims):
+        - Hand joint positions normalized (16)
+        - Hand joint velocities scaled (16)
         - Cube position relative to palm (3)
         - Cube orientation quaternion (4)
-        - Cube linear velocity (3) * 0.2
-        - Cube angular velocity (3) * 0.2
+        - Cube linear velocity (3)
+        - Cube angular velocity (3)
         - Goal orientation quaternion (4)
-        - Fingertip positions relative to cube (4*4=16) - optional
 
     Action space (16 dims):
         - Joint position deltas for 16 actuated DOFs
@@ -54,7 +53,6 @@ class AllegroHandCubeEnv:
         self._build_simulation()
 
         # Observation and action spaces
-        # 16 pos + 16 vel + 3 cube_pos + 4 cube_quat + 3 cube_lin_vel + 3 cube_ang_vel + 4 goal
         self.num_obs = 16 + 16 + 3 + 4 + 3 + 3 + 4  # = 49
         self.num_actions = 16
 
@@ -71,18 +69,18 @@ class AllegroHandCubeEnv:
         # Current joint targets (for delta actions)
         self.current_targets = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float32, device=self.torch_device)
 
-        # Goal state
+        # Goal state (quaternion: x, y, z, w)
         self.goal_quat = torch.zeros(self.num_envs, 4, dtype=torch.float32, device=self.torch_device)
-        self.goal_quat[:, 3] = 1.0  # identity quaternion (x, y, z, w)
-        self.goal_rotation_speed = config.goal_rotation_speed
+        self.goal_quat[:, 3] = 1.0  # identity
 
-        # Success tracking
+        # Success tracking (DextrEme: consecutive successes)
         self.successes = torch.zeros(self.num_envs, dtype=torch.int32, device=self.torch_device)
+        self.consecutive_successes = torch.zeros(self.num_envs, dtype=torch.int32, device=self.torch_device)
 
-        # Initial state storage for reset
+        # Initial state storage
         self._store_initial_state()
 
-        # CUDA graph for simulation (disabled for now)
+        # CUDA graph (disabled)
         self.graph = None
 
     def _build_simulation(self):
@@ -91,9 +89,9 @@ class AllegroHandCubeEnv:
         newton.solvers.SolverMuJoCo.register_custom_attributes(hand_builder)
 
         # Contact parameters for good grasping
-        hand_builder.default_shape_cfg.ke = 1.0e4  # Higher contact stiffness
+        hand_builder.default_shape_cfg.ke = 1.0e4
         hand_builder.default_shape_cfg.kd = 1.0e3
-        hand_builder.default_shape_cfg.mu = 1.2  # Higher friction
+        hand_builder.default_shape_cfg.mu = 1.2
 
         # Load Allegro hand from downloaded asset
         asset_path = newton.utils.download_asset("wonik_allegro")
@@ -102,7 +100,8 @@ class AllegroHandCubeEnv:
         hand_builder.add_usd(
             asset_file,
             xform=wp.transform(wp.vec3(0, 0, 0.3)),
-            ignore_paths=[".*Dummy", ".*CollisionPlane", ".*goal", ".*DexCube/visuals"],
+            # Note: Don't ignore DexCube/visuals so cube is visible
+            ignore_paths=[".*Dummy", ".*CollisionPlane", ".*goal"],
         )
 
         self.num_hand_dofs = hand_builder.joint_dof_count
@@ -123,7 +122,7 @@ class AllegroHandCubeEnv:
             hand_builder.joint_limit_upper[6:22], dtype=torch.float32, device=self.torch_device
         )
 
-        # Compute joint range for action scaling
+        # Compute joint range for normalization
         self.joint_range = self.joint_upper - self.joint_lower
         self.joint_mid = (self.joint_upper + self.joint_lower) / 2
 
@@ -131,14 +130,13 @@ class AllegroHandCubeEnv:
         builder = newton.ModelBuilder()
         builder.replicate(hand_builder, self.num_envs, spacing=(0.5, 0.5, 0.0))
 
-        # Ground plane
         builder.default_shape_cfg.ke = 1.0e4
         builder.default_shape_cfg.kd = 1.0e3
         builder.add_ground_plane()
 
         self.model = builder.finalize()
 
-        # Solver with good contact parameters
+        # Solver
         self.solver = newton.solvers.SolverMuJoCo(
             self.model,
             solver="newton",
@@ -165,10 +163,8 @@ class AllegroHandCubeEnv:
         self.initial_joint_q = wp.clone(self.state_0.joint_q)
         self.initial_joint_qd = wp.clone(self.state_0.joint_qd)
         newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
-        self.initial_body_q = wp.clone(self.state_0.body_q)
-        self.initial_body_qd = wp.clone(self.state_0.body_qd)
 
-        # Store initial joint targets
+        # Initialize current targets to initial joint positions
         joint_q_np = self.initial_joint_q.numpy()
         for i in range(self.num_envs):
             start = i * self.num_hand_dofs + self.hand_joint_offset
@@ -184,8 +180,23 @@ class AllegroHandCubeEnv:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
+    def _random_quaternion(self, n: int) -> torch.Tensor:
+        """Generate random unit quaternions (uniform on SO(3))."""
+        u = torch.rand(n, 3, device=self.torch_device)
+        q = torch.zeros(n, 4, device=self.torch_device)
+
+        sqrt1_u0 = torch.sqrt(1 - u[:, 0])
+        sqrt_u0 = torch.sqrt(u[:, 0])
+
+        q[:, 0] = sqrt1_u0 * torch.sin(2 * np.pi * u[:, 1])  # x
+        q[:, 1] = sqrt1_u0 * torch.cos(2 * np.pi * u[:, 1])  # y
+        q[:, 2] = sqrt_u0 * torch.sin(2 * np.pi * u[:, 2])   # z
+        q[:, 3] = sqrt_u0 * torch.cos(2 * np.pi * u[:, 2])   # w
+
+        return q
+
     def reset(self, env_ids: torch.Tensor | None = None) -> torch.Tensor:
-        """Reset specified environments or all if env_ids is None."""
+        """Reset specified environments."""
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.torch_device)
 
@@ -196,8 +207,9 @@ class AllegroHandCubeEnv:
         # Reset episode counters
         self.episode_step[env_ids] = 0
         self.successes[env_ids] = 0
+        self.consecutive_successes[env_ids] = 0
 
-        # Reset joint states
+        # Reset joint states with small noise
         joint_q_np = self.state_0.joint_q.numpy()
         joint_qd_np = self.state_0.joint_qd.numpy()
         initial_q_np = self.initial_joint_q.numpy()
@@ -207,29 +219,32 @@ class AllegroHandCubeEnv:
         for idx in env_ids.cpu().numpy():
             start = idx * dofs_per_env
             end = start + dofs_per_env
-            # Add small noise to initial positions
-            noise = np.random.uniform(-0.1, 0.1, size=dofs_per_env)
-            joint_q_np[start:end] = initial_q_np[start:end] + noise * 0.1
+            noise = np.random.uniform(-0.1, 0.1, size=dofs_per_env) * 0.1
+            joint_q_np[start:end] = initial_q_np[start:end] + noise
             joint_qd_np[start:end] = initial_qd_np[start:end]
 
         self.state_0.joint_q = wp.array(joint_q_np, dtype=wp.float32, device=self.device)
         self.state_0.joint_qd = wp.array(joint_qd_np, dtype=wp.float32, device=self.device)
 
-        # Recompute forward kinematics (this will update body states from joint states)
+        # Recompute FK
         newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
 
-        # Reset goal quaternions
-        random_angles = torch.rand(num_reset, device=self.torch_device) * 2 * np.pi
-        self.goal_quat[env_ids, 0] = 0.0
-        self.goal_quat[env_ids, 1] = 0.0
-        self.goal_quat[env_ids, 2] = torch.sin(random_angles / 2)
-        self.goal_quat[env_ids, 3] = torch.cos(random_angles / 2)
+        # Randomize goal quaternion (DextrEme style: full random rotation)
+        if self.config.randomize_goal:
+            self.goal_quat[env_ids] = self._random_quaternion(num_reset)
+        else:
+            # Simple z-axis rotation
+            random_angles = torch.rand(num_reset, device=self.torch_device) * 2 * np.pi
+            self.goal_quat[env_ids, 0] = 0.0
+            self.goal_quat[env_ids, 1] = 0.0
+            self.goal_quat[env_ids, 2] = torch.sin(random_angles / 2)
+            self.goal_quat[env_ids, 3] = torch.cos(random_angles / 2)
 
         # Reset action buffers
         self.prev_actions[env_ids] = 0.0
         self.actions[env_ids] = 0.0
 
-        # Reset current targets to initial joint positions
+        # Reset current targets
         for idx in env_ids.cpu().numpy():
             start = idx * self.num_hand_dofs + self.hand_joint_offset
             end = start + self.num_actions
@@ -238,21 +253,18 @@ class AllegroHandCubeEnv:
         return self._compute_observations()
 
     def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        """Take a step in all environments.
-
-        Args:
-            actions: Joint position deltas, shape (num_envs, 16), range [-1, 1]
-
-        Returns:
-            observations, rewards, dones, info
-        """
+        """Take a step in all environments."""
         # Store previous actions
         self.prev_actions = self.actions.clone()
         self.actions = actions.clone()
 
         # Apply delta actions with scaling
-        action_delta = actions * self.config.action_scale
-        self.current_targets = self.current_targets + action_delta
+        if self.config.use_relative_control:
+            action_delta = actions * self.config.action_scale
+            self.current_targets = self.current_targets + action_delta
+        else:
+            # Absolute control
+            self.current_targets = self.joint_mid + actions * (self.joint_range / 2) * self.config.action_scale
 
         # Clamp to joint limits
         self.current_targets = torch.clamp(self.current_targets, self.joint_lower, self.joint_upper)
@@ -270,14 +282,11 @@ class AllegroHandCubeEnv:
         # Compute observations
         obs = self._compute_observations()
 
-        # Compute rewards
+        # Compute rewards (DextrEme style)
         rewards = self._compute_rewards()
 
         # Check termination
         dones = self._compute_dones()
-
-        # Update goal (slowly rotating target)
-        self._update_goal()
 
         # Auto-reset done environments
         done_env_ids = torch.where(dones)[0]
@@ -311,11 +320,11 @@ class AllegroHandCubeEnv:
             q_start = i * self.num_hand_dofs + self.hand_joint_offset
             q_end = q_start + self.num_actions
 
-            # Joint positions (normalized)
+            # Joint positions (normalized to [-1, 1])
             joint_pos = joint_q[q_start:q_end]
             self.obs_buf[i, 0:16] = (joint_pos - self.joint_mid) / (self.joint_range / 2 + 1e-6)
 
-            # Joint velocities (scaled)
+            # Joint velocities (scaled by 0.2)
             self.obs_buf[i, 16:32] = joint_qd[q_start:q_end] * 0.2
 
             # Cube state
@@ -327,12 +336,12 @@ class AllegroHandCubeEnv:
             hand_pos = body_q[hand_idx, :3]
             self.obs_buf[i, 32:35] = cube_pos - hand_pos
 
-            # Cube orientation
+            # Cube orientation (x, y, z, w)
             self.obs_buf[i, 35:39] = body_q[cube_idx, 3:7]
 
             # Cube velocities (scaled)
-            self.obs_buf[i, 39:42] = body_qd[cube_idx, :3] * 0.2  # linear vel
-            self.obs_buf[i, 42:45] = body_qd[cube_idx, 3:6] * 0.2  # angular vel
+            self.obs_buf[i, 39:42] = body_qd[cube_idx, :3] * 0.2
+            self.obs_buf[i, 42:45] = body_qd[cube_idx, 3:6] * 0.2
 
             # Goal orientation
             self.obs_buf[i, 45:49] = self.goal_quat[i]
@@ -343,55 +352,102 @@ class AllegroHandCubeEnv:
 
         return self.obs_buf
 
+    def _quat_mul(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """Multiply two quaternions (x, y, z, w format)."""
+        x1, y1, z1, w1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
+        x2, y2, z2, w2 = q2[..., 0], q2[..., 1], q2[..., 2], q2[..., 3]
+
+        w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+        x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+        y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+        z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+
+        return torch.stack([x, y, z, w], dim=-1)
+
+    def _quat_conjugate(self, q: torch.Tensor) -> torch.Tensor:
+        """Compute quaternion conjugate."""
+        return torch.stack([-q[..., 0], -q[..., 1], -q[..., 2], q[..., 3]], dim=-1)
+
+    def _rotation_distance(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        """Compute rotation distance between quaternions (DextrEme style).
+
+        Returns angle in radians: 2 * arcsin(||q_diff.xyz||)
+        """
+        # q_diff = q1 * conjugate(q2)
+        q2_conj = self._quat_conjugate(q2)
+        q_diff = self._quat_mul(q1, q2_conj)
+
+        # Rotation distance = 2 * arcsin(clamp(||xyz||, max=1))
+        xyz_norm = torch.norm(q_diff[..., :3], dim=-1)
+        xyz_norm = torch.clamp(xyz_norm, max=1.0)
+        return 2.0 * torch.asin(xyz_norm)
+
     def _compute_rewards(self) -> torch.Tensor:
-        """Compute rewards (IsaacLab style)."""
+        """Compute rewards (DextrEme style)."""
         body_q = torch.from_numpy(self.state_0.body_q.numpy()).to(self.torch_device)
+        joint_qd = torch.from_numpy(self.state_0.joint_qd.numpy()).to(self.torch_device)
 
         for i in range(self.num_envs):
             cube_idx = i * self.num_hand_bodies + self.cube_body_offset
-            cube_quat = body_q[cube_idx, 3:7]
-            cube_z = body_q[cube_idx, 2]
-
-            # Rotation reward (quaternion similarity)
-            goal_quat = self.goal_quat[i]
-            quat_diff = self._quat_distance(cube_quat, goal_quat)
-
-            # Rotation reward with shaping
-            rot_reward = 1.0 / (quat_diff + self.config.reward_rot_eps)
-            rot_reward = rot_reward * self.config.reward_rot_scale
-
-            # Distance penalty (cube should stay near hand)
             hand_idx = i * self.num_hand_bodies
-            hand_pos = body_q[hand_idx, :3]
+
+            # Get cube and hand states
+            cube_quat = body_q[cube_idx, 3:7]  # x, y, z, w
             cube_pos = body_q[cube_idx, :3]
+            hand_pos = body_q[hand_idx, :3]
+
+            # 1. Rotation reward: 1 / (rot_dist + eps) * scale
+            rot_dist = self._rotation_distance(cube_quat.unsqueeze(0), self.goal_quat[i].unsqueeze(0)).squeeze()
+            rot_reward = self.config.rot_reward_scale / (rot_dist + self.config.rot_eps)
+
+            # 2. Distance penalty (cube too far from hand)
             dist = torch.norm(cube_pos - hand_pos)
-            dist_penalty = dist * self.config.reward_dist_scale
+            dist_penalty = self.config.dist_reward_scale * dist
 
-            # Action penalties (very small)
-            action_penalty = torch.sum(self.actions[i] ** 2) * self.config.reward_action_penalty
-            action_rate = torch.sum((self.actions[i] - self.prev_actions[i]) ** 2) * self.config.reward_action_rate_penalty
+            # 3. Action penalty
+            action_penalty = self.config.action_penalty_scale * torch.sum(self.actions[i] ** 2)
 
-            # Success bonus
+            # 4. Action delta penalty
+            action_delta = self.actions[i] - self.prev_actions[i]
+            action_delta_penalty = self.config.action_delta_penalty_scale * torch.sum(action_delta ** 2)
+
+            # 5. Velocity penalty (DextrEme: -0.05 * sum((dof_vel/4)^2))
+            q_start = i * self.num_hand_dofs + self.hand_joint_offset
+            q_end = q_start + self.num_actions
+            dof_vel = joint_qd[q_start:q_end]
+            vel_penalty = self.config.velocity_penalty_scale * torch.sum((dof_vel / self.config.velocity_norm) ** 2)
+
+            # 6. Success bonus (consecutive successes)
             success_bonus = 0.0
-            if quat_diff < self.config.success_tolerance:
-                success_bonus = self.config.reward_success_bonus / self.max_episode_length
-                self.successes[i] += 1
+            if rot_dist < self.config.success_tolerance:
+                self.consecutive_successes[i] += 1
+                if self.consecutive_successes[i] >= self.config.consecutive_successes:
+                    success_bonus = self.config.reach_goal_bonus
+                    self.successes[i] += 1
+                    # Generate new goal after success
+                    if self.config.randomize_goal:
+                        self.goal_quat[i] = self._random_quaternion(1).squeeze()
+                    self.consecutive_successes[i] = 0
+            else:
+                self.consecutive_successes[i] = 0
 
-            # Fall penalty
+            # 7. Fall penalty
             fall_penalty = 0.0
-            if cube_z < self.config.fall_height:
-                fall_penalty = self.config.reward_fall_penalty
+            if dist > self.config.fall_dist or cube_pos[2] < 0.05:
+                fall_penalty = self.config.fall_penalty
 
             # Total reward
-            self.reward_buf[i] = rot_reward + dist_penalty - action_penalty - action_rate + success_bonus + fall_penalty
+            self.reward_buf[i] = (
+                rot_reward
+                + dist_penalty
+                - action_penalty
+                - action_delta_penalty
+                - vel_penalty
+                + success_bonus
+                + fall_penalty
+            )
 
         return self.reward_buf
-
-    def _quat_distance(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
-        """Compute angular distance between quaternions."""
-        dot = torch.abs(torch.sum(q1 * q2))
-        dot = torch.clamp(dot, 0.0, 1.0)
-        return 2.0 * torch.acos(dot)  # Returns angle in radians
 
     def _compute_dones(self) -> torch.Tensor:
         """Check termination conditions."""
@@ -401,24 +457,19 @@ class AllegroHandCubeEnv:
             timeout = self.episode_step[i] >= self.max_episode_length
 
             cube_idx = i * self.num_hand_bodies + self.cube_body_offset
-            cube_z = body_q[cube_idx, 2]
-            cube_fell = cube_z < self.config.fall_height
+            hand_idx = i * self.num_hand_bodies
 
-            self.done_buf[i] = timeout or cube_fell
+            cube_pos = body_q[cube_idx, :3]
+            hand_pos = body_q[hand_idx, :3]
+            dist = torch.norm(cube_pos - hand_pos)
+
+            # Fail if cube falls or goes too far
+            cube_fell = cube_pos[2] < 0.05
+            cube_far = dist > self.config.fall_dist
+
+            self.done_buf[i] = timeout or cube_fell or cube_far
 
         return self.done_buf
-
-    def _update_goal(self):
-        """Update goal quaternion (rotating target)."""
-        angle_delta = self.goal_rotation_speed * self.frame_dt * self.control_decimation
-
-        current_angle = 2 * torch.atan2(self.goal_quat[:, 2], self.goal_quat[:, 3])
-        new_angle = current_angle + angle_delta
-
-        self.goal_quat[:, 0] = 0.0
-        self.goal_quat[:, 1] = 0.0
-        self.goal_quat[:, 2] = torch.sin(new_angle / 2)
-        self.goal_quat[:, 3] = torch.cos(new_angle / 2)
 
     def close(self):
         """Clean up resources."""
