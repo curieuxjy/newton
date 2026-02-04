@@ -174,7 +174,12 @@ class Example:
         self.allegro_joint_upper = np.array(builder.joint_limit_upper[allegro_dof_start:allegro_dof_start + self.allegro_dof_count], dtype=np.float32)
 
         print(f"[INFO] Franka joint limits: {self.franka_joint_lower} to {self.franka_joint_upper}")
-        print(f"[INFO] Allegro joint limits: {self.allegro_joint_lower} to {self.allegro_joint_upper}")
+        print(f"[INFO] Allegro joint limits:")
+        finger_names = ["Ring", "Middle", "Index", "Thumb"]
+        for f in range(4):
+            start = f * 4
+            end = start + 4
+            print(f"  {finger_names[f]}: lower={self.allegro_joint_lower[start:end]}, upper={self.allegro_joint_upper[start:end]}")
 
         # Add ground plane
         builder.add_ground_plane()
@@ -221,24 +226,27 @@ class Example:
         """Step the simulation."""
         self.anim_time += self.frame_dt
 
-        # Animate Franka arm - oscillate through full joint range
-        franka_target = self.franka_mid + np.sin(self.anim_time * 2.0) * self.franka_range * 0.9
+        # Franka arm - keep at midpoint (no movement)
+        franka_target = self.franka_mid.copy()
 
-        # Animate Allegro fingers - each finger has different speed for identification
-        # DOF 0-3: Finger 1 (link_8-11), DOF 4-7: Finger 2 (link_4-7)
-        # DOF 8-11: Finger 3 (link_0-3) = Ring finger, DOF 12-15: Thumb (link_12-15)
-        allegro_target = np.zeros(self.allegro_dof_count, dtype=np.float32)
-        finger_speeds = [2.0, 2.5, 3.0, 3.5]  # Different speed for each finger
-        finger_range_scale = [0.5, 0.9, 0.9, 0.9]  # Reduce Finger1 (link8-11) range to prevent jittering
-        for finger in range(4):
-            start_dof = finger * 4
-            end_dof = start_dof + 4
-            speed = finger_speeds[finger]
-            phase = finger * np.pi / 2  # Different phase offset
-            range_scale = finger_range_scale[finger]
-            for i in range(start_dof, end_dof):
-                t = np.sin(self.anim_time * speed + phase)
-                allegro_target[i] = self.allegro_mid[i] + t * self.allegro_range[i] * range_scale
+        # DOF mapping (Newton loads in tree order):
+        # DOF 0-3: Ring finger (link_8-11), DOF 4-7: Middle finger (link_4-7)
+        # DOF 8-11: Index finger (link_0-3), DOF 12-15: Thumb (link_12-15)
+        # Each finger has 4 joints: Abduction, MCP, PIP, DIP
+        finger_names = ["Ring", "Middle", "Index", "Thumb"]
+
+        # Animate all 3 fingers (Ring, Middle, Index) simultaneously for comparison
+        # Use same oscillation parameters for all to compare motion
+        allegro_target = self.allegro_mid.copy()
+        range_scale = 0.9
+
+        # Animate fingers 0, 1, 2 (Ring, Middle, Index) with same motion
+        for finger_idx in range(3):  # Ring, Middle, Index (not thumb)
+            start_dof = finger_idx * 4
+            for j in range(4):  # 4 joints per finger
+                dof = start_dof + j
+                t = np.sin(self.anim_time * 3.0)  # Same phase for comparison
+                allegro_target[dof] = self.allegro_mid[dof] + t * self.allegro_range[dof] * range_scale
 
         # Apply control targets
         control_np = self.control.joint_target_pos.numpy()
@@ -252,15 +260,10 @@ class Example:
         else:
             self.simulate()
 
-        # Print joint states every 60 frames (~1 sec)
+        # Print status every 60 frames
         self.frame_count = getattr(self, 'frame_count', 0) + 1
         if self.frame_count % 60 == 0:
-            joint_q = self.state_0.joint_q.numpy()
-            allegro_q = joint_q[self.allegro_dof_start:self.allegro_dof_start + self.allegro_dof_count]
-            print(f"[t={self.anim_time:.1f}s] Finger1(link8-11):{allegro_q[0:4].round(2)} "
-                  f"Finger2(link4-7):{allegro_q[4:8].round(2)} "
-                  f"Finger3(link0-3):{allegro_q[8:12].round(2)} "
-                  f"Thumb:{allegro_q[12:16].round(2)}")
+            print(f"[t={self.anim_time:.1f}s] All 3 fingers (Ring, Middle, Index) moving with same motion")
 
         self.sim_time += self.frame_dt
 
