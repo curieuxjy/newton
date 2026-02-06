@@ -361,23 +361,26 @@ class FrankaAllegroGraspEnv:
 
     def _setup_depth_sensor(self):
         """Setup depth camera sensor."""
+        # New API: width/height/num_cameras moved from constructor to create_*_output methods
         self.depth_sensor = SensorTiledCamera(
             model=self.model,
-            num_cameras=1,
-            width=self.config.depth_width,
-            height=self.config.depth_height,
             options=SensorTiledCamera.Options(
                 default_light=True,
                 colors_per_shape=True,
             ),
         )
 
-        # Compute camera rays
+        # Compute camera rays (new API: width, height as arguments)
         fov_rad = math.radians(self.config.depth_fov)
-        self.camera_rays = self.depth_sensor.compute_pinhole_camera_rays(fov_rad)
+        self.camera_rays = self.depth_sensor.compute_pinhole_camera_rays(
+            self.config.depth_width, self.config.depth_height, fov_rad
+        )
 
-        # Create depth output buffer
-        self.depth_image = self.depth_sensor.create_depth_image_output()
+        # Create depth output buffer (new API: width, height, num_cameras as arguments)
+        # Output shape is now (num_worlds, num_cameras, height, width)
+        self.depth_image = self.depth_sensor.create_depth_image_output(
+            self.config.depth_width, self.config.depth_height, num_cameras=1
+        )
 
         # Camera transforms will be updated based on EE pose
         self.camera_transforms = wp.zeros((self.num_envs, 1), dtype=wp.transformf, device=self.device)
@@ -692,7 +695,9 @@ class FrankaAllegroGraspEnv:
         # Depth image if enabled
         if self.config.use_depth_sensor and self.depth_sensor is not None:
             self._update_depth_sensor()
+            # New output shape: (num_worlds, num_cameras, height, width)
             depth_np = self.depth_image.numpy()
+            # Flatten to (num_envs, height * width) for observation
             depth_flat = depth_np.reshape(self.num_envs, -1)
 
             # Normalize depth

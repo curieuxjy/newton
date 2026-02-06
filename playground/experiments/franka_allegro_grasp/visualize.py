@@ -110,11 +110,10 @@ class VisualizeExample:
             self.depth_ims = None
             return
 
-        # Get depth data
+        # Get depth data - new API shape is (num_worlds, num_cameras, height, width)
         depth_data = self.env.depth_image.numpy()
-        depth_reshaped = depth_data.reshape(
-            self.env.num_envs, 1, self.config.depth_height, self.config.depth_width
-        )
+        # Shape is already (num_envs, 1, height, width)
+        depth_reshaped = depth_data
 
         # Update images
         for i in range(min(4, self.env.num_envs)):

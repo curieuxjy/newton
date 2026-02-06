@@ -85,11 +85,10 @@ def run_realtime_visualization(env, config):
             noise = torch.randn_like(actions) * 0.05
             obs, rewards, dones, info = env.step(actions + noise)
 
-            # Get depth data
+            # Get depth data - new API shape is (num_worlds, num_cameras, height, width)
             depth_data = env.depth_image.numpy()
-            depth_reshaped = depth_data.reshape(
-                env.num_envs, 1, config.depth_height, config.depth_width
-            )
+            # Shape is already (num_envs, 1, height, width)
+            depth_reshaped = depth_data
 
             # Update images
             for i in range(min(4, env.num_envs)):
@@ -125,14 +124,12 @@ def run_save_mode(env, config):
         env.step(actions)
 
     # Get depth image from the sensor
+    # New API shape is (num_worlds, num_cameras, height, width)
     depth_data = env.depth_image.numpy()
-    print(f"Raw depth shape: {depth_data.shape}")
+    print(f"Depth shape: {depth_data.shape}")
 
-    # Reshape to (num_envs, num_cameras, height, width)
-    depth_reshaped = depth_data.reshape(
-        env.num_envs, 1, config.depth_height, config.depth_width
-    )
-    print(f"Reshaped depth: {depth_reshaped.shape}")
+    # Shape is already (num_envs, 1, height, width)
+    depth_reshaped = depth_data
 
     # Save depth images
     print("\nSaving depth images...")

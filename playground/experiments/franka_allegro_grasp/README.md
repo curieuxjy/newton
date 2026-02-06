@@ -232,23 +232,25 @@ Depth sensor는 Newton의 `SensorTiledCamera`를 사용합니다:
 ```python
 from newton.sensors import SensorTiledCamera
 
-# 센서 생성
+# 센서 생성 (new API: width/height/num_cameras는 create_*_output 메서드로 이동)
 depth_sensor = SensorTiledCamera(
     model=model,
-    num_cameras=1,
-    width=160,
-    height=120,
     options=SensorTiledCamera.Options(
         default_light=True,
         colors_per_shape=True,
     ),
 )
 
-# 카메라 ray 계산
-camera_rays = depth_sensor.compute_pinhole_camera_rays(fov_radians)
+# 카메라 ray 계산 (new API: width, height 파라미터 추가)
+camera_rays = depth_sensor.compute_pinhole_camera_rays(
+    width=160, height=120, fov=fov_radians
+)
 
-# 깊이 이미지 버퍼 생성
-depth_image = depth_sensor.create_depth_image_output()
+# 깊이 이미지 버퍼 생성 (new API: width, height, num_cameras 파라미터)
+# 출력 shape: (num_worlds, num_cameras, height, width)
+depth_image = depth_sensor.create_depth_image_output(
+    width=160, height=120, num_cameras=1
+)
 
 # 렌더링
 depth_sensor.render(
