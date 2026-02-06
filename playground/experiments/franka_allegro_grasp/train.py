@@ -411,23 +411,28 @@ class PPOTrainer:
         return state_obs
 
     def update(self) -> dict[str, float]:
-        """Update policy using PPO."""
-        # Normalize advantages
-        advantages = self.buffer.advantages.reshape(-1)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        self.buffer.advantages = advantages.reshape(
-            self.buffer.num_steps, self.buffer.num_envs
-        )
+        """Update policy using PPO with DEXTRAH-style KL divergence and adaptive LR."""
+        # Normalize advantages (DEXTRAH: normalize_advantage = True)
+        if self.config.ppo.normalize_advantage:
+            advantages = self.buffer.advantages.reshape(-1)
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            self.buffer.advantages = advantages.reshape(
+                self.buffer.num_steps, self.buffer.num_envs
+            )
 
         metrics = {
             "policy_loss": 0.0,
             "value_loss": 0.0,
             "entropy": 0.0,
+            "bounds_loss": 0.0,
+            "kl_divergence": 0.0,
             "total_loss": 0.0,
         }
         num_updates = 0
+        kl_sum = 0.0
+        kl_count = 0
 
-        for _ in range(self.config.ppo.num_epochs):
+        for epoch in range(self.config.ppo.num_epochs):
             for batch in self.buffer.get_batches(self.config.ppo.num_minibatches):
                 state_obs, fabric_obs, actions, old_log_probs, advs, returns = batch
 
@@ -440,6 +445,12 @@ class PPOTrainer:
                 log_ratio = new_log_probs - old_log_probs
                 ratio = torch.exp(log_ratio)
 
+                # Compute approximate KL divergence (DEXTRAH style)
+                with torch.no_grad():
+                    approx_kl = ((ratio - 1) - log_ratio).mean()
+                    kl_sum += approx_kl.item()
+                    kl_count += 1
+
                 pg_loss1 = -advs * ratio
                 pg_loss2 = -advs * torch.clamp(
                     ratio,
@@ -448,17 +459,22 @@ class PPOTrainer:
                 )
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss
+                # Value loss (DEXTRAH: critic_coef = 4)
                 value_loss = 0.5 * ((new_values - returns) ** 2).mean()
 
-                # Entropy loss
+                # Entropy loss (DEXTRAH: 0.0)
                 entropy_loss = entropy.mean()
+
+                # Bounds loss (DEXTRAH: bounds_loss_coef = 0.0001)
+                # Penalize actions outside [-1, 1]
+                bounds_loss = torch.clamp(actions.abs() - 1.0, min=0.0).pow(2).mean()
 
                 # Total loss
                 loss = (
                     pg_loss
                     + self.config.ppo.value_coef * value_loss
                     - self.config.ppo.entropy_coef * entropy_loss
+                    + self.config.ppo.bounds_loss_coef * bounds_loss
                 )
 
                 # Gradient step
@@ -472,11 +488,36 @@ class PPOTrainer:
                 metrics["policy_loss"] += pg_loss.item()
                 metrics["value_loss"] += value_loss.item()
                 metrics["entropy"] += entropy_loss.item()
+                metrics["bounds_loss"] += bounds_loss.item()
                 metrics["total_loss"] += loss.item()
                 num_updates += 1
 
+            # Early stopping based on KL threshold (DEXTRAH: kl_threshold = 0.016)
+            if kl_count > 0:
+                avg_kl = kl_sum / kl_count
+                if avg_kl > self.config.ppo.kl_threshold:
+                    break
+
+        # Compute final KL divergence
+        metrics["kl_divergence"] = kl_sum / max(kl_count, 1)
+
         for key in metrics:
-            metrics[key] /= num_updates
+            if key != "kl_divergence":
+                metrics[key] /= max(num_updates, 1)
+
+        # Adaptive learning rate (DEXTRAH: lr_schedule = "adaptive")
+        if self.config.ppo.lr_schedule == "adaptive":
+            kl = metrics["kl_divergence"]
+            if kl > self.config.ppo.kl_threshold * 2.0:
+                # KL too high -> reduce LR
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = max(param_group["lr"] * 0.5, 1e-6)
+            elif kl < self.config.ppo.kl_threshold * 0.5:
+                # KL too low -> increase LR
+                for param_group in self.optimizer.param_groups:
+                    param_group["lr"] = min(param_group["lr"] * 1.5, 1e-2)
+
+        metrics["learning_rate"] = self.optimizer.param_groups[0]["lr"]
 
         return metrics
 
@@ -560,15 +601,20 @@ class PPOTrainer:
                     f"[{global_step:>10}] "
                     f"FPS: {fps:.0f} | "
                     f"reward: {avg_reward:.3f} | "
-                    f"policy_loss: {update_metrics['policy_loss']:.4f} | "
-                    f"value_loss: {update_metrics['value_loss']:.4f}"
+                    f"policy: {update_metrics['policy_loss']:.4f} | "
+                    f"value: {update_metrics['value_loss']:.4f} | "
+                    f"kl: {update_metrics['kl_divergence']:.4f} | "
+                    f"lr: {update_metrics['learning_rate']:.2e}"
                 )
 
                 # TensorBoard
                 self.writer.add_scalar("charts/fps", fps, global_step)
+                self.writer.add_scalar("charts/learning_rate", update_metrics["learning_rate"], global_step)
                 self.writer.add_scalar("losses/policy_loss", update_metrics["policy_loss"], global_step)
                 self.writer.add_scalar("losses/value_loss", update_metrics["value_loss"], global_step)
                 self.writer.add_scalar("losses/entropy", update_metrics["entropy"], global_step)
+                self.writer.add_scalar("losses/bounds_loss", update_metrics["bounds_loss"], global_step)
+                self.writer.add_scalar("losses/kl_divergence", update_metrics["kl_divergence"], global_step)
 
                 for key, value in reward_components.items():
                     self.writer.add_scalar(f"reward/{key}", value, global_step)
@@ -625,10 +671,10 @@ def main():
     parser.add_argument("--use-depth", action="store_true", help="Enable depth sensor")
     parser.add_argument("--no-fabric", action="store_true", help="Disable FABRICS observations")
 
-    # Training
-    parser.add_argument("--total-timesteps", type=int, default=10_000_000, help="Total timesteps")
-    parser.add_argument("--learning-rate", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--rollout-steps", type=int, default=24, help="Rollout steps per update")
+    # Training (DEXTRAH defaults)
+    parser.add_argument("--total-timesteps", type=int, default=100_000_000, help="Total timesteps")
+    parser.add_argument("--learning-rate", type=float, default=5e-4, help="Learning rate (DEXTRAH: 5e-4)")
+    parser.add_argument("--rollout-steps", type=int, default=16, help="Rollout steps per update (DEXTRAH: horizon_length=16)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
     # Logging

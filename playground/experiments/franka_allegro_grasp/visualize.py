@@ -221,9 +221,11 @@ class VisualizeExample:
         if int(self.sim_time * 10) % 10 == 0:
             rc = self.env.reward_components
             print(f"[t={self.sim_time:.1f}s] "
-                  f"phase: R={rc.get('phase_reach', 0):.1f}/G={rc.get('phase_grasp', 0):.1f}/L={rc.get('phase_lift', 0):.1f} | "
-                  f"ee2cube: {rc.get('ee_to_cube_dist', 0):.3f} | "
-                  f"cube_h: {rc.get('cube_height', 0):.3f}")
+                  f"h2o: {rc.get('hand_to_object_reward', 0):.2f} | "
+                  f"o2g: {rc.get('object_to_goal_reward', 0):.2f} | "
+                  f"lift: {rc.get('lift_reward', 0):.2f} | "
+                  f"dist: {rc.get('hand_to_object_dist', 0):.3f} | "
+                  f"h: {rc.get('cube_height', 0):.3f}")
 
     def render(self):
         """Render the scene."""

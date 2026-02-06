@@ -8,10 +8,12 @@ Franka Emika Panda 로봇 팔과 Allegro 손을 결합하여 테이블 위의 �
 
 **목표**: Franka arm + Allegro hand로 테이블 위의 큐브를 잡아서 목표 높이까지 들어올리기
 
-### 3단계 Task Phase
+### Task Phase (시각화용)
 
-1. **Reach**: End effector를 큐브 위치로 이동
-2. **Grasp**: 손가락으로 큐브를 잡기
+Phase는 시각화 및 로깅 목적으로 추적되지만, **보상은 DEXTRAH 원본처럼 continuous하게 계산**됩니다:
+
+1. **Reach**: End effector가 큐브에 접근 (hand_to_object_dist < 0.3m)
+2. **Grasp**: 손가락으로 큐브를 잡는 중 (cube_height > table + 0.05m)
 3. **Lift**: 큐브를 목표 높이까지 들어올리기
 
 ## Scene Layout
@@ -75,8 +77,8 @@ Env 0 (0, 0)      Env 1 (0, 1.5)
 ### Depth Observations (Optional)
 
 - **Depth image**: `depth_width × depth_height` (기본 160×120 = 19200 dims)
-- 카메라는 End Effector에 부착
-- 깊이값은 `[depth_min, depth_max]` 범위로 정규화
+- 카메라는 테이블 짧은 면(로봇 쪽)에 고정 설치
+- 깊이값은 `[depth_min, depth_max]` 범위로 정규화 (0~1)
 
 ## Action Space (23 dims)
 
@@ -91,49 +93,61 @@ Env 0 (0, 0)      Env 1 (0, 1.5)
 
 ## Reward Structure
 
-### Phase별 Reward
+DEXTRAH 원본의 continuous reward 구조를 사용합니다. 모든 보상 컴포넌트가 동시에 계산되고 합산됩니다.
 
-| Phase | Reward | 설명 |
-|-------|--------|------|
-| Reach | `exp(-5 × dist_ee_to_cube)` | EE가 큐브에 가까워질수록 보상 |
-| Grasp | `exp(-10 × dist_ee_to_cube)` | 큐브를 잡은 상태 유지 |
-| Lift | `exp(-5 × dist_cube_to_goal)` | 큐브가 목표 높이에 가까워질수록 보상 |
+### DEXTRAH Reward Components (Continuous Sum)
 
-### Bonus & Penalty
+```
+total_reward = hand_to_object + object_to_goal + finger_curl_reg + lift + success_bonus
+```
 
-| 항목 | 값 | 조건 |
+| Component | 수식 | Weight | Sharpness |
+|-----------|------|--------|-----------|
+| `hand_to_object` | `w × exp(-s × dist_ee_to_cube)` | 1.0 | 10.0 |
+| `object_to_goal` | `w × exp(-s × dist_cube_to_goal)` | 5.0 | 15.0 |
+| `lift` | `w × exp(-s × vertical_error)` | 5.0 | 8.5 |
+| `finger_curl_reg` | `w × ‖q - curled_q‖²` | -0.01 | - |
+| `success_bonus` | `w (if in_success_region)` | 10.0 | - |
+
+### Thresholds (DEXTRAH 원본 값)
+
+| 항목 | 값 | 설명 |
 |------|-----|------|
-| Reach bonus | +50 | EE-큐브 거리 < 0.1m |
-| Grasp bonus | +100 | 큐브 잡기 성공 |
-| Lift bonus | +250 | 목표 높이 도달 |
+| `hand_to_object_dist_threshold` | 0.3m | 도달 판정 임계값 |
+| `object_goal_tol` | 0.1m | 성공 판정 거리 |
+| `object_height_thresh` | 0.15m | 리프트 성공 높이 |
+| `min_episode_steps` | 60 | 최소 에피소드 길이 |
+
+### Penalties
+
+| 항목 | 값 | 설명 |
+|------|-----|------|
 | Drop penalty | -100 | 큐브 낙하 |
 | Action penalty | -0.0001 × Σ(a²) | 액션 크기 |
+| Velocity penalty | -0.01 × Σ(v²) | 관절 속도 |
 
 ## 실행 방법
 
 ### 시각화
 
 ```bash
-# 기본 실행 (스크립트 데모)
-uv run --extra examples --extra torch-cu12 python -m playground.experiments.franka_allegro_grasp.visualize
+# 기본 실행 (depth sensor, matplotlib 시각화, 카메라 디버그 모두 기본 활성화)
+uv run --extra examples --extra torch-cu12 --with matplotlib python -m playground.experiments.franka_allegro_grasp.visualize
 
 # 다중 환경
-uv run --extra examples --extra torch-cu12 python -m playground.experiments.franka_allegro_grasp.visualize --num-envs 16
+uv run --extra examples --extra torch-cu12 --with matplotlib python -m playground.experiments.franka_allegro_grasp.visualize --num-envs 16
 
-# Depth sensor 활성화
-uv run --extra examples --extra torch-cu12 python -m playground.experiments.franka_allegro_grasp.visualize --use-depth
-
-# Depth sensor + 실시간 matplotlib 시각화 (Newton 뷰어와 함께)
-uv run --extra examples --extra torch-cu12 --with matplotlib python -m playground.experiments.franka_allegro_grasp.visualize --use-depth --show-depth
-
-# 카메라 위치 및 FOV 디버그 시각화 (주황색 구: 카메라 위치, 청록색: FOV)
-uv run --extra examples --extra torch-cu12 python -m playground.experiments.franka_allegro_grasp.visualize --use-depth --debug-camera
+# 특정 기능 비활성화
+uv run --extra examples --extra torch-cu12 python -m playground.experiments.franka_allegro_grasp.visualize \
+    --no-depth              # depth sensor 비활성화
+    --no-show-depth         # matplotlib depth 창 숨기기
+    --no-debug-camera       # 카메라 디버그 시각화 숨기기
 
 # 랜덤 액션
-uv run --extra examples --extra torch-cu12 python -m playground.experiments.franka_allegro_grasp.visualize --random
+uv run --extra examples --extra torch-cu12 --with matplotlib python -m playground.experiments.franka_allegro_grasp.visualize --random
 
 # 학습된 정책 시각화
-uv run --extra examples --extra torch-cu12 python -m playground.experiments.franka_allegro_grasp.visualize \
+uv run --extra examples --extra torch-cu12 --with matplotlib python -m playground.experiments.franka_allegro_grasp.visualize \
     --checkpoint checkpoints/franka_allegro_grasp_XXXXXX/final.pt
 ```
 
@@ -149,13 +163,14 @@ uv run --extra examples --extra torch-cu12 python -m playground.experiments.fran
 
 ## 환경 설정
 
-### Simulation
+### Simulation (DEXTRAH 원본)
 
 ```python
-fps: int = 60
-sim_substeps: int = 4
-control_decimation: int = 2  # 30Hz control
-episode_length: int = 400    # ~6.7 seconds
+fps: int = 120                # Physics at 120Hz (DEXTRAH: sim_dt = 1/120)
+sim_substeps: int = 1         # No additional substeps
+control_decimation: int = 2   # 60Hz control (DEXTRAH: decimation = 2)
+episode_length: int = 600     # 10 seconds (DEXTRAH: episode_length_s = 10.0)
+min_episode_steps: int = 60   # DEXTRAH minimum
 ```
 
 ### Robot Parameters
@@ -188,8 +203,9 @@ cube_mass: float = 0.1               # 100g
 cube_spawn_pos: tuple = (-0.3, -0.5, 0.45)  # on table center
 cube_spawn_noise: float = 0.05       # ±5cm randomization
 
-# Goal
-lift_height: float = 0.2             # lift 20cm above table
+# Goal (DEXTRAH values)
+lift_height: float = 0.15            # lift 15cm above table (object_height_thresh)
+goal_tolerance: float = 0.1          # success distance tolerance (object_goal_tol)
 ```
 
 ### Depth Sensor
@@ -204,7 +220,7 @@ depth_max: float = 2.0       # meters
 ```
 
 **카메라 위치**: 테이블 짧은 면(로봇 쪽)에서 테이블/큐브를 바라보는 고정 뷰
-- 위치: 각 환경의 (-0.3, 0.1, 0.55) - 로봇 옆, 낮은 높이
+- 위치: 각 환경의 (-0.3, 0.1, 0.43) - 로봇 옆, 낮은 높이
 - 방향: 큐브 영역 (-0.3, -0.5, 0.45) 방향
 
 ## 구현 세부사항
@@ -243,14 +259,16 @@ depth_sensor.render(
 )
 ```
 
-### Phase Transition
+### Phase Transition (시각화용)
 
-Task phase는 자동으로 전환됩니다:
+Task phase는 시각화 목적으로 자동 전환됩니다. **보상은 phase와 무관하게 continuous하게 계산**됩니다:
 
 ```
-Reach → Grasp: EE-큐브 거리 < reach_threshold (0.1m)
+Reach → Grasp: EE-큐브 거리 < hand_to_object_dist_threshold (0.3m)
 Grasp → Lift: 큐브 높이 > table_height + 0.05m
 ```
+
+**중요**: DEXTRAH 원본과 동일하게, 모든 reward component는 항상 동시에 계산되고 합산됩니다.
 
 ### Environment Replication
 
@@ -277,25 +295,41 @@ for env_idx in range(num_envs):
 
 ## FABRICS 통합
 
-이 예제는 [FABRICS](https://github.com/NVlabs/FABRICS) (Riemannian Geometric Fabrics)의 핵심 개념을 단순화하여 구현합니다.
+이 예제는 [FABRICS](https://github.com/NVlabs/FABRICS) (Riemannian Geometric Fabrics)와 [DEXTRAH](https://github.com/NVlabs/DEXTRAH) 스타일의 파지 보상을 통합합니다.
+
+### 환경 통합
+
+`FrankaAllegroGraspEnv`는 내부적으로 `GraspFabric` 모듈을 사용하여:
+1. 매 스텝마다 grasp features 계산
+2. FABRICS 기반 보상을 reward에 직접 통합
+3. 손가락 위치 기반 파지 품질 평가
 
 ### FABRICS 핵심 개념
 
 1. **Task Map**: 관절 공간(joint space)을 작업 공간(task space)으로 매핑
-   - `LinearTaskMap`: PCA 기반 손 제어
-   - `FingertipTaskMap`: 손가락 끝 위치 계산
+   - `LinearTaskMap`: PCA 기반 손 제어 (synergy-based control)
+   - `FingertipTaskMap`: 손가락 끝 위치 계산 (forward kinematics)
 
 2. **Grasp Features**: 파지 관련 특징 계산
-   - 손가락 끝-큐브 거리
-   - Grasp closure (손가락 중심점과 큐브 중심 거리)
-   - Palm-to-cube 벡터
+   - `fingertip_positions`: 월드 좌표계 손가락 끝 위치 (batch, 4, 3)
+   - `fingertip_distances`: 손가락 끝-큐브 거리 (batch, 4)
+   - `grasp_closure`: 손가락 중심점과 큐브 중심 거리 (batch,)
+   - `palm_to_cube`: Palm-to-cube 벡터 (batch, 3)
 
-3. **Grasp Rewards**: 파지 기반 보상
-   - Contact reward: 손가락이 큐브 표면에 닿을 때
-   - Closure reward: 손가락이 큐브를 감쌀 때
-   - Multi-contact bonus: 여러 손가락이 동시에 접촉할 때
+3. **Grasp Rewards**: 파지 기반 보상 (env.py에 직접 통합)
+   - `contact_reward`: 손가락이 큐브 표면에 닿을 때
+   - `closure_reward`: 손가락이 큐브를 감쌀 때
+   - `approach_reward`: 손바닥이 큐브에 가까울 때
+   - `multi_contact_bonus`: 여러 손가락이 동시에 접촉할 때
 
-### 사용 예시
+### Training Pipeline
+
+PPO 학습 시 FABRICS 관측을 추가로 사용:
+- 학습 네트워크에 fabric observation encoder 포함
+- Fabric features를 별도 MLP로 인코딩 후 state와 결합
+- `--no-fabric` 옵션으로 비활성화 가능
+
+### 코드 예시
 
 ```python
 from playground.experiments.franka_allegro_grasp import GraspFabric
@@ -309,6 +343,11 @@ grasp_features = fabric.compute_grasp_features(
 
 # Get grasp rewards
 grasp_rewards = fabric.compute_grasp_reward(grasp_features, cube_size=0.05)
+
+# Access individual components
+contact_reward = grasp_rewards["contact_reward"]      # (batch,)
+closure_reward = grasp_rewards["closure_reward"]      # (batch,)
+multi_contact = grasp_rewards["multi_contact_bonus"]  # (batch,)
 ```
 
 ## 학습
@@ -329,12 +368,12 @@ uv run --extra examples --extra torch-cu12 python -m playground.experiments.fran
 ### 학습 옵션
 
 ```bash
-# Full training with wandb
+# Full training with wandb (DEXTRAH default values)
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.franka_allegro_grasp.train \
-    --num-envs 512 \
-    --total-timesteps 50000000 \
-    --learning-rate 3e-4 \
-    --rollout-steps 24 \
+    --num-envs 256 \
+    --total-timesteps 100000000 \
+    --learning-rate 5e-4 \
+    --rollout-steps 16 \
     --wandb-project my-grasp-project
 
 # Without FABRICS observations
@@ -370,26 +409,103 @@ franka_allegro_grasp/
 └── README.md
 ```
 
-## PPO 하이퍼파라미터
+## PPO 하이퍼파라미터 (DEXTRAH 원본)
 
 ```python
-learning_rate: float = 3e-4
+# Learning (DEXTRAH values)
+learning_rate: float = 5e-4         # DEXTRAH: 5e-4
+lr_schedule: str = "adaptive"       # Adaptive LR based on KL
 gamma: float = 0.99
-gae_lambda: float = 0.95
-clip_epsilon: float = 0.2
-entropy_coef: float = 0.01
-value_coef: float = 0.5
+gae_lambda: float = 0.95            # DEXTRAH: tau = 0.95
+
+# Clipping
+clip_epsilon: float = 0.2           # DEXTRAH: e_clip = 0.2
+kl_threshold: float = 0.016         # DEXTRAH: early stopping threshold
+
+# Loss coefficients
+entropy_coef: float = 0.0           # DEXTRAH: 0.0
+value_coef: float = 4.0             # DEXTRAH: critic_coef = 4
+bounds_loss_coef: float = 0.0001    # DEXTRAH: action bounds penalty
 max_grad_norm: float = 1.0
-num_epochs: int = 5
-num_minibatches: int = 4
-rollout_steps: int = 24
-hidden_dims: tuple = (512, 256, 128)
+
+# Training dynamics
+num_epochs: int = 5                 # DEXTRAH: mini_epochs = 5
+rollout_steps: int = 16             # DEXTRAH: horizon_length = 16
+minibatch_size: int = 8192          # DEXTRAH: 8192
+
+# Normalization
+normalize_input: bool = True
+normalize_value: bool = True
+normalize_advantage: bool = True
+observation_clip: float = 5.0
+action_clip: float = 1.0
+
+# Network (DEXTRAH: [512, 512, 256, 128])
+hidden_dims: tuple = (512, 512, 256, 128)
+activation: str = "elu"
 ```
+
+## DEXTRAH 원본 정렬
+
+이 구현은 [NVlabs/DEXTRAH](https://github.com/NVlabs/DEXTRAH)의 원본 값들과 정렬되어 있습니다:
+
+### Simulation
+
+| 항목 | DEXTRAH 원본 | 이 구현 |
+|------|-------------|--------|
+| Physics frequency | 120 Hz | 120 Hz ✓ |
+| Control frequency | 60 Hz | 60 Hz ✓ |
+| Episode length | 10.0s | 10.0s ✓ |
+| Min episode steps | 60 | 60 ✓ |
+
+### Reward Structure
+
+| 항목 | DEXTRAH 원본 | 이 구현 |
+|------|-------------|--------|
+| hand_to_object weight | 1.0 | 1.0 ✓ |
+| hand_to_object sharpness | 10.0 | 10.0 ✓ |
+| object_to_goal weight | 5.0 | 5.0 ✓ |
+| lift weight | 5.0 | 5.0 ✓ |
+| lift sharpness | 8.5 | 8.5 ✓ |
+| finger_curl_reg weight | -0.01 | -0.01 ✓ |
+| success bonus | 10.0 | 10.0 ✓ |
+
+### Thresholds
+
+| 항목 | DEXTRAH 원본 | 이 구현 |
+|------|-------------|--------|
+| hand_to_object_dist_threshold | 0.3m | 0.3m ✓ |
+| object_goal_tol | 0.1m | 0.1m ✓ |
+| object_height_thresh | 0.15m | 0.15m ✓ |
+
+### PPO Hyperparameters
+
+| 항목 | DEXTRAH 원본 | 이 구현 |
+|------|-------------|--------|
+| learning_rate | 5e-4 | 5e-4 ✓ |
+| lr_schedule | adaptive | adaptive ✓ |
+| gamma | 0.99 | 0.99 ✓ |
+| tau (gae_lambda) | 0.95 | 0.95 ✓ |
+| e_clip | 0.2 | 0.2 ✓ |
+| kl_threshold | 0.016 | 0.016 ✓ |
+| entropy_coef | 0.0 | 0.0 ✓ |
+| critic_coef (value_coef) | 4.0 | 4.0 ✓ |
+| bounds_loss_coef | 0.0001 | 0.0001 ✓ |
+| horizon_length | 16 | 16 ✓ |
+| mini_epochs | 5 | 5 ✓ |
+| network | [512,512,256,128] | [512,512,256,128] ✓ |
+| activation | elu | elu ✓ |
+
+### 주요 차이점
+
+- **로봇**: DEXTRAH는 Kuka 팔 사용, 이 구현은 Franka Emika Panda 사용
+- **시뮬레이터**: DEXTRAH는 Isaac Lab 사용, 이 구현은 Newton 사용
+- **FABRICS**: 학습 관측에 추가적으로 FABRICS features 사용 가능 (`--no-fabric`으로 비활성화)
 
 ## 참고 자료
 
 - [FABRICS](https://github.com/NVlabs/FABRICS) - Riemannian Geometric Fabrics
-- [DEXTRAH](https://github.com/NVlabs/DEXTRAH) - Kuka + Allegro grasping
+- [DEXTRAH](https://github.com/NVlabs/DEXTRAH) - Kuka + Allegro grasping (원본 참조)
 - [Newton SensorTiledCamera](../../newton/sensors.py) - Depth sensor API
 - [Franka Allegro Example](../franka_allegro/) - 기본 결합 예제
 - [CleanRL](https://github.com/vwxyzjn/cleanrl) - PPO 구현 참고

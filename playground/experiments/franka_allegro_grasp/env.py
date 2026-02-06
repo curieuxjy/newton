@@ -7,6 +7,7 @@ Reference: DEXTRAH (NVlabs/DEXTRAH) - dextrah_kuka_allegro_env.py
 """
 
 import math
+import re
 from typing import Any
 
 import numpy as np
@@ -14,10 +15,11 @@ import torch
 import warp as wp
 
 import newton
-from newton import ActuatorMode
-from newton.sensors import SensorTiledCamera
+from newton import ActuatorMode, Contacts
+from newton.sensors import SensorContact, SensorTiledCamera, populate_contacts
 
 from .config import EnvConfig
+from .fabric import GraspFabric
 
 
 class FrankaAllegroGraspEnv:
@@ -107,6 +109,16 @@ class FrankaAllegroGraspEnv:
 
         # Reward components for logging
         self.reward_components: dict[str, float] = {}
+
+        # Setup FABRICS module for grasp feature computation
+        self.fabric = GraspFabric(
+            franka_dof=self.franka_dof_count,
+            allegro_dof=self.allegro_dof_count,
+            device=self.torch_device,
+        )
+
+        # Setup contact sensor for finger-cube contact detection
+        self._setup_contact_sensor()
 
         # Store initial state
         self._store_initial_state()
@@ -369,6 +381,29 @@ class FrankaAllegroGraspEnv:
 
         # Camera transforms will be updated based on EE pose
         self.camera_transforms = wp.zeros((self.num_envs, 1), dtype=wp.transformf, device=self.device)
+
+    def _setup_contact_sensor(self):
+        """Setup contact sensor for finger-cube contact detection."""
+        # Create a Contacts object for storing contact info
+        self.contact_data = Contacts(0, 0)
+
+        # Find fingertip shapes (link3 are the distal links in Allegro)
+        # Allegro finger structure: link0 (base) -> link1 -> link2 -> link3 (tip)
+        # We want to detect contacts between fingertip shapes and the cube
+        try:
+            self.finger_contact_sensor = SensorContact(
+                self.model,
+                sensing_obj_shapes=".*link3.*",  # Fingertip links
+                counterpart_shapes=".*cube.*",   # Cube
+                match_fn=lambda string, pat: re.match(pat, string, re.IGNORECASE),
+                include_total=True,
+                verbose=False,
+            )
+            self.use_contact_sensor = True
+        except Exception as e:
+            print(f"[WARNING] Failed to setup contact sensor: {e}")
+            self.finger_contact_sensor = None
+            self.use_contact_sensor = False
 
     def _store_initial_state(self):
         """Store initial state for resetting environments."""
@@ -736,67 +771,91 @@ class FrankaAllegroGraspEnv:
         )
 
     def _compute_rewards(self) -> torch.Tensor:
-        """Compute rewards based on task phase."""
+        """Compute rewards using DEXTRAH continuous reward structure.
+
+        DEXTRAH reward = hand_to_object + object_to_goal + finger_curl_reg + lift
+        All components are computed continuously and summed (not phase-based).
+        """
         body_q = torch.from_numpy(self.state_0.body_q.numpy()).to(self.torch_device)
+        joint_q = torch.from_numpy(self.state_0.joint_q.numpy()).to(self.torch_device)
         joint_qd = torch.from_numpy(self.state_0.joint_qd.numpy()).to(self.torch_device)
 
         body_q_reshaped = body_q.reshape(self.num_envs, self.bodies_per_env, 7)
+        joint_q_reshaped = joint_q.reshape(self.num_envs, self.joint_q_per_env)
         joint_qd_reshaped = joint_qd.reshape(self.num_envs, self.joint_qd_per_env)
 
         # Get positions
         ee_pos = body_q_reshaped[:, self.ee_body_idx, :3]
+        ee_quat = body_q_reshaped[:, self.ee_body_idx, 3:7]
         cube_pos = body_q_reshaped[:, self.cube_body_idx, :3]
 
-        # Distance from EE to cube
-        ee_to_cube_dist = torch.norm(ee_pos - cube_pos, dim=-1)
+        # Get Allegro joint positions
+        allegro_q = joint_q_reshaped[
+            :, self.allegro_dof_start:self.allegro_dof_start + self.allegro_dof_count
+        ]
 
-        # Distance from cube to goal
-        cube_to_goal_dist = torch.norm(cube_pos - self.goal_pos, dim=-1)
+        # === DEXTRAH Reward Components (continuous, all summed) ===
 
-        # Cube height
+        # 1. Hand-to-Object Reward: weight * exp(-sharpness * dist)
+        # Encourages fingertip and palm to approach object
+        hand_to_object_dist = torch.norm(ee_pos - cube_pos, dim=-1)
+        hand_to_object_reward = self.config.hand_to_object_weight * torch.exp(
+            -self.config.hand_to_object_sharpness * hand_to_object_dist
+        )
+
+        # 2. Object-to-Goal Reward: weight * exp(-sharpness * dist)
+        # Incentivizes moving object toward goal position
+        object_to_goal_dist = torch.norm(cube_pos - self.goal_pos, dim=-1)
+        object_to_goal_reward = self.config.object_to_goal_weight * torch.exp(
+            -self.config.object_to_goal_sharpness * object_to_goal_dist
+        )
+
+        # 3. Finger Curl Regularization: weight * ||q - curled_q||²
+        # Prevents excessive finger curling during approach (negative weight = penalty)
+        # Curled configuration: nominally closed fingers
+        curled_q = torch.tensor(
+            [0.0, 0.8, 0.8, 0.8] * 4,  # 4 fingers, each with [abduction, proximal, middle, distal]
+            dtype=torch.float32, device=self.torch_device
+        ).unsqueeze(0).expand(self.num_envs, -1)
+        finger_curl_diff = allegro_q - curled_q
+        finger_curl_reg = self.config.finger_curl_reg_weight * torch.sum(finger_curl_diff ** 2, dim=-1)
+
+        # 4. Lift Reward: weight * exp(-sharpness * vertical_error)
+        # Rewards lifting object off table toward goal height
         cube_height = cube_pos[:, 2]
-
-        # === Phase-based rewards ===
-
-        # Phase 0: Reach - move EE close to cube
-        reach_reward = self.config.reach_reward_scale * torch.exp(-5.0 * ee_to_cube_dist)
-        reached = ee_to_cube_dist < self.config.reach_threshold
-        reach_bonus = torch.where(reached, torch.full_like(reach_reward, self.config.reach_bonus), torch.zeros_like(reach_reward))
-
-        # Phase 1: Grasp - encourage finger contact (simplified: based on EE-cube distance staying small)
-        grasp_reward = self.config.grasp_reward_scale * torch.exp(-10.0 * ee_to_cube_dist)
-
-        # Phase 2: Lift - move cube to goal height
-        lift_reward = self.config.lift_reward_scale * torch.exp(-5.0 * cube_to_goal_dist)
-        lifted = cube_to_goal_dist < self.config.goal_tolerance
-        lift_bonus = torch.where(lifted, torch.full_like(lift_reward, self.config.lift_bonus), torch.zeros_like(lift_reward))
-
-        # Update task phase
-        # Reach -> Grasp when close enough
-        self.task_phase = torch.where(
-            (self.task_phase == 0) & reached,
-            torch.ones_like(self.task_phase),
-            self.task_phase
-        )
-        # Grasp -> Lift when cube is above table
-        grasped = (ee_to_cube_dist < self.config.reach_threshold) & (cube_height > self.config.table_height + 0.05)
-        self.task_phase = torch.where(
-            (self.task_phase == 1) & grasped,
-            torch.full_like(self.task_phase, 2),
-            self.task_phase
+        goal_height = self.config.table_height + self.config.lift_height
+        vertical_error = torch.abs(cube_height - goal_height)
+        lift_reward = self.config.lift_weight * torch.exp(
+            -self.config.lift_sharpness * vertical_error
         )
 
-        # Apply phase-specific rewards
-        phase_0_mask = self.task_phase == 0
-        phase_1_mask = self.task_phase == 1
-        phase_2_mask = self.task_phase == 2
+        # 5. In-Success-Region Bonus
+        # Bonus when object is at goal position
+        in_success_region = object_to_goal_dist < self.config.object_goal_tol
+        success_bonus = torch.where(
+            in_success_region,
+            torch.full_like(hand_to_object_reward, self.config.in_success_region_weight),
+            torch.zeros_like(hand_to_object_reward)
+        )
 
-        reward = torch.zeros_like(reach_reward)
-        reward = torch.where(phase_0_mask, reach_reward + reach_bonus, reward)
-        reward = torch.where(phase_1_mask, grasp_reward, reward)
-        reward = torch.where(phase_2_mask, lift_reward + lift_bonus, reward)
+        # === Compute FABRICS grasp features (for logging and optional use) ===
+        grasp_features = self.fabric.compute_grasp_features(
+            ee_pos, ee_quat, allegro_q, cube_pos, self.config.cube_size
+        )
+        fabric_rewards = self.fabric.compute_grasp_reward(
+            grasp_features, self.config.cube_size
+        )
 
-        # === Penalties ===
+        # === DEXTRAH Total Reward (continuous sum) ===
+        reward = (
+            hand_to_object_reward +
+            object_to_goal_reward +
+            finger_curl_reg +  # This is negative (penalty)
+            lift_reward +
+            success_bonus
+        )
+
+        # === Additional Penalties ===
 
         # Action penalty
         action_penalty = self.config.action_penalty_scale * torch.sum(self.actions ** 2, dim=-1)
@@ -812,8 +871,22 @@ class FrankaAllegroGraspEnv:
         dropped = cube_height < self.config.fall_height
         drop_penalty = torch.where(dropped, torch.full_like(reward, self.config.drop_penalty), torch.zeros_like(reward))
 
+        # === Update task phase (for logging/visualization) ===
+        reached = hand_to_object_dist < self.config.hand_to_object_dist_threshold
+        self.task_phase = torch.where(
+            (self.task_phase == 0) & reached,
+            torch.ones_like(self.task_phase),
+            self.task_phase
+        )
+        grasped = reached & (cube_height > self.config.table_height + 0.05)
+        self.task_phase = torch.where(
+            (self.task_phase == 1) & grasped,
+            torch.full_like(self.task_phase, 2),
+            self.task_phase
+        )
+
         # Success tracking
-        is_success = lifted & (self.task_phase == 2)
+        is_success = in_success_region & (cube_height > self.config.table_height + self.config.object_height_thresh)
         self.consecutive_successes = torch.where(is_success, self.consecutive_successes + 1, torch.zeros_like(self.consecutive_successes))
         self.successes = torch.where(
             self.consecutive_successes >= self.config.consecutive_successes,
@@ -825,18 +898,34 @@ class FrankaAllegroGraspEnv:
         self.reward_buf = reward - action_penalty - action_delta_penalty - vel_penalty + drop_penalty
 
         # Store components for logging
+        phase_0_mask = self.task_phase == 0
+        phase_1_mask = self.task_phase == 1
+        phase_2_mask = self.task_phase == 2
+
         self.reward_components = {
-            "reach_reward": reach_reward.mean().item(),
-            "grasp_reward": grasp_reward.mean().item(),
+            # DEXTRAH reward components
+            "hand_to_object_reward": hand_to_object_reward.mean().item(),
+            "object_to_goal_reward": object_to_goal_reward.mean().item(),
+            "finger_curl_reg": finger_curl_reg.mean().item(),
             "lift_reward": lift_reward.mean().item(),
+            "success_bonus": success_bonus.mean().item(),
+            # Penalties
             "action_penalty": -action_penalty.mean().item(),
             "drop_penalty": drop_penalty.mean().item(),
-            "ee_to_cube_dist": ee_to_cube_dist.mean().item(),
-            "cube_to_goal_dist": cube_to_goal_dist.mean().item(),
+            # Distances
+            "hand_to_object_dist": hand_to_object_dist.mean().item(),
+            "object_to_goal_dist": object_to_goal_dist.mean().item(),
             "cube_height": cube_height.mean().item(),
+            "vertical_error": vertical_error.mean().item(),
+            # Phase tracking (for visualization)
             "phase_reach": phase_0_mask.float().mean().item(),
             "phase_grasp": phase_1_mask.float().mean().item(),
             "phase_lift": phase_2_mask.float().mean().item(),
+            # FABRICS metrics (for comparison)
+            "fabric_contact": fabric_rewards["contact_reward"].mean().item(),
+            "fabric_closure": fabric_rewards["closure_reward"].mean().item(),
+            "fabric_approach": fabric_rewards["approach_reward"].mean().item(),
+            "grasp_closure_dist": grasp_features["grasp_closure"].mean().item(),
         }
 
         return self.reward_buf

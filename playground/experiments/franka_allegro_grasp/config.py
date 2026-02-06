@@ -11,12 +11,12 @@ class EnvConfig:
     """Environment configuration."""
 
     num_envs: int = 256
-    episode_length: int = 400  # 8 seconds at 50Hz
+    episode_length: int = 600  # 10 seconds at 60Hz control (DEXTRAH: 10.0s)
 
-    # Simulation
-    fps: int = 60
-    sim_substeps: int = 4
-    control_decimation: int = 2  # control at 30Hz
+    # Simulation (DEXTRAH: 120Hz physics, 60Hz control)
+    fps: int = 120  # Physics frequency
+    sim_substeps: int = 1  # No additional substeps (already 120Hz)
+    control_decimation: int = 2  # 60Hz control (120Hz / 2)
 
     # Robot - Franka arm
     franka_stiffness: float = 500.0
@@ -46,8 +46,8 @@ class EnvConfig:
     cube_spawn_noise: float = 0.05  # XY randomization range
 
     # Goal
-    lift_height: float = 0.2  # How high to lift the cube above table
-    goal_tolerance: float = 0.05  # Distance tolerance for success
+    lift_height: float = 0.15  # How high to lift the cube above table (DEXTRAH: object_height_thresh)
+    goal_tolerance: float = 0.1  # Distance tolerance for success (DEXTRAH: object_goal_tol)
 
     # Depth sensor
     use_depth_sensor: bool = True
@@ -57,20 +57,27 @@ class EnvConfig:
     depth_min: float = 0.1
     depth_max: float = 2.0
 
-    # Reward weights (DEXTRAH style)
-    # Phase 1: Reach - move hand to cube
-    reach_reward_scale: float = 1.0
-    reach_bonus: float = 50.0
-    reach_threshold: float = 0.1  # distance to consider "reached"
+    # Reward weights (DEXTRAH original values)
+    # Hand-to-object reward: weight * exp(-sharpness * dist)
+    hand_to_object_weight: float = 1.0
+    hand_to_object_sharpness: float = 10.0
+    hand_to_object_dist_threshold: float = 0.3  # meters
 
-    # Phase 2: Grasp - close fingers around cube
-    grasp_reward_scale: float = 2.0
-    grasp_bonus: float = 100.0
-    finger_contact_reward: float = 10.0
+    # Object-to-goal reward: weight * exp(-sharpness * dist)
+    object_to_goal_weight: float = 5.0
+    object_to_goal_sharpness: float = 15.0  # ADR range: 15-20
 
-    # Phase 3: Lift - lift cube to goal height
-    lift_reward_scale: float = 5.0
-    lift_bonus: float = 250.0
+    # Lift reward: weight * exp(-sharpness * vertical_error)
+    lift_weight: float = 5.0
+    lift_sharpness: float = 8.5
+    object_height_thresh: float = 0.15  # meters for lift criteria
+
+    # Finger curl regularization (penalty)
+    finger_curl_reg_weight: float = -0.01
+
+    # Success bonus
+    in_success_region_weight: float = 10.0
+    object_goal_tol: float = 0.1  # meters
 
     # Penalties
     action_penalty_scale: float = 0.0001
@@ -81,6 +88,7 @@ class EnvConfig:
     # Success/Failure
     consecutive_successes: int = 10  # Hold for N steps
     fall_height: float = 0.3  # Below this z, cube is dropped
+    min_episode_steps: int = 60  # DEXTRAH minimum episode length
 
     # Domain randomization
     randomize_cube_pos: bool = True
@@ -89,24 +97,47 @@ class EnvConfig:
 
 @dataclass
 class PPOConfig:
-    """PPO algorithm configuration."""
+    """PPO algorithm configuration (DEXTRAH original values)."""
 
-    learning_rate: float = 3e-4
+    # Learning (DEXTRAH: 5e-4 with adaptive schedule)
+    learning_rate: float = 5e-4
+    lr_schedule: str = "adaptive"  # "adaptive" or "linear" or "constant"
     gamma: float = 0.99
-    gae_lambda: float = 0.95
-    clip_epsilon: float = 0.2
-    entropy_coef: float = 0.01
-    value_coef: float = 0.5
+    gae_lambda: float = 0.95  # DEXTRAH: tau = 0.95
+
+    # Clipping (DEXTRAH values)
+    clip_epsilon: float = 0.2  # DEXTRAH: e_clip = 0.2
+    kl_threshold: float = 0.016  # DEXTRAH: kl_threshold = 0.016
+    clip_value: bool = True
+
+    # Loss coefficients (DEXTRAH values)
+    entropy_coef: float = 0.0  # DEXTRAH: 0.0
+    value_coef: float = 4.0  # DEXTRAH: critic_coef = 4
+    bounds_loss_coef: float = 0.0001  # DEXTRAH: bounds_loss_coef = 0.0001
     max_grad_norm: float = 1.0
 
-    num_epochs: int = 5
-    num_minibatches: int = 4
+    # Training dynamics (DEXTRAH values)
+    num_epochs: int = 5  # DEXTRAH: mini_epochs = 5
+    num_minibatches: int = 4  # Will adjust based on num_envs
+    minibatch_size: int = 8192  # DEXTRAH: 8192
     total_timesteps: int = 100_000_000
-    rollout_steps: int = 24
+    rollout_steps: int = 16  # DEXTRAH: horizon_length = 16
+    max_iterations: int = 5000  # DEXTRAH: max_epochs = 5000
 
-    # Network
-    hidden_dims: tuple = (512, 256, 128)
+    # Normalization (DEXTRAH values)
+    normalize_input: bool = True
+    normalize_value: bool = True
+    normalize_advantage: bool = True
+    observation_clip: float = 5.0  # DEXTRAH: 5.0
+    action_clip: float = 1.0  # DEXTRAH: 1.0
+
+    # Network (DEXTRAH: [512, 512, 256, 128])
+    hidden_dims: tuple = (512, 512, 256, 128)
     activation: str = "elu"
+
+    # Sigma (DEXTRAH: fixed sigma)
+    fixed_sigma: bool = True
+    init_sigma: float = 0.0  # DEXTRAH: 0.0
 
     # Depth encoder (if using depth)
     depth_encoder_dims: tuple = (32, 64, 128)
