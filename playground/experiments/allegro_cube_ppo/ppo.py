@@ -53,7 +53,8 @@ class ActorCritic(nn.Module):
         self.actor_mean = layer_init(nn.Linear(prev_dim, num_actions), std=0.01)
 
         # Actor log std (learnable parameter)
-        self.actor_log_std = nn.Parameter(torch.zeros(num_actions))
+        # Initialize to -0.5 (σ ≈ 0.6) for reasonable initial exploration
+        self.actor_log_std = nn.Parameter(torch.full((num_actions,), -0.5))
 
         # Critic head
         self.critic = layer_init(nn.Linear(prev_dim, 1), std=1.0)
@@ -84,8 +85,9 @@ class ActorCritic(nn.Module):
         features = self.shared(obs)
         action_mean = self.actor_mean(features)
 
-        # Clamp log_std to prevent numerical issues
-        log_std_clamped = torch.clamp(self.actor_log_std, min=-20.0, max=2.0)
+        # Clamp log_std to reasonable range for actions in [-1, 1]
+        # min=-2.0 → σ=0.14, max=0.5 → σ=1.65
+        log_std_clamped = torch.clamp(self.actor_log_std, min=-2.0, max=0.5)
         action_std = torch.exp(log_std_clamped)
 
         # Replace NaN in action_mean with zeros
@@ -181,6 +183,7 @@ class RolloutBuffer:
         log_probs_flat = self.log_probs.reshape(-1)
         advantages_flat = self.advantages.reshape(-1)
         returns_flat = self.returns.reshape(-1)
+        values_flat = self.values.reshape(-1)
 
         # Random permutation
         indices = torch.randperm(batch_size, device=self.device)
@@ -195,6 +198,7 @@ class RolloutBuffer:
                 log_probs_flat[batch_indices],
                 advantages_flat[batch_indices],
                 returns_flat[batch_indices],
+                values_flat[batch_indices],
             )
 
     def reset(self):
@@ -235,11 +239,12 @@ class PPO:
         total_pg_loss = 0.0
         total_value_loss = 0.0
         total_entropy_loss = 0.0
+        total_bounds_loss = 0.0
         total_loss = 0.0
         num_updates = 0
 
         for _ in range(self.config.num_epochs):
-            for obs, actions, old_log_probs, advs, returns in buffer.get_batches(self.config.num_minibatches):
+            for obs, actions, old_log_probs, advs, returns, old_values in buffer.get_batches(self.config.num_minibatches):
                 # Get current policy outputs
                 _, new_log_probs, entropy, new_values = self.actor_critic.get_action_and_value(obs, actions)
 
@@ -254,14 +259,25 @@ class PPO:
                 pg_loss2 = -advs * torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss
-                value_loss = 0.5 * ((new_values - returns) ** 2).mean()
+                # Value loss with clipping (PPO2 style)
+                value_clipped = old_values + torch.clamp(
+                    new_values - old_values,
+                    -self.config.clip_epsilon,
+                    self.config.clip_epsilon,
+                )
+                value_loss_unclipped = (new_values - returns) ** 2
+                value_loss_clipped = (value_clipped - returns) ** 2
+                value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
                 # Entropy loss (for exploration)
                 entropy_loss = entropy.mean()
 
-                # Total loss
-                loss = pg_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy_loss
+                # Bounds loss - penalize actions outside [-1, 1]
+                bounds_loss = torch.clamp(actions.abs() - 1.0, min=0.0).pow(2).mean()
+
+                # Total loss (bounds_loss_coef default 0.0001)
+                bounds_loss_coef = getattr(self.config, 'bounds_loss_coef', 0.0001)
+                loss = pg_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy_loss + bounds_loss_coef * bounds_loss
 
                 # Gradient step
                 self.optimizer.zero_grad()
@@ -273,6 +289,7 @@ class PPO:
                 total_pg_loss += pg_loss.item()
                 total_value_loss += value_loss.item()
                 total_entropy_loss += entropy_loss.item()
+                total_bounds_loss += bounds_loss.item()
                 total_loss += loss.item()
                 num_updates += 1
 
@@ -280,6 +297,7 @@ class PPO:
             "policy_loss": total_pg_loss / num_updates,
             "value_loss": total_value_loss / num_updates,
             "entropy": total_entropy_loss / num_updates,
+            "bounds_loss": total_bounds_loss / num_updates,
             "total_loss": total_loss / num_updates,
         }
 

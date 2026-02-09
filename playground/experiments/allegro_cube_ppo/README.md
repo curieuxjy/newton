@@ -35,8 +35,9 @@ allegro_cube_ppo/
 ### Action (16 dims)
 
 - **Delta position control**: 현재 위치에서의 변화량
-- 범위: [-1, 1] × action_scale (0.5)
-- joint limits로 클램핑
+- Policy 출력은 [-1, 1]로 클램핑
+- 최종 범위: [-1, 1] × action_scale (0.5)
+- joint limits로 추가 클램핑
 
 ### Reward (DextrEme 스타일)
 
@@ -222,10 +223,30 @@ gamma: float = 0.99
 gae_lambda: float = 0.95
 clip_epsilon: float = 0.2
 entropy_coef: float = 0.01
+value_coef: float = 0.5
+bounds_loss_coef: float = 0.0001    # 액션 범위 초과 페널티
 num_epochs: int = 5
 rollout_steps: int = 24
 hidden_dims: tuple = (512, 256, 128)
 ```
+
+### Policy Network 안정화
+
+```python
+# Actor log_std 초기화 및 범위 제한
+actor_log_std = nn.Parameter(torch.full((num_actions,), -0.5))  # σ ≈ 0.6
+log_std_clamped = torch.clamp(actor_log_std, min=-2.0, max=0.5)  # σ ∈ [0.14, 1.65]
+
+# Value loss clipping (PPO2 스타일)
+value_clipped = old_values + clamp(new_values - old_values, -ε, +ε)
+value_loss = max(unclipped_loss, clipped_loss)
+
+# Bounds loss - 액션 범위 초과 페널티
+bounds_loss = mean(clamp(|actions| - 1, 0)²)
+```
+
+- **Entropy 범위**: 약 10~30 (16 actions 기준)
+- **Reward clipping**: [-100, 100] 범위로 제한
 
 ## 참고 자료
 

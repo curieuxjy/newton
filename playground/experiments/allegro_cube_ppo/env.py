@@ -481,6 +481,9 @@ class AllegroHandCubeEnv:
             + fall_penalty
         )
 
+        # Clip rewards to stabilize training
+        self.reward_buf = torch.clamp(self.reward_buf, -100.0, 100.0)
+
         # Store individual reward components for logging
         self.reward_components = {
             "rot_reward": rot_reward.mean().item(),

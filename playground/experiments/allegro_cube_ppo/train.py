@@ -166,6 +166,8 @@ def train(config: TrainConfig):
         for step in range(config.ppo.rollout_steps):
             with torch.no_grad():
                 action, log_prob, _, value = actor_critic.get_action_and_value(obs)
+                # Clamp actions to valid range before environment step
+                action = torch.clamp(action, -1.0, 1.0)
 
             # Environment step
             next_obs, reward, done, info = env.step(action)

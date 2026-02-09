@@ -73,6 +73,7 @@ class PPOConfig:
     clip_epsilon: float = 0.2
     entropy_coef: float = 0.01
     value_coef: float = 0.5
+    bounds_loss_coef: float = 0.0001  # Penalize actions outside [-1, 1]
     max_grad_norm: float = 1.0
 
     # Training
