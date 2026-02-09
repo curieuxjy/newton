@@ -25,6 +25,10 @@ class Example:
         # MuJoCo 솔버용 커스텀 속성 등록
         newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
 
+        # 접촉 파라미터 설정 (Newton 2026-02-09 기본값, MuJoCo 정렬)
+        builder.default_shape_cfg.ke = 2.5e3  # 접촉 강성
+        builder.default_shape_cfg.kd = 250.0  # 접촉 감쇠
+
         # H1 에셋 다운로드 (자동 캐시)
         print("\n[H1 에셋 다운로드 중...]")
         asset_path = newton.utils.download_asset("unitree_h1")

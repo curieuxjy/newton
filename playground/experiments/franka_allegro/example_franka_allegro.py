@@ -64,6 +64,10 @@ class Example:
         """Build the combined Franka + Allegro robot."""
         builder = newton.ModelBuilder()
 
+        # 접촉 파라미터 설정 (Newton 2026-02-09 기본값, MuJoCo 정렬)
+        builder.default_shape_cfg.ke = 2.5e3  # 접촉 강성
+        builder.default_shape_cfg.kd = 250.0  # 접촉 감쇠
+
         # Load Franka arm (following panda_hydro example)
         franka_asset = newton.utils.download_asset("franka_emika_panda")
         builder.add_urdf(

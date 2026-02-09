@@ -25,6 +25,10 @@ class Example:
         # 모델 빌더 생성
         builder = newton.ModelBuilder()
 
+        # 접촉 파라미터 설정 (Newton 2026-02-09 이후 기본값: ke=2.5e3)
+        builder.default_shape_cfg.ke = 2.5e3  # 접촉 강성
+        builder.default_shape_cfg.kd = 250.0  # 접촉 감쇠
+
         # TODO: 여기에 시뮬레이션 객체를 추가하세요
         # 예시: 간단한 박스 추가
         link_0 = builder.add_link()

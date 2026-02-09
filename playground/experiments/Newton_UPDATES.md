@@ -5,6 +5,85 @@
 
 ---
 
+## 2026-02-09 업데이트
+
+### 커밋 범위
+`8c7f116..2fcc770` (main branch merge)
+
+### 주요 변경 사항
+
+#### 1. Default shape_ke 변경 (#1491)
+**커밋**: `0e5438f`
+
+**중요**: `ModelBuilder.ShapeConfig.ke` 기본값이 변경됨.
+
+| 항목 | Old | New |
+|------|-----|-----|
+| `ke` (contact elastic stiffness) | `1.0e3` | `2.5e3` |
+
+**MJCF 파싱 개선**:
+- `geom solref` 속성에서 contact stiffness/damping 파싱 지원
+
+**영향**: 기존 시뮬레이션의 접촉 동작이 달라질 수 있음. 명시적으로 `ke` 값을 설정하지 않은 경우 확인 필요.
+
+#### 2. Cable Junctions 지원 (#1519)
+**커밋**: `b31d6d2`
+
+**새 기능**:
+- Cable Y-junction 지원
+- `add_rod()` quaternions 파라미터가 optional로 변경 (자동 계산)
+- 새 유틸리티: `newton/_src/utils/cable.py`
+
+**새 예제**:
+- `newton/examples/cable/example_cable_y_junction.py`
+
+**API 변경**:
+```python
+# Old: quaternions 필수
+builder.add_rod(positions, quaternions, ...)
+
+# New: quaternions 자동 계산 가능
+builder.add_rod(positions, radius=0.1, ...)  # quaternions=None
+```
+
+#### 3. VBD Solver 대규모 업데이트 (#1479)
+**커밋**: `8e38779`
+
+**새 기능**:
+- Particle VBD kernels 대폭 개선
+- Graph coloring 알고리즘 리팩토링
+- Cloth, softbody 시뮬레이션 성능 향상
+
+**새 예제들**:
+- `example_rolling_cloth.py` - 천 롤링
+- `example_falling_gift.py` - 선물 낙하 (multiphysics)
+- `example_poker_cards_stacking.py` - 카드 쌓기
+- `example_softbody_dropping_to_cloth.py` - 소프트바디-천 상호작용
+- `example_softbody_hanging.py` - 매달린 소프트바디
+
+#### 4. Viewer log_shapes 수정 (#1550)
+**커밋**: `ccb0a89`
+
+- Length-1 warp array broadcasting 버그 수정
+- `viewer.log_shapes()` 사용 시 단일 shape 렌더링 문제 해결
+
+#### 5. SolverMuJoCo 수정 (#1546)
+**커밋**: `c996047`
+
+- `update_solver_options_kernel`의 tolerance clamping 버그 수정
+- Solver options 동적 업데이트 안정성 개선
+
+#### 6. Warp Raytrace 추가 수정 (#1545)
+**커밋**: `2dca881`
+
+- 누락된 함수 호출에 device parameter 추가
+
+#### 7. 문서화 개선 (#1560, #1566)
+- Versioned documentation deployment to GitHub Pages
+- 문서 링크 수정
+
+---
+
 ## 2026-02-06 업데이트
 
 ### 커밋 범위
@@ -88,6 +167,9 @@ git diff HEAD~N..HEAD -- path/to/file
 - [ ] `SensorTiledCamera` API 호환성
 - [ ] `SensorContact` API 호환성
 - [ ] `ModelBuilder` API 호환성
+- [ ] `ModelBuilder.ShapeConfig.ke` 기본값 변경 확인 (1.0e3 → 2.5e3)
+- [ ] `add_rod()` API 변경 확인 (quaternions optional)
 - [ ] `newton.*` 함수 export 확인
 - [ ] Solver API 변경 확인
+- [ ] VBD solver 사용 시 그래프 컬러링 변경 확인
 - [ ] 예제 실행 테스트

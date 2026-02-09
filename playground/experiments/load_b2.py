@@ -22,6 +22,10 @@ class Example:
 
         builder = newton.ModelBuilder()
 
+        # 접촉 파라미터 설정 (Newton 2026-02-09 기본값)
+        builder.default_shape_cfg.ke = 2.5e3  # 접촉 강성
+        builder.default_shape_cfg.kd = 250.0  # 접촉 감쇠
+
         # B2 URDF 로드
         builder.add_urdf(
             ASSET_PATH,
