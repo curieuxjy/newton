@@ -49,11 +49,11 @@ reward = rot_reward + dist_penalty - action_penalty - action_delta_penalty - vel
 |------|------|------|
 | **Rotation reward** | `1.0 / (rot_dist + 0.1)` | 쿼터니언 정렬 보상 |
 | **Distance penalty** | `-10.0 × dist` | 큐브가 손에서 멀어지면 페널티 |
-| **Action penalty** | `-0.0002 × Σ(a²)` | 액션 크기 페널티 |
-| **Action delta penalty** | `-0.0001 × Σ(Δa²)` | 액션 변화율 페널티 |
+| **Action penalty** | `-0.0001 × Σ(a²)` | 액션 크기 페널티 |
+| **Action delta penalty** | `-0.01 × Σ(Δa²)` | 액션 변화율 페널티 |
 | **Velocity penalty** | `-0.05 × Σ((v/4)²)` | 관절 속도 페널티 |
 | **Success bonus** | `+250` | N회 연속 성공 시 |
-| **Fall penalty** | `-50` | 큐브 낙하/이탈 시 |
+| **Fall penalty** | `0` | DextrEme 원본: 비활성화 |
 
 **Rotation distance (DextrEme 방식)**:
 
@@ -72,7 +72,7 @@ rot_dist = 2 × arcsin(||q_diff.xyz||)  # radians
 
 - Episode timeout (600 steps = 10초)
 - 큐브 낙하 (z < 0.05m)
-- 큐브 이탈 (dist > 0.3m)
+- 큐브 이탈 (dist > 0.24m)
 
 ## 실행 방법
 
@@ -205,14 +205,16 @@ action_scale: float = 0.5
 rot_reward_scale: float = 1.0
 rot_eps: float = 0.1
 dist_reward_scale: float = -10.0
-action_penalty_scale: float = 0.0002
+action_penalty_scale: float = 0.0001  # DextrEme: -0.0001
+action_delta_penalty_scale: float = 0.01  # DextrEme: -0.01
 velocity_penalty_scale: float = 0.05
 
 # Success/Failure
 success_tolerance: float = 0.4   # radians (~23°)
 consecutive_successes: int = 50
 reach_goal_bonus: float = 250.0
-fall_penalty: float = -50.0
+fall_penalty: float = 0.0        # DextrEme: 비활성화
+fall_dist: float = 0.24          # DextrEme: fallDistance = 0.24
 ```
 
 ### PPOConfig (DextrEme/rl_games 원본 정렬)
@@ -275,7 +277,7 @@ bounds_loss = mean(clamp(μ - 1.1, 0)² + clamp(μ + 1.1, max=0)²)
 ```
 
 - **KL early stopping**: 사용하지 않음 (rl_games 원본과 동일)
-- **Reward clipping**: [-100, 100] 범위로 제한
+- **Reward clipping**: 없음 (DextrEme 원본과 동일)
 
 ## DextrEme 원본 정렬
 
@@ -325,6 +327,24 @@ bounds_loss = mean(clamp(μ - 1.1, 0)² + clamp(μ + 1.1, max=0)²)
 | Bounds loss soft bound | 1.1 | 1.1 ✓ |
 | Value normalization | RunningMeanStd | RunningMeanStd ✓ |
 | log_std clamp | [-5.0, 2.0] | [-5.0, 2.0] ✓ |
+
+### Reward Structure
+
+| 항목 | DextrEme 원본 | 이 구현 |
+|------|-------------|--------|
+| rot_reward_scale | 1.0 | 1.0 ✓ |
+| rot_eps | 0.1 | 0.1 ✓ |
+| dist_reward_scale | -10.0 | -10.0 ✓ |
+| action_penalty_scale | 0.0001 | 0.0001 ✓ |
+| action_delta_penalty_scale | 0.01 | 0.01 ✓ |
+| velocity_penalty_scale | 0.05 | 0.05 ✓ |
+| velocity_norm | 4.0 | 4.0 ✓ |
+| reach_goal_bonus | 250.0 | 250.0 ✓ |
+| fall_penalty | 0.0 (disabled) | 0.0 ✓ |
+| fall_dist | 0.24 | 0.24 ✓ |
+| success_tolerance | 0.4 rad | 0.4 rad ✓ |
+| consecutive_successes | 50 | 50 ✓ |
+| Reward clipping | None | None ✓ |
 
 ### 주요 차이점
 

@@ -457,6 +457,26 @@ class PPOTrainer:
             # Step environment
             next_obs, reward, done, info = self.env.step(action)
 
+            # Accumulate reward components every env.step()
+            for key, val in self.env.reward_components.items():
+                if key not in self._rc_sums:
+                    self._rc_sums[key] = 0.0
+                self._rc_sums[key] += val
+            self._rc_counts += 1
+
+            # Track episode metrics
+            self._episode_rewards += reward
+            self._episode_lengths += 1
+
+            # Handle episode completions
+            done_indices = torch.where(done)[0]
+            for idx in done_indices:
+                self._completed_episodes += 1
+                self._total_episode_reward += self._episode_rewards[idx].item()
+                self._total_episode_length += self._episode_lengths[idx].item()
+                self._episode_rewards[idx] = 0
+                self._episode_lengths[idx] = 0
+
             # Store in buffer
             self.buffer.add(
                 state_obs[:, : self.env.num_state_obs],
@@ -648,16 +668,25 @@ class PPOTrainer:
 
         best_reward = float("-inf")
 
-        # Accumulated reward component tracking across log intervals
-        reward_component_sums: dict[str, float] = {}
-        reward_component_counts = 0
+        # Episode-based reward tracking (per-env accumulators)
+        self._episode_rewards = torch.zeros(self.env.num_envs, device=self.device)
+        self._episode_lengths = torch.zeros(self.env.num_envs, device=self.device, dtype=torch.int32)
+        self._completed_episodes = 0
+        self._total_episode_reward = 0.0
+        self._total_episode_length = 0
+        self._last_avg_reward = 0.0  # Carry forward when no episodes complete
+        self._last_avg_length = 0.0
+
+        # Reward component tracking (per env.step())
+        self._rc_sums: dict[str, float] = {}
+        self._rc_counts = 0
 
         print(f"[INFO] Starting training: {total_timesteps} timesteps")
         print(f"[INFO] Batch size: {batch_size}")
         print(f"[INFO] Checkpoints: {checkpoint_dir}")
 
         while global_step < total_timesteps:
-            # Collect rollout
+            # Collect rollout (tracks episodes and reward components per env.step())
             state_obs = self.collect_rollout(state_obs)
 
             # Compute returns and advantages
@@ -678,17 +707,6 @@ class PPOTrainer:
             if self.value_normalizer is not None:
                 self.value_normalizer.update(self.buffer.returns)
 
-            # Compute average reward before buffer reset
-            avg_reward = self.buffer.rewards.mean().item()
-
-            # Accumulate reward components over the log interval
-            current_rc = self.env.reward_components
-            for key, val in current_rc.items():
-                if key not in reward_component_sums:
-                    reward_component_sums[key] = 0.0
-                reward_component_sums[key] += val
-            reward_component_counts += 1
-
             # Update policy
             update_metrics = self.update()
 
@@ -703,16 +721,27 @@ class PPOTrainer:
                 elapsed = time.time() - start_time
                 fps = global_step / elapsed
 
-                # Compute averaged reward components over the log interval
+                # Episode metrics: use new data if available, otherwise carry forward
+                if self._completed_episodes > 0:
+                    avg_reward = self._total_episode_reward / self._completed_episodes
+                    avg_length = self._total_episode_length / self._completed_episodes
+                    self._last_avg_reward = avg_reward
+                    self._last_avg_length = avg_length
+                else:
+                    avg_reward = self._last_avg_reward
+                    avg_length = self._last_avg_length
+
                 avg_reward_components = {}
-                if reward_component_counts > 0:
-                    for key, val in reward_component_sums.items():
-                        avg_reward_components[key] = val / reward_component_counts
+                if self._rc_counts > 0:
+                    for key, val in self._rc_sums.items():
+                        avg_reward_components[key] = val / self._rc_counts
 
                 print(
                     f"[{global_step:>10}] "
                     f"FPS: {fps:.0f} | "
                     f"reward: {avg_reward:.3f} | "
+                    f"length: {avg_length:.1f} | "
+                    f"episodes: {self._completed_episodes} | "
                     f"policy: {update_metrics['policy_loss']:.4f} | "
                     f"value: {update_metrics['value_loss']:.4f} | "
                     f"kl: {update_metrics['kl_divergence']:.4f} | "
@@ -722,7 +751,9 @@ class PPOTrainer:
                 # TensorBoard
                 self.writer.add_scalar("charts/fps", fps, global_step)
                 self.writer.add_scalar("charts/learning_rate", update_metrics["learning_rate"], global_step)
-                self.writer.add_scalar("charts/avg_reward", avg_reward, global_step)
+                self.writer.add_scalar("episode/reward_mean", avg_reward, global_step)
+                self.writer.add_scalar("episode/length_mean", avg_length, global_step)
+                # self.writer.add_scalar("episode/completed", self._completed_episodes, global_step)
                 self.writer.add_scalar("losses/policy_loss", update_metrics["policy_loss"], global_step)
                 self.writer.add_scalar("losses/value_loss", update_metrics["value_loss"], global_step)
                 self.writer.add_scalar("losses/entropy", update_metrics["entropy"], global_step)
@@ -737,20 +768,29 @@ class PPOTrainer:
                     wandb.log(
                         {
                             "charts/fps": fps,
-                            "charts/avg_reward": avg_reward,
+                            "episode/reward_mean": avg_reward,
+                            "episode/length_mean": avg_length,
+                            # "episode/completed": self._completed_episodes,
                             **{f"losses/{k}": v for k, v in update_metrics.items()},
                             **{f"reward/{k}": v for k, v in avg_reward_components.items()},
                         },
                         step=global_step,
                     )
 
-                # Reset accumulated reward components
-                reward_component_sums = {}
-                reward_component_counts = 0
+                # Reset episode and reward component tracking
+                self._completed_episodes = 0
+                self._total_episode_reward = 0.0
+                self._total_episode_length = 0
+                self._rc_sums = {}
+                self._rc_counts = 0
 
             # Save best checkpoint
-            if avg_reward > best_reward:
-                best_reward = avg_reward
+            if self._completed_episodes > 0:
+                current_reward = self._total_episode_reward / self._completed_episodes
+            else:
+                current_reward = float("-inf")
+            if current_reward > best_reward:
+                best_reward = current_reward
                 best_path = checkpoint_dir / "best.pt"
                 self.save(best_path)
                 print(f"[INFO] New best reward: {best_reward:.4f} -> saved {best_path}")

@@ -884,9 +884,16 @@ class FrankaAllegroGraspEnv:
 
         # === DEXTRAH Reward Components (continuous, all summed) ===
 
-        # 1. Hand-to-Object Reward: weight * exp(-sharpness * dist)
-        # Encourages fingertip and palm to approach object
-        hand_to_object_dist = torch.norm(ee_pos - cube_pos, dim=-1)
+        # 1. Hand-to-Object Reward: weight * exp(-sharpness * max_dist)
+        # DEXTRAH: compute distance from palm + 4 fingertips to object, take max
+        # This encourages the furthest hand point to approach the object
+        grasp_features_for_reward = self.fabric.compute_grasp_features(
+            ee_pos, ee_quat, allegro_q, cube_pos, self.config.cube_size
+        )
+        fingertip_dists = grasp_features_for_reward["fingertip_distances"]  # (batch, 4)
+        palm_dist = torch.norm(ee_pos - cube_pos, dim=-1, keepdim=True)  # (batch, 1)
+        all_hand_dists = torch.cat([palm_dist, fingertip_dists], dim=-1)  # (batch, 5)
+        hand_to_object_dist = all_hand_dists.max(dim=-1).values  # (batch,)
         hand_to_object_reward = self.config.hand_to_object_weight * torch.exp(
             -self.config.hand_to_object_sharpness * hand_to_object_dist
         )
@@ -899,10 +906,13 @@ class FrankaAllegroGraspEnv:
         )
 
         # 3. Finger Curl Regularization: weight * ||q - curled_q||²
-        # Prevents excessive finger curling during approach (negative weight = penalty)
-        # Curled configuration: nominally closed fingers
+        # DEXTRAH: fingers 1-3 extended (zeros), thumb curled
+        # Encourages approaching with open fingers, only thumb pre-curled
         curled_q = torch.tensor(
-            [0.0, 0.8, 0.8, 0.8] * 4,  # 4 fingers, each with [abduction, proximal, middle, distal]
+            [0.0, 0.0, 0.0, 0.0,  # Finger 1 (extended)
+             0.0, 0.0, 0.0, 0.0,  # Finger 2 (extended)
+             0.0, 0.0, 0.0, 0.0,  # Finger 3 (extended)
+             1.5, 0.60147215, 0.33795027, 0.60845138],  # Thumb (curled)
             dtype=torch.float32, device=self.torch_device
         ).unsqueeze(0).expand(self.num_envs, -1)
         finger_curl_diff = allegro_q - curled_q
@@ -917,31 +927,20 @@ class FrankaAllegroGraspEnv:
             -self.config.lift_sharpness * vertical_error
         )
 
-        # 5. In-Success-Region Bonus
-        # Bonus when object is at goal position
+        # 5. Success region tracking (DEXTRAH: no bonus reward, used for ADR/termination only)
         in_success_region = object_to_goal_dist < self.config.object_goal_tol
-        success_bonus = torch.where(
-            in_success_region,
-            torch.full_like(hand_to_object_reward, self.config.in_success_region_weight),
-            torch.zeros_like(hand_to_object_reward)
-        )
 
-        # === Compute FABRICS grasp features (for logging and optional use) ===
-        grasp_features = self.fabric.compute_grasp_features(
-            ee_pos, ee_quat, allegro_q, cube_pos, self.config.cube_size
-        )
+        # === Compute FABRICS grasp rewards (for logging) ===
         fabric_rewards = self.fabric.compute_grasp_reward(
-            grasp_features, self.config.cube_size
+            grasp_features_for_reward, self.config.cube_size
         )
 
-        # === DEXTRAH Total Reward (continuous sum, no extra penalties) ===
-        # Note: DEXTRAH uses only these 4 core components + success bonus
+        # === DEXTRAH Total Reward (4 core components, no success bonus) ===
         reward = (
             hand_to_object_reward +
             object_to_goal_reward +
             finger_curl_reg +  # This is negative (penalty)
-            lift_reward +
-            success_bonus
+            lift_reward
         )
 
         # === Update task phase (for logging/visualization) ===
@@ -976,17 +975,17 @@ class FrankaAllegroGraspEnv:
         phase_2_mask = self.task_phase == 2
 
         self.reward_components = {
-            # DEXTRAH reward components (4 core + success bonus)
+            # DEXTRAH reward components (4 core, no success bonus)
             "hand_to_object_reward": hand_to_object_reward.mean().item(),
             "object_to_goal_reward": object_to_goal_reward.mean().item(),
             "finger_curl_reg": finger_curl_reg.mean().item(),
             "lift_reward": lift_reward.mean().item(),
-            "success_bonus": success_bonus.mean().item(),
             # Distances
             "hand_to_object_dist": hand_to_object_dist.mean().item(),
             "object_to_goal_dist": object_to_goal_dist.mean().item(),
             "cube_height": cube_height.mean().item(),
             "vertical_error": vertical_error.mean().item(),
+            "in_success_region": in_success_region.float().mean().item(),
             # Phase tracking (for visualization)
             "phase_reach": phase_0_mask.float().mean().item(),
             "phase_grasp": phase_1_mask.float().mean().item(),
@@ -995,7 +994,7 @@ class FrankaAllegroGraspEnv:
             "fabric_contact": fabric_rewards["contact_reward"].mean().item(),
             "fabric_closure": fabric_rewards["closure_reward"].mean().item(),
             "fabric_approach": fabric_rewards["approach_reward"].mean().item(),
-            "grasp_closure_dist": grasp_features["grasp_closure"].mean().item(),
+            "grasp_closure_dist": grasp_features_for_reward["grasp_closure"].mean().item(),
         }
 
         return self.reward_buf

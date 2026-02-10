@@ -171,8 +171,8 @@ class TrainConfig:
 
     seed: int = 42
     device: str = "cuda"
-    log_interval: int = 10
-    save_interval: int = 5000
+    log_interval: int = 1000
+    save_interval: int = 50000
     checkpoint_dir: str = "checkpoints"
     experiment_name: str = "franka_allegro_grasp"
 

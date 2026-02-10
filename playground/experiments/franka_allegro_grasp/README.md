@@ -125,16 +125,23 @@ DEXTRAH 원본의 continuous reward 구조를 사용합니다. 모든 보상 컴
 ### DEXTRAH Reward Components (Continuous Sum)
 
 ```
-total_reward = hand_to_object + object_to_goal + finger_curl_reg + lift + success_bonus
+total_reward = hand_to_object + object_to_goal + finger_curl_reg + lift
 ```
 
 | Component | 수식 | Weight | Sharpness |
 |-----------|------|--------|-----------|
-| `hand_to_object` | `w × exp(-s × dist_ee_to_cube)` | 1.0 | 10.0 |
+| `hand_to_object` | `w × exp(-s × max_dist(palm+fingertips, cube))` | 1.0 | 10.0 |
 | `object_to_goal` | `w × exp(-s × dist_cube_to_goal)` | 5.0 | 15.0 |
 | `lift` | `w × exp(-s × vertical_error)` | 5.0 | 8.5 |
 | `finger_curl_reg` | `w × ‖q - curled_q‖²` | -0.01 | - |
-| `success_bonus` | `w (if in_success_region)` | 10.0 | - |
+
+**hand_to_object**: palm + 4 fingertips에서 cube까지 거리 중 **최대값** 사용 (가장 먼 부위의 접근 유도)
+
+**finger_curl_reg curled_q** (DEXTRAH 원본):
+- Finger 1-3: `[0, 0, 0, 0]` (펼친 상태 → 접근 시 손가락 펴기 유도)
+- Thumb: `[1.5, 0.60, 0.34, 0.61]` (엄지만 curled)
+
+**success bonus**: DEXTRAH 원본에는 없음 (success 판정은 ADR/종료용만 사용)
 
 ### Thresholds (DEXTRAH 원본 값)
 
@@ -642,11 +649,14 @@ Critic output (normalized space)
 |------|-------------|--------|
 | hand_to_object weight | 1.0 | 1.0 ✓ |
 | hand_to_object sharpness | 10.0 | 10.0 ✓ |
+| hand_to_object dist | max(palm + 4 fingertips) | max(palm + 4 fingertips) ✓ |
 | object_to_goal weight | 5.0 | 5.0 ✓ |
 | lift weight | 5.0 | 5.0 ✓ |
 | lift sharpness | 8.5 | 8.5 ✓ |
 | finger_curl_reg weight | -0.01 | -0.01 ✓ |
-| success bonus | 10.0 | 10.0 ✓ |
+| curled_q finger 1-3 | [0,0,0,0] (extended) | [0,0,0,0] ✓ |
+| curled_q thumb | [1.5, 0.60, 0.34, 0.61] | [1.5, 0.60, 0.34, 0.61] ✓ |
+| success bonus | 없음 (ADR/종료용만) | 없음 ✓ |
 
 ### Thresholds
 

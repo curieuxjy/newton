@@ -38,20 +38,20 @@ class EnvConfig:
     # Distance penalty (object too far from hand)
     dist_reward_scale: float = -10.0
 
-    # Action penalties (very small in DextrEme)
-    action_penalty_scale: float = 0.0002
-    action_delta_penalty_scale: float = 0.0001
+    # Action penalties (DextrEme original values)
+    action_penalty_scale: float = 0.0001  # DextrEme: -0.0001 (sign applied in reward)
+    action_delta_penalty_scale: float = 0.01  # DextrEme: -0.01 (sign applied in reward)
 
     # Velocity penalty (DextrEme: -0.05 * sum((dof_vel/4)^2))
     velocity_penalty_scale: float = 0.05
     velocity_norm: float = 4.0
 
-    # Success/Failure
+    # Success/Failure (DextrEme original values)
     reach_goal_bonus: float = 250.0
-    fall_penalty: float = -50.0
+    fall_penalty: float = 0.0  # DextrEme: 0.0 (disabled)
     success_tolerance: float = 0.4  # radians (~23 degrees)
-    consecutive_successes: int = 50  # Hold for N steps
-    fall_dist: float = 0.3  # meters
+    consecutive_successes: int = 50  # DextrEme: maxConsecutiveSuccesses = 50
+    fall_dist: float = 0.24  # DextrEme: fallDistance = 0.24
 
     # Goal
     goal_rotation_speed: float = 0.0  # Static goal (DextrEme style)
