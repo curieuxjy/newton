@@ -33,6 +33,55 @@ from .env import FrankaAllegroGraspEnv
 from .fabric import GraspFabric
 
 
+def gaussian_kl(mu0: torch.Tensor, sigma0: torch.Tensor, mu1: torch.Tensor, sigma1: torch.Tensor) -> torch.Tensor:
+    """Analytical KL divergence between two diagonal Gaussians (rl_games style).
+
+    Computes KL(p0 || p1) where p0 = N(mu0, sigma0^2), p1 = N(mu1, sigma1^2).
+    """
+    c1 = torch.log(sigma1 / (sigma0 + 1e-5) + 1e-5)
+    c2 = (sigma0**2 + (mu0 - mu1) ** 2) / (2.0 * (sigma1**2 + 1e-5))
+    c3 = -0.5
+    kl = c1 + c2 + c3
+    return kl.sum(dim=-1).mean()
+
+
+class RunningMeanStd:
+    """Running mean and standard deviation tracker (rl_games style).
+
+    Used to normalize value targets so the critic trains on a stable scale,
+    preventing large swings in value_loss.
+    """
+
+    def __init__(self, device: str = "cuda", epsilon: float = 1e-5):
+        self.mean = torch.zeros((), dtype=torch.float32, device=device)
+        self.var = torch.ones((), dtype=torch.float32, device=device)
+        self.count = epsilon
+        self.epsilon = epsilon
+
+    def update(self, x: torch.Tensor):
+        """Update running statistics with a batch of data."""
+        batch_mean = x.mean()
+        batch_var = x.var()
+        batch_count = x.numel()
+
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+
+        self.mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        self.var = (m_a + m_b + delta**2 * self.count * batch_count / total_count) / total_count
+        self.count = total_count
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize input using running statistics."""
+        return (x - self.mean) / (torch.sqrt(self.var) + self.epsilon)
+
+    def denormalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Denormalize input using running statistics."""
+        return x * torch.sqrt(self.var) + self.mean
+
+
 def layer_init(layer: nn.Linear, std: float = 0.01) -> nn.Linear:
     """Initialize layer with orthogonal initialization."""
     nn.init.orthogonal_(layer.weight, std)
@@ -122,8 +171,8 @@ class ActorCritic(nn.Module):
         state_obs: torch.Tensor,
         fabric_obs: torch.Tensor | None = None,
         action: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get action, log prob, entropy, and value."""
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get action, log prob, entropy, value, action mean, and action std."""
         # Sanitize input
         state_obs = torch.nan_to_num(state_obs, nan=0.0, posinf=10.0, neginf=-10.0)
         state_obs = torch.clamp(state_obs, -100.0, 100.0)
@@ -136,8 +185,8 @@ class ActorCritic(nn.Module):
         features = self.shared(combined)
         action_mean = self.actor_mean(features)
 
-        # Clamp log_std
-        log_std_clamped = torch.clamp(self.actor_log_std, min=-20.0, max=2.0)
+        # Clamp log_std (rl_games style)
+        log_std_clamped = torch.clamp(self.actor_log_std, min=-5.0, max=2.0)
         action_std = torch.exp(log_std_clamped)
 
         action_mean = torch.nan_to_num(action_mean, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -151,7 +200,7 @@ class ActorCritic(nn.Module):
         entropy = dist.entropy().sum(dim=-1)
         value = self.critic(features).squeeze(-1)
 
-        return action, log_prob, entropy, value
+        return action, log_prob, entropy, value, action_mean, action_std
 
     def get_value(
         self, state_obs: torch.Tensor, fabric_obs: torch.Tensor | None = None
@@ -193,6 +242,7 @@ class RolloutBuffer:
             else None
         )
         self.actions = torch.zeros(num_steps, num_envs, num_actions, device=device)
+        self.action_means = torch.zeros(num_steps, num_envs, num_actions, device=device)
         self.log_probs = torch.zeros(num_steps, num_envs, device=device)
         self.rewards = torch.zeros(num_steps, num_envs, device=device)
         self.dones = torch.zeros(num_steps, num_envs, device=device)
@@ -213,12 +263,14 @@ class RolloutBuffer:
         reward: torch.Tensor,
         done: torch.Tensor,
         value: torch.Tensor,
+        action_mean: torch.Tensor,
     ):
         """Add a step of data."""
         self.state_observations[self.step] = state_obs
         if fabric_obs is not None and self.fabric_observations is not None:
             self.fabric_observations[self.step] = fabric_obs
         self.actions[self.step] = action
+        self.action_means[self.step] = action_mean
         self.log_probs[self.step] = log_prob
         self.rewards[self.step] = reward
         self.dones[self.step] = done.float()
@@ -255,9 +307,11 @@ class RolloutBuffer:
             else None
         )
         actions_flat = self.actions.reshape(-1, self.actions.shape[-1])
+        action_means_flat = self.action_means.reshape(-1, self.action_means.shape[-1])
         log_probs_flat = self.log_probs.reshape(-1)
         advantages_flat = self.advantages.reshape(-1)
         returns_flat = self.returns.reshape(-1)
+        values_flat = self.values.reshape(-1)
 
         indices = torch.randperm(batch_size, device=self.device)
 
@@ -274,6 +328,8 @@ class RolloutBuffer:
                 log_probs_flat[batch_indices],
                 advantages_flat[batch_indices],
                 returns_flat[batch_indices],
+                values_flat[batch_indices],
+                action_means_flat[batch_indices],
             )
 
     def reset(self):
@@ -325,6 +381,9 @@ class PPOTrainer:
             num_actions=env.num_actions,
             device=self.device,
         )
+
+        # Value normalization (rl_games: normalize_value = True)
+        self.value_normalizer = RunningMeanStd(device=self.device) if config.ppo.normalize_value else None
 
         # Logging
         self.writer = None
@@ -387,10 +446,13 @@ class PPOTrainer:
 
             # Get action
             with torch.no_grad():
-                action, log_prob, _, value = self.actor_critic.get_action_and_value(
+                action, log_prob, _, value, action_mean, _ = self.actor_critic.get_action_and_value(
                     state_obs[:, : self.env.num_state_obs], fabric_obs
                 )
                 action = torch.clamp(action, -1.0, 1.0)
+                # Denormalize value for GAE computation (critic predicts in normalized space)
+                if self.value_normalizer is not None:
+                    value = self.value_normalizer.denormalize(value)
 
             # Step environment
             next_obs, reward, done, info = self.env.step(action)
@@ -404,6 +466,7 @@ class PPOTrainer:
                 reward,
                 done,
                 value,
+                action_mean,
             )
 
             state_obs = next_obs
@@ -411,7 +474,15 @@ class PPOTrainer:
         return state_obs
 
     def update(self) -> dict[str, float]:
-        """Update policy using PPO with DEXTRAH-style KL divergence and adaptive LR."""
+        """Update policy using PPO (rl_games style).
+
+        Matches rl_games behavior:
+        - Analytical Gaussian KL divergence
+        - No KL-based early stopping (rl_games doesn't use it)
+        - Clipped value loss
+        - Bounds loss on action mean (mu) with soft bound 1.1
+        - Adaptive LR: /1.5 decrease, *1.5 increase, applied per epoch
+        """
         # Normalize advantages (DEXTRAH: normalize_advantage = True)
         if self.config.ppo.normalize_advantage:
             advantages = self.buffer.advantages.reshape(-1)
@@ -420,106 +491,121 @@ class PPOTrainer:
                 self.buffer.num_steps, self.buffer.num_envs
             )
 
-        metrics = {
-            "policy_loss": 0.0,
-            "value_loss": 0.0,
-            "entropy": 0.0,
-            "bounds_loss": 0.0,
-            "kl_divergence": 0.0,
-            "total_loss": 0.0,
-        }
+        # Snapshot old sigma before any optimizer step changes it
+        with torch.no_grad():
+            old_log_std = torch.clamp(self.actor_critic.actor_log_std, min=-5.0, max=2.0)
+            old_sigma = torch.exp(old_log_std)
+
+        # Training metrics
+        total_pg_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy_loss = 0.0
+        total_bounds_loss = 0.0
+        total_loss = 0.0
+        total_kl = 0.0
         num_updates = 0
-        kl_sum = 0.0
-        kl_count = 0
 
-        for epoch in range(self.config.ppo.num_epochs):
-            for batch in self.buffer.get_batches(self.config.ppo.num_minibatches):
-                state_obs, fabric_obs, actions, old_log_probs, advs, returns = batch
+        ppo_cfg = self.config.ppo
 
-                # Get current policy outputs
-                _, new_log_probs, entropy, new_values = self.actor_critic.get_action_and_value(
-                    state_obs, fabric_obs, actions
+        for epoch in range(ppo_cfg.num_epochs):
+            epoch_kl = 0.0
+            epoch_batches = 0
+
+            for batch in self.buffer.get_batches(ppo_cfg.num_minibatches):
+                state_obs, fabric_obs, actions, old_log_probs, advs, returns, old_values, old_mu = batch
+
+                # Get current policy outputs (including mu and sigma)
+                _, new_log_probs, entropy, new_values, new_mu, new_sigma = (
+                    self.actor_critic.get_action_and_value(state_obs, fabric_obs, actions)
                 )
 
-                # Policy loss
+                # Policy loss (clipped surrogate objective)
                 log_ratio = new_log_probs - old_log_probs
                 ratio = torch.exp(log_ratio)
 
-                # Compute approximate KL divergence (DEXTRAH style)
-                with torch.no_grad():
-                    approx_kl = ((ratio - 1) - log_ratio).mean()
-                    kl_sum += approx_kl.item()
-                    kl_count += 1
-
                 pg_loss1 = -advs * ratio
-                pg_loss2 = -advs * torch.clamp(
-                    ratio,
-                    1 - self.config.ppo.clip_epsilon,
-                    1 + self.config.ppo.clip_epsilon,
-                )
+                pg_loss2 = -advs * torch.clamp(ratio, 1 - ppo_cfg.clip_epsilon, 1 + ppo_cfg.clip_epsilon)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss (DEXTRAH: critic_coef = 4)
-                value_loss = 0.5 * ((new_values - returns) ** 2).mean()
+                # Clipped value loss (rl_games style)
+                # Normalize returns and old_values if value normalization is enabled
+                # (critic predicts in normalized space, so compare in normalized space)
+                if self.value_normalizer is not None:
+                    norm_returns = self.value_normalizer.normalize(returns)
+                    norm_old_values = self.value_normalizer.normalize(old_values)
+                else:
+                    norm_returns = returns
+                    norm_old_values = old_values
 
-                # Entropy loss (DEXTRAH: 0.0)
+                value_pred_clipped = norm_old_values + torch.clamp(
+                    new_values - norm_old_values, -ppo_cfg.clip_epsilon, ppo_cfg.clip_epsilon
+                )
+                value_loss_unclipped = (new_values - norm_returns) ** 2
+                value_loss_clipped = (value_pred_clipped - norm_returns) ** 2
+                value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
+
+                # Entropy loss
                 entropy_loss = entropy.mean()
 
-                # Bounds loss (DEXTRAH: bounds_loss_coef = 0.0001)
-                # Penalize actions outside [-1, 1]
-                bounds_loss = torch.clamp(actions.abs() - 1.0, min=0.0).pow(2).mean()
+                # Bounds loss on action mean (rl_games style: penalize mu, soft bound 1.1)
+                soft_bound = 1.1
+                mu_loss_high = torch.clamp_min(new_mu - soft_bound, 0.0) ** 2
+                mu_loss_low = torch.clamp_max(new_mu + soft_bound, 0.0) ** 2
+                bounds_loss = (mu_loss_high + mu_loss_low).sum(dim=-1).mean()
 
                 # Total loss
                 loss = (
                     pg_loss
-                    + self.config.ppo.value_coef * value_loss
-                    - self.config.ppo.entropy_coef * entropy_loss
-                    + self.config.ppo.bounds_loss_coef * bounds_loss
+                    + ppo_cfg.value_coef * value_loss
+                    - ppo_cfg.entropy_coef * entropy_loss
+                    + ppo_cfg.bounds_loss_coef * bounds_loss
                 )
 
                 # Gradient step
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(
-                    self.actor_critic.parameters(), self.config.ppo.max_grad_norm
-                )
+                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), ppo_cfg.max_grad_norm)
                 self.optimizer.step()
 
-                metrics["policy_loss"] += pg_loss.item()
-                metrics["value_loss"] += value_loss.item()
-                metrics["entropy"] += entropy_loss.item()
-                metrics["bounds_loss"] += bounds_loss.item()
-                metrics["total_loss"] += loss.item()
+                # Analytical Gaussian KL divergence (rl_games style, no grad)
+                with torch.no_grad():
+                    kl = gaussian_kl(old_mu, old_sigma.expand_as(old_mu), new_mu, new_sigma.expand_as(new_mu))
+
+                # Accumulate metrics
+                total_pg_loss += pg_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy_loss += entropy_loss.item()
+                total_bounds_loss += bounds_loss.item()
+                total_loss += loss.item()
+                total_kl += kl.item()
                 num_updates += 1
+                epoch_kl += kl.item()
+                epoch_batches += 1
 
-            # Early stopping based on KL threshold (DEXTRAH: kl_threshold = 0.016)
-            if kl_count > 0:
-                avg_kl = kl_sum / kl_count
-                if avg_kl > self.config.ppo.kl_threshold:
-                    break
+            # Adaptive LR per epoch (rl_games style: applied after each mini-epoch)
+            avg_epoch_kl = epoch_kl / max(epoch_batches, 1)
+            if ppo_cfg.lr_schedule == "adaptive":
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                if avg_epoch_kl > ppo_cfg.kl_threshold * 2.0:
+                    new_lr = max(current_lr / 1.5, 1e-6)
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = new_lr
+                elif avg_epoch_kl < ppo_cfg.kl_threshold * 0.5:
+                    new_lr = min(current_lr * 1.5, 1e-2)
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = new_lr
 
-        # Compute final KL divergence
-        metrics["kl_divergence"] = kl_sum / max(kl_count, 1)
+        avg_kl = total_kl / max(num_updates, 1)
 
-        for key in metrics:
-            if key != "kl_divergence":
-                metrics[key] /= max(num_updates, 1)
-
-        # Adaptive learning rate (DEXTRAH: lr_schedule = "adaptive")
-        if self.config.ppo.lr_schedule == "adaptive":
-            kl = metrics["kl_divergence"]
-            if kl > self.config.ppo.kl_threshold * 2.0:
-                # KL too high -> reduce LR
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = max(param_group["lr"] * 0.5, 1e-6)
-            elif kl < self.config.ppo.kl_threshold * 0.5:
-                # KL too low -> increase LR
-                for param_group in self.optimizer.param_groups:
-                    param_group["lr"] = min(param_group["lr"] * 1.5, 1e-2)
-
-        metrics["learning_rate"] = self.optimizer.param_groups[0]["lr"]
-
-        return metrics
+        return {
+            "policy_loss": total_pg_loss / max(num_updates, 1),
+            "value_loss": total_value_loss / max(num_updates, 1),
+            "entropy": total_entropy_loss / max(num_updates, 1),
+            "bounds_loss": total_bounds_loss / max(num_updates, 1),
+            "total_loss": total_loss / max(num_updates, 1),
+            "kl_divergence": avg_kl,
+            "learning_rate": self.optimizer.param_groups[0]["lr"],
+        }
 
     def train(self):
         """Main training loop."""
@@ -560,6 +646,12 @@ class PPOTrainer:
         total_timesteps = self.config.ppo.total_timesteps
         batch_size = self.config.ppo.rollout_steps * self.env.num_envs
 
+        best_reward = float("-inf")
+
+        # Accumulated reward component tracking across log intervals
+        reward_component_sums: dict[str, float] = {}
+        reward_component_counts = 0
+
         print(f"[INFO] Starting training: {total_timesteps} timesteps")
         print(f"[INFO] Batch size: {batch_size}")
         print(f"[INFO] Checkpoints: {checkpoint_dir}")
@@ -574,10 +666,28 @@ class PPOTrainer:
                 last_value = self.actor_critic.get_value(
                     state_obs[:, : self.env.num_state_obs], fabric_obs
                 )
+                # Denormalize last_value (critic predicts in normalized space)
+                if self.value_normalizer is not None:
+                    last_value = self.value_normalizer.denormalize(last_value)
 
             self.buffer.compute_returns_and_advantages(
                 last_value, self.config.ppo.gamma, self.config.ppo.gae_lambda
             )
+
+            # Update value normalizer with computed returns
+            if self.value_normalizer is not None:
+                self.value_normalizer.update(self.buffer.returns)
+
+            # Compute average reward before buffer reset
+            avg_reward = self.buffer.rewards.mean().item()
+
+            # Accumulate reward components over the log interval
+            current_rc = self.env.reward_components
+            for key, val in current_rc.items():
+                if key not in reward_component_sums:
+                    reward_component_sums[key] = 0.0
+                reward_component_sums[key] += val
+            reward_component_counts += 1
 
             # Update policy
             update_metrics = self.update()
@@ -593,9 +703,11 @@ class PPOTrainer:
                 elapsed = time.time() - start_time
                 fps = global_step / elapsed
 
-                # Get reward info
-                reward_components = self.env.reward_components
-                avg_reward = self.buffer.rewards.mean().item() if self.buffer.step > 0 else 0
+                # Compute averaged reward components over the log interval
+                avg_reward_components = {}
+                if reward_component_counts > 0:
+                    for key, val in reward_component_sums.items():
+                        avg_reward_components[key] = val / reward_component_counts
 
                 print(
                     f"[{global_step:>10}] "
@@ -610,25 +722,38 @@ class PPOTrainer:
                 # TensorBoard
                 self.writer.add_scalar("charts/fps", fps, global_step)
                 self.writer.add_scalar("charts/learning_rate", update_metrics["learning_rate"], global_step)
+                self.writer.add_scalar("charts/avg_reward", avg_reward, global_step)
                 self.writer.add_scalar("losses/policy_loss", update_metrics["policy_loss"], global_step)
                 self.writer.add_scalar("losses/value_loss", update_metrics["value_loss"], global_step)
                 self.writer.add_scalar("losses/entropy", update_metrics["entropy"], global_step)
                 self.writer.add_scalar("losses/bounds_loss", update_metrics["bounds_loss"], global_step)
                 self.writer.add_scalar("losses/kl_divergence", update_metrics["kl_divergence"], global_step)
 
-                for key, value in reward_components.items():
+                for key, value in avg_reward_components.items():
                     self.writer.add_scalar(f"reward/{key}", value, global_step)
 
                 # Wandb
                 if self.config.wandb.enabled:
                     wandb.log(
                         {
-                            "fps": fps,
-                            "global_step": global_step,
+                            "charts/fps": fps,
+                            "charts/avg_reward": avg_reward,
                             **{f"losses/{k}": v for k, v in update_metrics.items()},
-                            **{f"reward/{k}": v for k, v in reward_components.items()},
-                        }
+                            **{f"reward/{k}": v for k, v in avg_reward_components.items()},
+                        },
+                        step=global_step,
                     )
+
+                # Reset accumulated reward components
+                reward_component_sums = {}
+                reward_component_counts = 0
+
+            # Save best checkpoint
+            if avg_reward > best_reward:
+                best_reward = avg_reward
+                best_path = checkpoint_dir / "best.pt"
+                self.save(best_path)
+                print(f"[INFO] New best reward: {best_reward:.4f} -> saved {best_path}")
 
             # Save checkpoint
             if num_updates % self.config.save_interval == 0:

@@ -10,7 +10,7 @@ allegro_cube_ppo/
 ├── __init__.py      # 패키지 export
 ├── config.py        # 하이퍼파라미터 설정 (DextrEme 스타일)
 ├── env.py           # AllegroHandCubeEnv (Newton 기반 환경)
-├── ppo.py           # PPO 알고리즘 (CleanRL 스타일)
+├── ppo.py           # PPO 알고리즘 (rl_games 스타일)
 ├── train.py         # 학습 스크립트
 ├── visualize.py     # Newton viewer로 시각화
 └── README.md
@@ -65,12 +65,12 @@ rot_dist = 2 × arcsin(||q_diff.xyz||)  # radians
 ### Success Condition
 
 - Rotation distance < `success_tolerance` (0.4 rad ≈ 23°)
-- `consecutive_successes` (5) 회 연속 유지
+- `consecutive_successes` (50) 회 연속 유지
 - 성공 시 새로운 랜덤 목표 생성
 
 ### Termination
 
-- Episode timeout (400 steps = 8초)
+- Episode timeout (600 steps = 10초)
 - 큐브 낙하 (z < 0.05m)
 - 큐브 이탈 (dist > 0.3m)
 
@@ -190,11 +190,11 @@ uv run --extra examples --extra torch-cu12 python -m playground.experiments.alle
 ### EnvConfig
 
 ```python
-# Simulation
-fps: int = 60
-sim_substeps: int = 2
-control_decimation: int = 2      # 30Hz control
-episode_length: int = 400        # 8 seconds
+# Simulation (DextrEme: 120Hz physics, 60Hz control)
+fps: int = 120
+sim_substeps: int = 1
+control_decimation: int = 2      # 60Hz control
+episode_length: int = 600        # 10 seconds
 
 # Robot
 hand_stiffness: float = 40.0
@@ -210,46 +210,130 @@ velocity_penalty_scale: float = 0.05
 
 # Success/Failure
 success_tolerance: float = 0.4   # radians (~23°)
-consecutive_successes: int = 5
+consecutive_successes: int = 50
 reach_goal_bonus: float = 250.0
 fall_penalty: float = -50.0
 ```
 
-### PPOConfig
+### PPOConfig (DextrEme/rl_games 원본 정렬)
 
 ```python
-learning_rate: float = 3e-4
+# Learning
+learning_rate: float = 5e-4       # DextrEme: 5e-4
+lr_schedule: str = "adaptive"     # Adaptive LR based on KL
+kl_threshold: float = 0.016       # DextrEme: 0.016
+
+# Loss coefficients
 gamma: float = 0.99
 gae_lambda: float = 0.95
 clip_epsilon: float = 0.2
-entropy_coef: float = 0.01
-value_coef: float = 0.5
-bounds_loss_coef: float = 0.0001    # 액션 범위 초과 페널티
+entropy_coef: float = 0.0         # DextrEme: 0.0
+value_coef: float = 4.0           # DextrEme: critic_coef = 4
+bounds_loss_coef: float = 0.0001  # 액션 범위 초과 페널티
+max_grad_norm: float = 1.0
+
+# Training
 num_epochs: int = 5
-rollout_steps: int = 24
-hidden_dims: tuple = (512, 256, 128)
+num_minibatches: int = 4
+rollout_steps: int = 16           # DextrEme: horizon_length = 16
+
+# Normalization (DextrEme: 모두 True)
+normalize_input: bool = True
+normalize_value: bool = True      # RunningMeanStd로 value target 정규화
+normalize_advantage: bool = True
+observation_clip: float = 5.0
+
+# Network (DextrEme: [512, 512, 256, 128])
+hidden_dims: tuple = (512, 512, 256, 128)
+activation: str = "elu"
+init_sigma: float = 0.0           # σ=1.0 for wide exploration
 ```
 
-### Policy Network 안정화
+### PPO 알고리즘 (rl_games 원본 정렬)
 
 ```python
-# Actor log_std 초기화 및 범위 제한
-actor_log_std = nn.Parameter(torch.full((num_actions,), -0.5))  # σ ≈ 0.6
-log_std_clamped = torch.clamp(actor_log_std, min=-2.0, max=0.5)  # σ ∈ [0.14, 1.65]
+# Actor log_std 초기화 및 범위 제한 (rl_games 스타일)
+actor_log_std = nn.Parameter(torch.full((num_actions,), 0.0))  # σ = 1.0
+log_std_clamped = torch.clamp(actor_log_std, min=-5.0, max=2.0)  # σ ∈ [0.007, 7.39]
 
-# Value loss clipping (PPO2 스타일)
+# Analytical Gaussian KL divergence (rl_games 스타일)
+kl = log(σ1/σ0) + (σ0² + (μ0 - μ1)²) / (2σ1²) - 0.5
+
+# Adaptive LR per epoch (rl_games 스타일)
+# KL > threshold×2 → LR /= 1.5
+# KL < threshold×0.5 → LR *= 1.5
+
+# Clipped value loss (rl_games 스타일)
 value_clipped = old_values + clamp(new_values - old_values, -ε, +ε)
 value_loss = max(unclipped_loss, clipped_loss)
 
-# Bounds loss - 액션 범위 초과 페널티
-bounds_loss = mean(clamp(|actions| - 1, 0)²)
+# Bounds loss on action mean (rl_games 스타일, soft bound 1.1)
+bounds_loss = mean(clamp(μ - 1.1, 0)² + clamp(μ + 1.1, max=0)²)
+
+# RunningMeanStd value normalization (DextrEme: normalize_value = True)
+# Critic → normalized space → denormalize for GAE → normalize for value loss
 ```
 
-- **Entropy 범위**: 약 10~30 (16 actions 기준)
+- **KL early stopping**: 사용하지 않음 (rl_games 원본과 동일)
 - **Reward clipping**: [-100, 100] 범위로 제한
+
+## DextrEme 원본 정렬
+
+이 구현은 [IsaacGymEnvs DextrEme](https://github.com/isaac-sim/IsaacGymEnvs)의 원본 값들과 정렬되어 있습니다.
+
+### Simulation
+
+| 항목 | DextrEme 원본 | 이 구현 |
+|------|-------------|--------|
+| Physics frequency | 120 Hz | 120 Hz ✓ |
+| Control frequency | 60 Hz | 60 Hz ✓ |
+| Episode length | 600 steps (10s) | 600 steps ✓ |
+| Consecutive successes | 50 | 50 ✓ |
+
+### PPO Hyperparameters
+
+| 항목 | DextrEme 원본 | 이 구현 |
+|------|-------------|--------|
+| learning_rate | 5e-4 | 5e-4 ✓ |
+| lr_schedule | adaptive | adaptive ✓ |
+| gamma | 0.99 | 0.99 ✓ |
+| tau (gae_lambda) | 0.95 | 0.95 ✓ |
+| e_clip | 0.2 | 0.2 ✓ |
+| kl_threshold | 0.016 | 0.016 ✓ |
+| entropy_coef | 0.0 | 0.0 ✓ |
+| critic_coef (value_coef) | 4.0 | 4.0 ✓ |
+| bounds_loss_coef | 0.0001 | 0.0001 ✓ |
+| horizon_length | 16 | 16 ✓ |
+| mini_epochs | 5 | 5 ✓ |
+| network | [512,512,256,128] | [512,512,256,128] ✓ |
+| activation | elu | elu ✓ |
+| normalize_value | True | True (RunningMeanStd) ✓ |
+| normalize_input | True | True ✓ |
+| normalize_advantage | True | True ✓ |
+
+### PPO Algorithm (rl_games)
+
+| 항목 | rl_games 원본 | 이 구현 |
+|------|-------------|--------|
+| KL divergence | Analytical Gaussian | Analytical Gaussian ✓ |
+| KL early stopping | None | None ✓ |
+| Adaptive LR timing | Per epoch | Per epoch ✓ |
+| LR decrease factor | /1.5 | /1.5 ✓ |
+| LR increase factor | ×1.5 | ×1.5 ✓ |
+| Value loss | Clipped | Clipped ✓ |
+| Bounds loss target | Action mean (μ) | Action mean (μ) ✓ |
+| Bounds loss soft bound | 1.1 | 1.1 ✓ |
+| Value normalization | RunningMeanStd | RunningMeanStd ✓ |
+| log_std clamp | [-5.0, 2.0] | [-5.0, 2.0] ✓ |
+
+### 주요 차이점
+
+- **시뮬레이터**: DextrEme는 IsaacGym 사용, 이 구현은 Newton 사용
+- **RL 라이브러리**: DextrEme는 rl_games 사용, 이 구현은 직접 구현 (알고리즘 동일)
 
 ## 참고 자료
 
 - [IsaacGymEnvs DextrEme](https://github.com/isaac-sim/IsaacGymEnvs/tree/main/isaacgymenvs/tasks/dextreme)
+- [rl_games](https://github.com/Denys88/rl_games) - PPO 알고리즘 참조
 - [IsaacLab Allegro Hand](https://github.com/isaac-sim/IsaacLab/blob/main/source/isaaclab_tasks/isaaclab_tasks/direct/allegro_hand/)
 - [Newton Examples](https://github.com/nvidia-warp/newton)

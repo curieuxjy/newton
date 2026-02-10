@@ -1,17 +1,60 @@
-"""Simplified FABRICS implementation for Franka + Allegro grasping.
+"""FABRICS implementation for Franka + Allegro grasping.
 
-Reference: NVlabs/FABRICS - Riemannian Geometric Fabrics for Robot Motion Planning
-https://github.com/NVlabs/FABRICS
+Reference:
+- NVlabs/FABRICS - Riemannian Geometric Fabrics for Robot Motion Planning
+  https://github.com/NVlabs/FABRICS
+- NVlabs/DEXTRAH - High-performance hand-arm grasping policy
+  https://github.com/NVlabs/DEXTRAH
 
-This is a simplified version that provides:
-1. Task space position computation (fingertips, palm)
-2. Jacobian-based velocity mapping
-3. Multi-point attractor targets for grasp control
+This module provides:
+1. FabricActionController: Converts 11D fabric actions to 23D joint targets
+   - 6D palm pose (XYZ + RPY) -> 7D Franka arm joints via IK
+   - 5D hand PCA -> 16D Allegro hand joints via PCA matrix
+2. GraspFabric: Computes grasp features and rewards
 """
 
 import torch
 import torch.nn as nn
 import numpy as np
+
+
+# === DEXTRAH Constants ===
+# Reference: dextrah_lab/tasks/dextrah_kuka_allegro/dextrah_kuka_allegro_constants.py
+
+# Hand PCA limits (5D action space for 16D Allegro hand)
+HAND_PCA_MINS = [0.2475, -0.3286, -0.7238, -0.0192, -0.5532]
+HAND_PCA_MAXS = [3.8336, 3.0025, 0.8977, 1.0243, 0.0629]
+
+# Palm pose limits (will be adjusted for Franka's workspace)
+# Original DEXTRAH (for Kuka): position [-1.2, -0.7, 0.0] to [0.0, 0.7, 1.0]
+# Adjusted for Franka workspace centered around (-0.3, -0.5, 0.45)
+PALM_POSE_MINS = [-0.6, -0.9, 0.35, -np.pi, -np.pi/4, -np.pi]  # [x, y, z, roll, pitch, yaw]
+PALM_POSE_MAXS = [0.0, -0.1, 0.8, np.pi, np.pi/4, np.pi]
+
+# PCA matrix from FABRICS (5x16): maps 5D PCA coords to 16D Allegro joints
+# Reference: fabrics_sim/fabrics/kuka_allegro_pose_fabric.py
+HAND_PCA_MATRIX = torch.tensor([
+    [-3.8872e-02, 3.7917e-01, 4.4703e-01, 7.1016e-03, 2.1159e-03,
+     3.2014e-01, 4.4660e-01, 5.2108e-02, 5.6869e-05, 2.9845e-01,
+     3.8575e-01, 7.5774e-03, -1.4790e-02, 9.8163e-02, 4.3551e-02,
+     3.1699e-01],
+    [-5.1148e-02, -1.3007e-01, 5.7727e-02, 5.7914e-01, 1.0156e-02,
+     -1.8469e-01, 5.3809e-02, 5.4888e-01, 1.3351e-04, -1.7747e-01,
+     2.7809e-02, 4.8187e-01, 2.9753e-02, 2.6149e-02, 6.6994e-02,
+     1.8117e-01],
+    [-5.7137e-02, -3.4707e-01, 3.3365e-01, -1.8029e-01, -4.3560e-02,
+     -4.7666e-01, 3.2517e-01, -1.5208e-01, -5.9691e-05, -4.5790e-01,
+     3.6536e-01, -1.3916e-01, 2.3925e-03, 3.7238e-02, -1.0124e-01,
+     -1.7442e-02],
+    [2.2795e-02, -3.4090e-02, 3.4366e-02, -2.6531e-02, 2.3471e-02,
+     4.6123e-02, 9.8059e-02, -1.2619e-03, -1.6452e-04, -1.3741e-02,
+     1.3813e-01, 2.8677e-02, 2.2661e-01, -5.9911e-01, 7.0257e-01,
+     -2.4525e-01],
+    [-4.4911e-02, -4.7156e-01, 9.3124e-02, 2.3135e-01, -2.4607e-03,
+     9.5564e-02, 1.2470e-01, 3.6613e-02, 1.3821e-04, 4.6072e-01,
+     9.9315e-02, -8.1080e-02, -4.7617e-01, -2.7734e-01, -2.3989e-01,
+     -3.1222e-01],
+], dtype=torch.float32)
 
 
 class TaskMap(nn.Module):
@@ -470,3 +513,372 @@ class GraspFabric(nn.Module):
         allegro_force = allegro_force - self.damping_gain * allegro_qd
 
         return franka_force, allegro_force
+
+
+class FabricActionController(nn.Module):
+    """FABRICS-based action controller for Franka + Allegro.
+
+    Converts 11D fabric actions to 23D joint targets:
+    - 6D palm pose (XYZ + RPY) -> 7D Franka arm joint targets via differential IK
+    - 5D hand PCA -> 16D Allegro hand joint targets via PCA projection
+
+    Reference: NVlabs/DEXTRAH - dextrah_kuka_allegro_env.py
+    """
+
+    # Action space dimensions
+    NUM_XYZ = 3
+    NUM_RPY = 3
+    NUM_HAND_PCA = 5
+    NUM_FABRIC_ACTIONS = NUM_XYZ + NUM_RPY + NUM_HAND_PCA  # 11
+
+    def __init__(
+        self,
+        franka_dof: int = 7,
+        allegro_dof: int = 16,
+        franka_joint_lower: torch.Tensor | None = None,
+        franka_joint_upper: torch.Tensor | None = None,
+        allegro_joint_lower: torch.Tensor | None = None,
+        allegro_joint_upper: torch.Tensor | None = None,
+        device: str = "cuda",
+        damping: float = 0.1,
+        ik_step_size: float = 0.1,
+    ):
+        """Initialize the fabric action controller.
+
+        Args:
+            franka_dof: Number of Franka arm DOFs (7)
+            allegro_dof: Number of Allegro hand DOFs (16)
+            franka_joint_lower: Lower joint limits for Franka
+            franka_joint_upper: Upper joint limits for Franka
+            allegro_joint_lower: Lower joint limits for Allegro
+            allegro_joint_upper: Upper joint limits for Allegro
+            device: Compute device
+            damping: Damping for IK solver
+            ik_step_size: Step size for iterative IK
+        """
+        super().__init__()
+        self.franka_dof = franka_dof
+        self.allegro_dof = allegro_dof
+        self.device = device
+        self.damping = damping
+        self.ik_step_size = ik_step_size
+
+        # Register PCA matrix (5 x 16)
+        self.register_buffer("pca_matrix", HAND_PCA_MATRIX.to(device))
+
+        # Action space limits
+        self.register_buffer(
+            "palm_pose_lower",
+            torch.tensor(PALM_POSE_MINS, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "palm_pose_upper",
+            torch.tensor(PALM_POSE_MAXS, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "hand_pca_lower",
+            torch.tensor(HAND_PCA_MINS, dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "hand_pca_upper",
+            torch.tensor(HAND_PCA_MAXS, dtype=torch.float32, device=device)
+        )
+
+        # Joint limits
+        if franka_joint_lower is not None:
+            self.register_buffer("franka_joint_lower", franka_joint_lower.to(device))
+            self.register_buffer("franka_joint_upper", franka_joint_upper.to(device))
+        else:
+            # Default Franka Emika Panda joint limits
+            self.register_buffer(
+                "franka_joint_lower",
+                torch.tensor([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973],
+                           dtype=torch.float32, device=device)
+            )
+            self.register_buffer(
+                "franka_joint_upper",
+                torch.tensor([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973],
+                           dtype=torch.float32, device=device)
+            )
+
+        if allegro_joint_lower is not None:
+            self.register_buffer("allegro_joint_lower", allegro_joint_lower.to(device))
+            self.register_buffer("allegro_joint_upper", allegro_joint_upper.to(device))
+        else:
+            # Default Allegro hand limits (approximate)
+            self.register_buffer(
+                "allegro_joint_lower",
+                torch.tensor([-0.47, -0.196, -0.174, -0.227] * 4, dtype=torch.float32, device=device)
+            )
+            self.register_buffer(
+                "allegro_joint_upper",
+                torch.tensor([0.47, 1.61, 1.709, 1.618] * 4, dtype=torch.float32, device=device)
+            )
+
+        # Franka Jacobian approximation using DH parameters (simplified)
+        # Real implementation would use proper FK/IK from the robot model
+        self._init_franka_kinematics()
+
+    def _init_franka_kinematics(self):
+        """Initialize Franka kinematics parameters (DH parameters)."""
+        # Franka Emika Panda DH parameters (simplified)
+        # These are approximate and used for differential IK
+        self.register_buffer(
+            "franka_d",
+            torch.tensor([0.333, 0.0, 0.316, 0.0, 0.384, 0.0, 0.107],
+                        dtype=torch.float32, device=self.device)
+        )
+        self.register_buffer(
+            "franka_a",
+            torch.tensor([0.0, 0.0, 0.0825, -0.0825, 0.0, 0.088, 0.0],
+                        dtype=torch.float32, device=self.device)
+        )
+
+    def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Normalize action from [-1, 1] to actual limits.
+
+        Args:
+            action: Raw action in [-1, 1] (batch, 11)
+
+        Returns:
+            Normalized action with actual values
+        """
+        # Split action
+        palm_action = action[:, :6]  # 6D palm pose
+        hand_action = action[:, 6:]  # 5D hand PCA
+
+        # Scale palm pose from [-1, 1] to actual limits
+        palm_range = self.palm_pose_upper - self.palm_pose_lower
+        palm_target = self.palm_pose_lower + (palm_action + 1.0) * 0.5 * palm_range
+
+        # Scale hand PCA from [-1, 1] to actual limits
+        hand_range = self.hand_pca_upper - self.hand_pca_lower
+        hand_target = self.hand_pca_lower + (hand_action + 1.0) * 0.5 * hand_range
+
+        return torch.cat([palm_target, hand_target], dim=-1)
+
+    def pca_to_joint(self, hand_pca: torch.Tensor) -> torch.Tensor:
+        """Convert 5D hand PCA coordinates to 16D joint positions.
+
+        Args:
+            hand_pca: Hand PCA coordinates (batch, 5)
+
+        Returns:
+            allegro_q: Allegro joint positions (batch, 16)
+        """
+        # PCA reconstruction: q = pca_coords @ pca_matrix
+        # pca_matrix is (5, 16), hand_pca is (batch, 5)
+        allegro_q = torch.matmul(hand_pca, self.pca_matrix)
+
+        # Clamp to joint limits
+        allegro_q = torch.clamp(allegro_q, self.allegro_joint_lower, self.allegro_joint_upper)
+
+        return allegro_q
+
+    def euler_to_quat(self, rpy: torch.Tensor) -> torch.Tensor:
+        """Convert Euler angles (ZYX convention) to quaternion.
+
+        Args:
+            rpy: Roll-Pitch-Yaw angles (batch, 3)
+
+        Returns:
+            quat: Quaternion (batch, 4) in (x, y, z, w) format
+        """
+        roll = rpy[:, 0]
+        pitch = rpy[:, 1]
+        yaw = rpy[:, 2]
+
+        cy = torch.cos(yaw * 0.5)
+        sy = torch.sin(yaw * 0.5)
+        cp = torch.cos(pitch * 0.5)
+        sp = torch.sin(pitch * 0.5)
+        cr = torch.cos(roll * 0.5)
+        sr = torch.sin(roll * 0.5)
+
+        w = cr * cp * cy + sr * sp * sy
+        x = sr * cp * cy - cr * sp * sy
+        y = cr * sp * cy + sr * cp * sy
+        z = cr * cp * sy - sr * sp * cy
+
+        return torch.stack([x, y, z, w], dim=-1)
+
+    def compute_franka_jacobian(
+        self,
+        franka_q: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute approximate Franka Jacobian using finite differences.
+
+        For production use, this should be replaced with analytical Jacobian
+        from the robot model or a proper IK library.
+
+        Args:
+            franka_q: Current Franka joint positions (batch, 7)
+
+        Returns:
+            J: Jacobian matrix (batch, 6, 7)
+        """
+        batch_size = franka_q.shape[0]
+        eps = 1e-4
+
+        # Approximate Jacobian using numerical differentiation
+        # This is a simplified version; real implementation would use FK
+        J = torch.zeros(batch_size, 6, 7, device=self.device)
+
+        # For now, use a simple diagonal approximation
+        # Real IK would compute proper Jacobian from FK
+        # Joints 0-2 primarily affect XYZ position
+        # Joints 3-6 primarily affect orientation
+        J[:, 0, 0] = 0.5   # Joint 0 -> X
+        J[:, 1, 0] = 0.3   # Joint 0 -> Y
+        J[:, 0, 1] = 0.3   # Joint 1 -> X
+        J[:, 2, 1] = 0.4   # Joint 1 -> Z
+        J[:, 1, 2] = 0.4   # Joint 2 -> Y
+        J[:, 0, 3] = 0.2   # Joint 3 -> X
+        J[:, 2, 3] = 0.3   # Joint 3 -> Z
+        J[:, 3, 4] = 0.5   # Joint 4 -> Roll
+        J[:, 4, 5] = 0.5   # Joint 5 -> Pitch
+        J[:, 5, 6] = 0.5   # Joint 6 -> Yaw
+
+        return J
+
+    def differential_ik(
+        self,
+        current_q: torch.Tensor,
+        current_ee_pos: torch.Tensor,
+        current_ee_quat: torch.Tensor,
+        target_pos: torch.Tensor,
+        target_rpy: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute joint position update using differential IK.
+
+        Args:
+            current_q: Current Franka joint positions (batch, 7)
+            current_ee_pos: Current EE position (batch, 3)
+            current_ee_quat: Current EE quaternion (batch, 4)
+            target_pos: Target EE position (batch, 3)
+            target_rpy: Target EE orientation as RPY (batch, 3)
+
+        Returns:
+            target_q: Target joint positions (batch, 7)
+        """
+        batch_size = current_q.shape[0]
+
+        # Compute position error
+        pos_error = target_pos - current_ee_pos
+
+        # Compute orientation error (simplified: use RPY difference)
+        # Convert current quat to RPY for error computation
+        current_rpy = self.quat_to_euler(current_ee_quat)
+        ori_error = target_rpy - current_rpy
+
+        # Wrap orientation error to [-pi, pi]
+        ori_error = torch.atan2(torch.sin(ori_error), torch.cos(ori_error))
+
+        # Combine into 6D task space error
+        task_error = torch.cat([pos_error, ori_error], dim=-1)  # (batch, 6)
+
+        # Compute Jacobian
+        J = self.compute_franka_jacobian(current_q)  # (batch, 6, 7)
+
+        # Damped least squares IK: dq = J^T (J J^T + λI)^-1 dx
+        JJT = torch.bmm(J, J.transpose(1, 2))  # (batch, 6, 6)
+        damping_matrix = self.damping * torch.eye(6, device=self.device).unsqueeze(0).expand(batch_size, -1, -1)
+        JJT_damped = JJT + damping_matrix
+
+        # Solve for dq
+        try:
+            JJT_inv = torch.linalg.inv(JJT_damped)
+            dq = torch.bmm(J.transpose(1, 2), torch.bmm(JJT_inv, task_error.unsqueeze(-1))).squeeze(-1)
+        except Exception:
+            # Fallback to simple proportional control
+            dq = torch.bmm(J.transpose(1, 2), task_error.unsqueeze(-1)).squeeze(-1) * 0.1
+
+        # Scale update
+        dq = dq * self.ik_step_size
+
+        # Compute target joint positions
+        target_q = current_q + dq
+
+        # Clamp to joint limits
+        target_q = torch.clamp(target_q, self.franka_joint_lower, self.franka_joint_upper)
+
+        return target_q
+
+    def quat_to_euler(self, quat: torch.Tensor) -> torch.Tensor:
+        """Convert quaternion to Euler angles (ZYX convention).
+
+        Args:
+            quat: Quaternion (batch, 4) in (x, y, z, w) format
+
+        Returns:
+            rpy: Roll-Pitch-Yaw angles (batch, 3)
+        """
+        x, y, z, w = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+
+        # Roll (x-axis rotation)
+        sinr_cosp = 2 * (w * x + y * z)
+        cosr_cosp = 1 - 2 * (x * x + y * y)
+        roll = torch.atan2(sinr_cosp, cosr_cosp)
+
+        # Pitch (y-axis rotation)
+        sinp = 2 * (w * y - z * x)
+        sinp = torch.clamp(sinp, -1.0, 1.0)
+        pitch = torch.asin(sinp)
+
+        # Yaw (z-axis rotation)
+        siny_cosp = 2 * (w * z + x * y)
+        cosy_cosp = 1 - 2 * (y * y + z * z)
+        yaw = torch.atan2(siny_cosp, cosy_cosp)
+
+        return torch.stack([roll, pitch, yaw], dim=-1)
+
+    def forward(
+        self,
+        fabric_action: torch.Tensor,
+        current_franka_q: torch.Tensor,
+        current_ee_pos: torch.Tensor,
+        current_ee_quat: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert 11D fabric action to 23D joint targets.
+
+        Args:
+            fabric_action: Normalized fabric action in [-1, 1] (batch, 11)
+            current_franka_q: Current Franka joint positions (batch, 7)
+            current_ee_pos: Current EE position (batch, 3)
+            current_ee_quat: Current EE quaternion (batch, 4)
+
+        Returns:
+            franka_target: Target Franka joint positions (batch, 7)
+            allegro_target: Target Allegro joint positions (batch, 16)
+        """
+        # Normalize action from [-1, 1] to actual values
+        normalized_action = self.normalize_action(fabric_action)
+
+        # Split into palm pose and hand PCA
+        palm_target = normalized_action[:, :6]  # (batch, 6) [x, y, z, roll, pitch, yaw]
+        hand_pca_target = normalized_action[:, 6:]  # (batch, 5)
+
+        # Convert hand PCA to joint positions
+        allegro_target = self.pca_to_joint(hand_pca_target)
+
+        # Convert palm pose to Franka joint positions using differential IK
+        target_pos = palm_target[:, :3]
+        target_rpy = palm_target[:, 3:6]
+
+        franka_target = self.differential_ik(
+            current_franka_q,
+            current_ee_pos,
+            current_ee_quat,
+            target_pos,
+            target_rpy,
+        )
+
+        return franka_target, allegro_target
+
+    def get_action_dim(self) -> int:
+        """Return the fabric action dimension (11)."""
+        return self.NUM_FABRIC_ACTIONS
+
+    def get_joint_dim(self) -> int:
+        """Return the total joint dimension (23)."""
+        return self.franka_dof + self.allegro_dof

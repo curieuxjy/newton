@@ -32,7 +32,19 @@ class EnvConfig:
 
     # Action
     action_scale: float = 0.1
-    use_relative_control: bool = True  # Delta position control
+    use_relative_control: bool = True  # Delta position control (for direct joint control)
+
+    # FABRICS Action Space (DEXTRAH-style)
+    # Action space is 11D instead of 23D:
+    # - 6D palm pose (XYZ + RPY) for arm control
+    # - 5D hand PCA for finger control
+    # Set to False for direct 23D joint control
+    use_fabric_actions: bool = True  # Default: FABRICS action space (DEXTRAH-style)
+
+    # Fabric IK parameters
+    fabric_ik_damping: float = 0.1  # Damping for differential IK
+    fabric_ik_step_size: float = 0.5  # Step size for IK updates
+    fabric_decimation: int = 2  # Number of fabric steps per physics step (DEXTRAH: 2)
 
     # Table - positioned where robot arm points (EE at approx -0.4, -0.7)
     table_height: float = 0.4
@@ -79,11 +91,8 @@ class EnvConfig:
     in_success_region_weight: float = 10.0
     object_goal_tol: float = 0.1  # meters
 
-    # Penalties
-    action_penalty_scale: float = 0.0001
-    action_delta_penalty_scale: float = 0.0001
-    velocity_penalty_scale: float = 0.01
-    drop_penalty: float = -100.0
+    # Note: DEXTRAH does NOT use action/velocity penalties in reward
+    # Only the 4 core reward components are used
 
     # Success/Failure
     consecutive_successes: int = 10  # Hold for N steps
@@ -163,7 +172,7 @@ class TrainConfig:
     seed: int = 42
     device: str = "cuda"
     log_interval: int = 10
-    save_interval: int = 100
+    save_interval: int = 5000
     checkpoint_dir: str = "checkpoints"
     experiment_name: str = "franka_allegro_grasp"
 

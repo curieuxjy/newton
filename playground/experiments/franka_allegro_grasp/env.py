@@ -16,10 +16,10 @@ import warp as wp
 
 import newton
 from newton import ActuatorMode, Contacts
-from newton.sensors import SensorContact, SensorTiledCamera, populate_contacts
+from newton.sensors import SensorContact, SensorTiledCamera
 
 from .config import EnvConfig
-from .fabric import GraspFabric
+from .fabric import FabricActionController, GraspFabric
 
 
 class FrankaAllegroGraspEnv:
@@ -82,7 +82,15 @@ class FrankaAllegroGraspEnv:
         self.num_state_obs = 7 + 7 + 16 + 16 + 3 + 4 + 3 + 4 + 3 + 3 + 3 + 3  # = 72
         self.num_depth_obs = config.depth_width * config.depth_height if config.use_depth_sensor else 0
         self.num_obs = self.num_state_obs + self.num_depth_obs
-        self.num_actions = 7 + 16  # Franka (7) + Allegro (16) = 23
+
+        # Action space depends on whether fabric actions are used
+        self.use_fabric_actions = config.use_fabric_actions
+        if self.use_fabric_actions:
+            # FABRICS action space: 6D palm pose + 5D hand PCA = 11D
+            self.num_actions = 11
+        else:
+            # Direct joint control: 7D Franka + 16D Allegro = 23D
+            self.num_actions = 7 + 16
 
         # Buffers
         self.obs_buf = torch.zeros(self.num_envs, self.num_obs, dtype=torch.float32, device=self.torch_device)
@@ -94,8 +102,9 @@ class FrankaAllegroGraspEnv:
         self.actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float32, device=self.torch_device)
         self.prev_actions = torch.zeros_like(self.actions)
 
-        # Current joint targets
-        self.current_targets = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float32, device=self.torch_device)
+        # Current joint targets (always 23D = 7 Franka + 16 Allegro, regardless of action mode)
+        self.num_joint_targets = 7 + 16  # Always 23
+        self.current_targets = torch.zeros(self.num_envs, self.num_joint_targets, dtype=torch.float32, device=self.torch_device)
 
         # Goal state (lift target position)
         self.goal_pos = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.torch_device)
@@ -116,6 +125,21 @@ class FrankaAllegroGraspEnv:
             allegro_dof=self.allegro_dof_count,
             device=self.torch_device,
         )
+
+        # Setup FABRICS action controller if using fabric actions
+        self.fabric_action_controller = None
+        if self.use_fabric_actions:
+            self.fabric_action_controller = FabricActionController(
+                franka_dof=self.franka_dof_count,
+                allegro_dof=self.allegro_dof_count,
+                franka_joint_lower=self.franka_joint_lower,
+                franka_joint_upper=self.franka_joint_upper,
+                allegro_joint_lower=self.allegro_joint_lower,
+                allegro_joint_upper=self.allegro_joint_upper,
+                device=self.torch_device,
+                damping=config.fabric_ik_damping,
+                ik_step_size=config.fabric_ik_step_size,
+            )
 
         # Setup contact sensor for finger-cube contact detection
         self._setup_contact_sensor()
@@ -565,22 +589,29 @@ class FrankaAllegroGraspEnv:
         self.prev_actions = self.actions.clone()
         self.actions = actions.clone()
 
-        # Apply delta actions
-        if self.config.use_relative_control:
-            action_delta = actions * self.config.action_scale
-            self.current_targets = self.current_targets + action_delta
+        if self.use_fabric_actions:
+            # === FABRICS Action Mode ===
+            # Convert 11D fabric actions to 23D joint targets
+            self._apply_fabric_actions(actions)
         else:
-            self.current_targets = self.joint_mid + actions * (self.joint_range / 2) * self.config.action_scale
+            # === Direct Joint Control Mode ===
+            # Apply delta actions
+            if self.config.use_relative_control:
+                action_delta = actions * self.config.action_scale
+                self.current_targets = self.current_targets + action_delta
+            else:
+                self.current_targets = self.joint_mid + actions * (self.joint_range / 2) * self.config.action_scale
 
-        # Clamp to joint limits
-        self.current_targets = torch.clamp(self.current_targets, self.joint_lower, self.joint_upper)
+            # Clamp to joint limits
+            self.current_targets = torch.clamp(self.current_targets, self.joint_lower, self.joint_upper)
 
-        # Apply to control
-        self._apply_actions(self.current_targets)
+            # Apply to control
+            self._apply_actions(self.current_targets)
 
-        # Step simulation
-        for _ in range(self.control_decimation):
-            self._simulate_step()
+        # Step simulation (only for direct joint control; fabric actions handle simulation internally)
+        if not self.use_fabric_actions:
+            for _ in range(self.control_decimation):
+                self._simulate_step()
 
         # Update episode step
         self.episode_step += 1
@@ -616,6 +647,58 @@ class FrankaAllegroGraspEnv:
         control_reshaped[:, self.allegro_dof_start:self.allegro_dof_start + self.allegro_dof_count] = target_np[:, self.franka_dof_count:]
 
         self.control.joint_target_pos = wp.array(control_reshaped.flatten(), dtype=wp.float32, device=self.device)
+
+    def _apply_fabric_actions(self, fabric_actions: torch.Tensor):
+        """Apply FABRICS-based actions.
+
+        Converts 11D fabric actions (6D palm pose + 5D hand PCA) to 23D joint targets
+        using the FabricActionController.
+
+        Args:
+            fabric_actions: Fabric actions in [-1, 1] (batch, 11)
+        """
+        # Get current state
+        body_q = torch.from_numpy(self.state_0.body_q.numpy()).to(self.torch_device)
+        joint_q = torch.from_numpy(self.state_0.joint_q.numpy()).to(self.torch_device)
+
+        body_q_reshaped = body_q.reshape(self.num_envs, self.bodies_per_env, 7)
+        joint_q_reshaped = joint_q.reshape(self.num_envs, self.joint_q_per_env)
+
+        # Get current EE pose
+        ee_pos = body_q_reshaped[:, self.ee_body_idx, :3]
+        ee_quat = body_q_reshaped[:, self.ee_body_idx, 3:7]
+
+        # Get current Franka joint positions
+        current_franka_q = joint_q_reshaped[:, :self.franka_dof_count]
+
+        # Run fabric decimation steps (DEXTRAH runs fabric at 60Hz, physics at 120Hz)
+        for _ in range(self.config.fabric_decimation):
+            # Convert fabric actions to joint targets
+            franka_target, allegro_target = self.fabric_action_controller(
+                fabric_actions,
+                current_franka_q,
+                ee_pos,
+                ee_quat,
+            )
+
+            # Update current targets
+            self.current_targets[:, :self.franka_dof_count] = franka_target
+            self.current_targets[:, self.franka_dof_count:] = allegro_target
+
+            # Apply to control
+            self._apply_actions(self.current_targets)
+
+            # Run one physics step
+            self._simulate_step()
+
+            # Update state for next iteration
+            body_q = torch.from_numpy(self.state_0.body_q.numpy()).to(self.torch_device)
+            joint_q = torch.from_numpy(self.state_0.joint_q.numpy()).to(self.torch_device)
+            body_q_reshaped = body_q.reshape(self.num_envs, self.bodies_per_env, 7)
+            joint_q_reshaped = joint_q.reshape(self.num_envs, self.joint_q_per_env)
+            ee_pos = body_q_reshaped[:, self.ee_body_idx, :3]
+            ee_quat = body_q_reshaped[:, self.ee_body_idx, 3:7]
+            current_franka_q = joint_q_reshaped[:, :self.franka_dof_count]
 
     def _compute_observations(self) -> torch.Tensor:
         """Compute observations for all environments."""
@@ -851,7 +934,8 @@ class FrankaAllegroGraspEnv:
             grasp_features, self.config.cube_size
         )
 
-        # === DEXTRAH Total Reward (continuous sum) ===
+        # === DEXTRAH Total Reward (continuous sum, no extra penalties) ===
+        # Note: DEXTRAH uses only these 4 core components + success bonus
         reward = (
             hand_to_object_reward +
             object_to_goal_reward +
@@ -859,22 +943,6 @@ class FrankaAllegroGraspEnv:
             lift_reward +
             success_bonus
         )
-
-        # === Additional Penalties ===
-
-        # Action penalty
-        action_penalty = self.config.action_penalty_scale * torch.sum(self.actions ** 2, dim=-1)
-
-        # Action delta penalty
-        action_delta = self.actions - self.prev_actions
-        action_delta_penalty = self.config.action_delta_penalty_scale * torch.sum(action_delta ** 2, dim=-1)
-
-        # Velocity penalty
-        vel_penalty = self.config.velocity_penalty_scale * torch.sum(joint_qd_reshaped ** 2, dim=-1)
-
-        # Drop penalty
-        dropped = cube_height < self.config.fall_height
-        drop_penalty = torch.where(dropped, torch.full_like(reward, self.config.drop_penalty), torch.zeros_like(reward))
 
         # === Update task phase (for logging/visualization) ===
         reached = hand_to_object_dist < self.config.hand_to_object_dist_threshold
@@ -899,8 +967,8 @@ class FrankaAllegroGraspEnv:
             self.successes
         )
 
-        # Total reward
-        self.reward_buf = reward - action_penalty - action_delta_penalty - vel_penalty + drop_penalty
+        # Total reward (DEXTRAH: no extra penalties)
+        self.reward_buf = reward
 
         # Store components for logging
         phase_0_mask = self.task_phase == 0
@@ -908,15 +976,12 @@ class FrankaAllegroGraspEnv:
         phase_2_mask = self.task_phase == 2
 
         self.reward_components = {
-            # DEXTRAH reward components
+            # DEXTRAH reward components (4 core + success bonus)
             "hand_to_object_reward": hand_to_object_reward.mean().item(),
             "object_to_goal_reward": object_to_goal_reward.mean().item(),
             "finger_curl_reg": finger_curl_reg.mean().item(),
             "lift_reward": lift_reward.mean().item(),
             "success_bonus": success_bonus.mean().item(),
-            # Penalties
-            "action_penalty": -action_penalty.mean().item(),
-            "drop_penalty": drop_penalty.mean().item(),
             # Distances
             "hand_to_object_dist": hand_to_object_dist.mean().item(),
             "object_to_goal_dist": object_to_goal_dist.mean().item(),

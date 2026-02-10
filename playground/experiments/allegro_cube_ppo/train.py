@@ -103,6 +103,7 @@ def train(config: TrainConfig):
         num_actions=env.num_actions,
         hidden_dims=config.ppo.hidden_dims,
         activation=config.ppo.activation,
+        init_sigma=config.ppo.init_sigma,
     )
     print(f"[INFO] Actor-Critic parameters: {sum(p.numel() for p in actor_critic.parameters()):,}")
 
@@ -165,16 +166,19 @@ def train(config: TrainConfig):
         buffer.reset()
         for step in range(config.ppo.rollout_steps):
             with torch.no_grad():
-                action, log_prob, _, value = actor_critic.get_action_and_value(obs)
+                action, log_prob, _, value, action_mean, _ = actor_critic.get_action_and_value(obs)
                 # Clamp actions to valid range before environment step
                 action = torch.clamp(action, -1.0, 1.0)
+                # Denormalize value for GAE computation (critic predicts in normalized space)
+                if ppo.value_normalizer is not None:
+                    value = ppo.value_normalizer.denormalize(value)
 
             # Environment step
             next_obs, reward, done, info = env.step(action)
             global_step += env.num_envs
 
             # Store in buffer
-            buffer.add(obs, action, log_prob, reward, done, value)
+            buffer.add(obs, action, log_prob, reward, done, value, action_mean)
 
             # Track reward components
             if hasattr(env, "reward_components"):
@@ -202,7 +206,14 @@ def train(config: TrainConfig):
         # Compute returns and advantages
         with torch.no_grad():
             last_value = actor_critic.get_value(obs)
+            # Denormalize last_value (critic predicts in normalized space)
+            if ppo.value_normalizer is not None:
+                last_value = ppo.value_normalizer.denormalize(last_value)
         buffer.compute_returns_and_advantages(last_value, config.ppo.gamma, config.ppo.gae_lambda)
+
+        # Update value normalizer with computed returns
+        if ppo.value_normalizer is not None:
+            ppo.value_normalizer.update(buffer.returns)
 
         # PPO update
         metrics = ppo.update(buffer)
@@ -223,7 +234,9 @@ def train(config: TrainConfig):
                 f"Length {avg_length:6.1f} | "
                 f"PL {metrics['policy_loss']:7.4f} | "
                 f"VL {metrics['value_loss']:7.4f} | "
-                f"Ent {metrics['entropy']:6.3f}"
+                f"Ent {metrics['entropy']:6.3f} | "
+                f"KL {metrics['kl_divergence']:.4f} | "
+                f"LR {metrics['learning_rate']:.2e}"
             )
 
             # Compute average reward components
@@ -250,6 +263,8 @@ def train(config: TrainConfig):
                 writer.add_scalar("train/policy_loss", metrics["policy_loss"], global_step)
                 writer.add_scalar("train/value_loss", metrics["value_loss"], global_step)
                 writer.add_scalar("train/entropy", metrics["entropy"], global_step)
+                writer.add_scalar("train/kl_divergence", metrics["kl_divergence"], global_step)
+                writer.add_scalar("train/learning_rate", metrics["learning_rate"], global_step)
                 writer.add_scalar("episode/reward_mean", avg_reward, global_step)
                 writer.add_scalar("episode/length_mean", avg_length, global_step)
                 writer.add_scalar("perf/fps", fps, global_step)
@@ -265,10 +280,11 @@ def train(config: TrainConfig):
                     "train/value_loss": metrics["value_loss"],
                     "train/entropy": metrics["entropy"],
                     "train/total_loss": metrics["total_loss"],
+                    "train/kl_divergence": metrics["kl_divergence"],
+                    "train/learning_rate": metrics["learning_rate"],
                     # Episode metrics
                     "episode/reward_mean": avg_reward,
                     "episode/length_mean": avg_length,
-                    "episode/completed": completed_episodes,
                     # Performance
                     "perf/fps": fps,
                     "perf/global_step": global_step,

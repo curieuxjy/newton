@@ -11,11 +11,11 @@ class EnvConfig:
     """Environment configuration."""
 
     num_envs: int = 4096
-    episode_length: int = 400  # 8 seconds at 50Hz
+    episode_length: int = 600  # 10 seconds at 60Hz control
 
     # Simulation
-    fps: int = 60
-    sim_substeps: int = 2
+    fps: int = 120
+    sim_substeps: int = 1
     control_decimation: int = 2  # control at 30Hz
 
     # Robot
@@ -50,7 +50,7 @@ class EnvConfig:
     reach_goal_bonus: float = 250.0
     fall_penalty: float = -50.0
     success_tolerance: float = 0.4  # radians (~23 degrees)
-    consecutive_successes: int = 5  # Hold for N steps
+    consecutive_successes: int = 50  # Hold for N steps
     fall_dist: float = 0.3  # meters
 
     # Goal
@@ -67,24 +67,37 @@ class PPOConfig:
     """PPO algorithm configuration."""
 
     # Learning
-    learning_rate: float = 3e-4
+    learning_rate: float = 5e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_epsilon: float = 0.2
-    entropy_coef: float = 0.01
-    value_coef: float = 0.5
+    entropy_coef: float = 0.0
+    value_coef: float = 4.0
     bounds_loss_coef: float = 0.0001  # Penalize actions outside [-1, 1]
     max_grad_norm: float = 1.0
+
+    # KL-based adaptive learning rate (rl_games style)
+    kl_threshold: float = 0.016
+    lr_schedule: str = "adaptive"  # "adaptive" or "fixed"
 
     # Training
     num_epochs: int = 5
     num_minibatches: int = 4
     total_timesteps: int = 100_000_000
-    rollout_steps: int = 24
+    rollout_steps: int = 16
 
     # Network (larger for complex task)
-    hidden_dims: tuple = (512, 256, 128)
+    hidden_dims: tuple = (512, 512, 256, 128)
     activation: str = "elu"
+
+    # Normalization (DextrEme: all True)
+    normalize_input: bool = True
+    normalize_value: bool = True
+    normalize_advantage: bool = True
+    observation_clip: float = 5.0  # DextrEme: 5.0
+
+    # Actor initialization
+    init_sigma: float = 0.0  # Initial log_std (σ=1.0 for wide exploration)
 
 
 @dataclass

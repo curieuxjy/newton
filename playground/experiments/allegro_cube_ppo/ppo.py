@@ -8,6 +8,54 @@ from torch.distributions import Normal
 from .config import PPOConfig
 
 
+def gaussian_kl(mu0: torch.Tensor, sigma0: torch.Tensor, mu1: torch.Tensor, sigma1: torch.Tensor) -> torch.Tensor:
+    """Analytical KL divergence between two diagonal Gaussians (rl_games style).
+
+    Computes KL(p0 || p1) where p0 = N(mu0, sigma0^2), p1 = N(mu1, sigma1^2).
+    """
+    c1 = torch.log(sigma1 / (sigma0 + 1e-5) + 1e-5)
+    c2 = (sigma0**2 + (mu0 - mu1) ** 2) / (2.0 * (sigma1**2 + 1e-5))
+    c3 = -0.5
+    kl = c1 + c2 + c3
+    return kl.sum(dim=-1).mean()
+
+
+class RunningMeanStd:
+    """Running mean and standard deviation tracker (rl_games style).
+
+    Used to normalize value targets so the critic trains on a stable scale.
+    """
+
+    def __init__(self, device: str = "cuda", epsilon: float = 1e-5):
+        self.mean = torch.zeros((), dtype=torch.float32, device=device)
+        self.var = torch.ones((), dtype=torch.float32, device=device)
+        self.count = epsilon
+        self.epsilon = epsilon
+
+    def update(self, x: torch.Tensor):
+        """Update running statistics with a batch of data."""
+        batch_mean = x.mean()
+        batch_var = x.var()
+        batch_count = x.numel()
+
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+
+        self.mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        self.var = (m_a + m_b + delta**2 * self.count * batch_count / total_count) / total_count
+        self.count = total_count
+
+    def normalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize input using running statistics."""
+        return (x - self.mean) / (torch.sqrt(self.var) + self.epsilon)
+
+    def denormalize(self, x: torch.Tensor) -> torch.Tensor:
+        """Denormalize input using running statistics."""
+        return x * torch.sqrt(self.var) + self.mean
+
+
 def layer_init(layer: nn.Linear, std: float = 0.01) -> nn.Linear:
     """Initialize layer with orthogonal initialization."""
     nn.init.orthogonal_(layer.weight, std)
@@ -24,6 +72,7 @@ class ActorCritic(nn.Module):
         num_actions: int,
         hidden_dims: tuple[int, ...] = (256, 256, 128),
         activation: str = "elu",
+        init_sigma: float = 0.0,
     ):
         super().__init__()
 
@@ -53,8 +102,8 @@ class ActorCritic(nn.Module):
         self.actor_mean = layer_init(nn.Linear(prev_dim, num_actions), std=0.01)
 
         # Actor log std (learnable parameter)
-        # Initialize to -0.5 (σ ≈ 0.6) for reasonable initial exploration
-        self.actor_log_std = nn.Parameter(torch.full((num_actions,), -0.5))
+        # Initialize from config (DextrEme: 0.0 → σ=1.0 for wide exploration)
+        self.actor_log_std = nn.Parameter(torch.full((num_actions,), init_sigma))
 
         # Critic head
         self.critic = layer_init(nn.Linear(prev_dim, 1), std=1.0)
@@ -68,15 +117,15 @@ class ActorCritic(nn.Module):
 
     def get_action_and_value(
         self, obs: torch.Tensor, action: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get action, log prob, entropy, and value.
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get action, log prob, entropy, value, action mean, and action std.
 
         Args:
             obs: Observation tensor
             action: If provided, compute log prob for this action
 
         Returns:
-            action, log_prob, entropy, value
+            action, log_prob, entropy, value, action_mean, action_std
         """
         # Sanitize input observations
         obs = torch.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
@@ -85,9 +134,9 @@ class ActorCritic(nn.Module):
         features = self.shared(obs)
         action_mean = self.actor_mean(features)
 
-        # Clamp log_std to reasonable range for actions in [-1, 1]
-        # min=-2.0 → σ=0.14, max=0.5 → σ=1.65
-        log_std_clamped = torch.clamp(self.actor_log_std, min=-2.0, max=0.5)
+        # Clamp log_std (rl_games style: wider range for exploration)
+        # min=-5.0 → σ=0.007, max=2.0 → σ=7.39
+        log_std_clamped = torch.clamp(self.actor_log_std, min=-5.0, max=2.0)
         action_std = torch.exp(log_std_clamped)
 
         # Replace NaN in action_mean with zeros
@@ -102,7 +151,7 @@ class ActorCritic(nn.Module):
         entropy = dist.entropy().sum(dim=-1)
         value = self.critic(features).squeeze(-1)
 
-        return action, log_prob, entropy, value
+        return action, log_prob, entropy, value, action_mean, action_std
 
     def get_value(self, obs: torch.Tensor) -> torch.Tensor:
         """Get value estimate for observations."""
@@ -125,6 +174,7 @@ class RolloutBuffer:
         # Storage
         self.observations = torch.zeros(num_steps, num_envs, num_obs, device=device)
         self.actions = torch.zeros(num_steps, num_envs, num_actions, device=device)
+        self.action_means = torch.zeros(num_steps, num_envs, num_actions, device=device)
         self.log_probs = torch.zeros(num_steps, num_envs, device=device)
         self.rewards = torch.zeros(num_steps, num_envs, device=device)
         self.dones = torch.zeros(num_steps, num_envs, device=device)
@@ -144,10 +194,12 @@ class RolloutBuffer:
         reward: torch.Tensor,
         done: torch.Tensor,
         value: torch.Tensor,
+        action_mean: torch.Tensor,
     ):
         """Add a step of data to the buffer."""
         self.observations[self.step] = obs
         self.actions[self.step] = action
+        self.action_means[self.step] = action_mean
         self.log_probs[self.step] = log_prob
         self.rewards[self.step] = reward
         self.dones[self.step] = done.float()
@@ -180,6 +232,7 @@ class RolloutBuffer:
         # Flatten data
         obs_flat = self.observations.reshape(-1, self.observations.shape[-1])
         actions_flat = self.actions.reshape(-1, self.actions.shape[-1])
+        action_means_flat = self.action_means.reshape(-1, self.action_means.shape[-1])
         log_probs_flat = self.log_probs.reshape(-1)
         advantages_flat = self.advantages.reshape(-1)
         returns_flat = self.returns.reshape(-1)
@@ -199,6 +252,7 @@ class RolloutBuffer:
                 advantages_flat[batch_indices],
                 returns_flat[batch_indices],
                 values_flat[batch_indices],
+                action_means_flat[batch_indices],
             )
 
     def reset(self):
@@ -221,8 +275,18 @@ class PPO:
 
         self.optimizer = optim.Adam(actor_critic.parameters(), lr=config.learning_rate)
 
+        # Value normalization (DextrEme: normalize_value = True)
+        self.value_normalizer = RunningMeanStd(device=device) if config.normalize_value else None
+
     def update(self, buffer: RolloutBuffer) -> dict[str, float]:
-        """Update policy using PPO algorithm.
+        """Update policy using PPO algorithm (rl_games style).
+
+        Matches rl_games behavior:
+        - Analytical Gaussian KL divergence
+        - No KL-based early stopping (rl_games doesn't use it)
+        - Clipped value loss
+        - Bounds loss on action mean (mu) with soft bound 1.1
+        - Adaptive LR: /1.5 decrease, *1.5 increase, applied per epoch
 
         Args:
             buffer: Rollout buffer with collected data
@@ -235,49 +299,79 @@ class PPO:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         buffer.advantages = advantages.reshape(buffer.num_steps, buffer.num_envs)
 
+        # Snapshot old sigma before any optimizer step changes it
+        with torch.no_grad():
+            old_log_std = torch.clamp(self.actor_critic.actor_log_std, min=-5.0, max=2.0)
+            old_sigma = torch.exp(old_log_std)
+
         # Training metrics
         total_pg_loss = 0.0
         total_value_loss = 0.0
         total_entropy_loss = 0.0
         total_bounds_loss = 0.0
         total_loss = 0.0
+        total_kl = 0.0
         num_updates = 0
 
-        for _ in range(self.config.num_epochs):
-            for obs, actions, old_log_probs, advs, returns, old_values in buffer.get_batches(self.config.num_minibatches):
-                # Get current policy outputs
-                _, new_log_probs, entropy, new_values = self.actor_critic.get_action_and_value(obs, actions)
+        kl_threshold = self.config.kl_threshold
+        lr_schedule = self.config.lr_schedule
+        bounds_loss_coef = self.config.bounds_loss_coef
+
+        for epoch in range(self.config.num_epochs):
+            epoch_kl = 0.0
+            epoch_batches = 0
+
+            for obs, actions, old_log_probs, advs, returns, old_values, old_mu in buffer.get_batches(
+                self.config.num_minibatches
+            ):
+                # Get current policy outputs (including mu and sigma)
+                _, new_log_probs, entropy, new_values, new_mu, new_sigma = (
+                    self.actor_critic.get_action_and_value(obs, actions)
+                )
 
                 # Policy loss (clipped surrogate objective)
                 log_ratio = new_log_probs - old_log_probs
                 ratio = torch.exp(log_ratio)
 
-                # Approximate KL divergence for monitoring
-                # approx_kl = ((ratio - 1) - log_ratio).mean()
-
                 pg_loss1 = -advs * ratio
                 pg_loss2 = -advs * torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Value loss with clipping (PPO2 style)
-                value_clipped = old_values + torch.clamp(
-                    new_values - old_values,
+                # Clipped value loss (rl_games style)
+                # Normalize returns and old_values if value normalization is enabled
+                # (critic predicts in normalized space, so compare in normalized space)
+                if self.value_normalizer is not None:
+                    norm_returns = self.value_normalizer.normalize(returns)
+                    norm_old_values = self.value_normalizer.normalize(old_values)
+                else:
+                    norm_returns = returns
+                    norm_old_values = old_values
+
+                value_pred_clipped = norm_old_values + torch.clamp(
+                    new_values - norm_old_values,
                     -self.config.clip_epsilon,
                     self.config.clip_epsilon,
                 )
-                value_loss_unclipped = (new_values - returns) ** 2
-                value_loss_clipped = (value_clipped - returns) ** 2
+                value_loss_unclipped = (new_values - norm_returns) ** 2
+                value_loss_clipped = (value_pred_clipped - norm_returns) ** 2
                 value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
-                # Entropy loss (for exploration)
+                # Entropy loss
                 entropy_loss = entropy.mean()
 
-                # Bounds loss - penalize actions outside [-1, 1]
-                bounds_loss = torch.clamp(actions.abs() - 1.0, min=0.0).pow(2).mean()
+                # Bounds loss on action mean (rl_games style: penalize mu, soft bound 1.1)
+                soft_bound = 1.1
+                mu_loss_high = torch.clamp_min(new_mu - soft_bound, 0.0) ** 2
+                mu_loss_low = torch.clamp_max(new_mu + soft_bound, 0.0) ** 2
+                bounds_loss = (mu_loss_high + mu_loss_low).sum(dim=-1).mean()
 
-                # Total loss (bounds_loss_coef default 0.0001)
-                bounds_loss_coef = getattr(self.config, 'bounds_loss_coef', 0.0001)
-                loss = pg_loss + self.config.value_coef * value_loss - self.config.entropy_coef * entropy_loss + bounds_loss_coef * bounds_loss
+                # Total loss
+                loss = (
+                    pg_loss
+                    + self.config.value_coef * value_loss
+                    - self.config.entropy_coef * entropy_loss
+                    + bounds_loss_coef * bounds_loss
+                )
 
                 # Gradient step
                 self.optimizer.zero_grad()
@@ -285,20 +379,44 @@ class PPO:
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
 
+                # Analytical Gaussian KL divergence (rl_games style, no grad)
+                with torch.no_grad():
+                    kl = gaussian_kl(old_mu, old_sigma.expand_as(old_mu), new_mu, new_sigma.expand_as(new_mu))
+
                 # Accumulate metrics
                 total_pg_loss += pg_loss.item()
                 total_value_loss += value_loss.item()
                 total_entropy_loss += entropy_loss.item()
                 total_bounds_loss += bounds_loss.item()
                 total_loss += loss.item()
+                total_kl += kl.item()
                 num_updates += 1
+                epoch_kl += kl.item()
+                epoch_batches += 1
+
+            # Adaptive LR per epoch (rl_games style: applied after each mini-epoch)
+            avg_epoch_kl = epoch_kl / max(epoch_batches, 1)
+            if lr_schedule == "adaptive":
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                if avg_epoch_kl > kl_threshold * 2.0:
+                    new_lr = max(current_lr / 1.5, 1e-6)
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = new_lr
+                elif avg_epoch_kl < kl_threshold * 0.5:
+                    new_lr = min(current_lr * 1.5, 1e-2)
+                    for param_group in self.optimizer.param_groups:
+                        param_group["lr"] = new_lr
+
+        avg_kl = total_kl / max(num_updates, 1)
 
         return {
-            "policy_loss": total_pg_loss / num_updates,
-            "value_loss": total_value_loss / num_updates,
-            "entropy": total_entropy_loss / num_updates,
-            "bounds_loss": total_bounds_loss / num_updates,
-            "total_loss": total_loss / num_updates,
+            "policy_loss": total_pg_loss / max(num_updates, 1),
+            "value_loss": total_value_loss / max(num_updates, 1),
+            "entropy": total_entropy_loss / max(num_updates, 1),
+            "bounds_loss": total_bounds_loss / max(num_updates, 1),
+            "total_loss": total_loss / max(num_updates, 1),
+            "kl_divergence": avg_kl,
+            "learning_rate": self.optimizer.param_groups[0]["lr"],
         }
 
     def save(self, path: str):
