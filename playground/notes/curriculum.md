@@ -198,7 +198,7 @@ uv run -m newton.examples robot_panda_hydro
 
 **핵심 개념:**
 - `SDFHydroelasticConfig` - Hydroelastic 접촉
-- `CollisionPipelineUnified` - 통합 충돌 파이프라인
+- `CollisionPipeline` + `BroadPhaseMode` - 충돌 파이프라인
 - IK + 물리 + 조작 계획 통합
 - 그리퍼 제어
 

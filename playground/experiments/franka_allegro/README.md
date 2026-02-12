@@ -73,7 +73,7 @@ self.solver = newton.solvers.SolverMuJoCo(
     nconmax=15000,
     iterations=15,
     ls_iterations=100,
-    ls_parallel=True,
+    ls_parallel=False,
     impratio=1000.0,
 )
 ```

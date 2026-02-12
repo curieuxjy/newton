@@ -27,28 +27,28 @@ class FrankaAllegroGraspEnv:
 
     Task: Reach, grasp, and lift a cube from a table to a target height.
 
-    Observation space:
-        - Franka joint positions (7)
-        - Franka joint velocities (7)
-        - Allegro joint positions (16)
-        - Allegro joint velocities (16)
-        - End effector position (3)
-        - End effector orientation (4)
-        - Cube position relative to EE (3)
-        - Cube orientation (4)
-        - Cube linear velocity (3)
-        - Cube angular velocity (3)
+    DEXTRAH-G observation space:
+        Student observations (159D):
+        - Robot DOF positions (23): 7 Franka + 16 Allegro
+        - Robot DOF velocities (23): 7 Franka + 16 Allegro
+        - Hand keypoint positions (15): palm(3) + 4 fingertips(12)
+        - Hand keypoint velocities (15): palm(3) + 4 fingertips(12)
         - Goal position (3)
-        - Task phase (3) - one-hot [reach, grasp, lift]
-        Total: 72 dims (without depth)
+        - Previous action (11)
+        - Fabric state q (23): target joint positions from IK
+        - Fabric state qd (23): target joint velocities
+        - Fabric state qdd (23): target joint accelerations
+        Total: 159 dims + depth image as separate tensor (1, 120, 160)
 
-        If depth sensor enabled:
-        - Depth image (depth_width * depth_height) flattened
+        Teacher additional privileged observations (+13D = 172D total):
+        - Object position (3)
+        - Object orientation (4)
+        - Object linear velocity (3)
+        - Object angular velocity (3)
 
     Action space:
-        - Franka joint position deltas (7)
-        - Allegro joint position deltas (16)
-        Total: 23 dims
+        - FABRICS mode (default): 11D (6D palm pose + 5D hand PCA)
+        - Direct joint mode: 23D (7 Franka + 16 Allegro)
     """
 
     def __init__(self, config: EnvConfig, device: str = "cuda", headless: bool = True):
@@ -64,6 +64,7 @@ class FrankaAllegroGraspEnv:
         self.sim_substeps = config.sim_substeps
         self.sim_dt = self.frame_dt / self.sim_substeps
         self.control_decimation = config.control_decimation
+        self.policy_decimation = getattr(config, "policy_decimation", 1)
 
         # Episode tracking
         self.max_episode_length = config.episode_length
@@ -78,22 +79,52 @@ class FrankaAllegroGraspEnv:
         if config.use_depth_sensor:
             self._setup_depth_sensor()
 
-        # Observation and action dimensions
-        self.num_state_obs = 7 + 7 + 16 + 16 + 3 + 4 + 3 + 4 + 3 + 3 + 3 + 3  # = 72
-        self.num_depth_obs = config.depth_width * config.depth_height if config.use_depth_sensor else 0
-        self.num_obs = self.num_state_obs + self.num_depth_obs
-
         # Action space depends on whether fabric actions are used
         self.use_fabric_actions = config.use_fabric_actions
         if self.use_fabric_actions:
-            # FABRICS action space: 6D palm pose + 5D hand PCA = 11D
-            self.num_actions = 11
+            self.num_actions = 11  # 6D palm pose + 5D hand PCA
         else:
-            # Direct joint control: 7D Franka + 16D Allegro = 23D
-            self.num_actions = 7 + 16
+            self.num_actions = 7 + 16  # Direct joint control
 
-        # Buffers
+        # DEXTRAH-G observation dimensions
+        # Student: robot_q(23) + robot_qd(23) + hand_kp_pos(15) + hand_kp_vel(15) +
+        #          goal(3) + prev_action(11) + fabric_q(23) + fabric_qd(23) + fabric_qdd(23) = 159
+        self.num_robot_dof = self.franka_dof_count + self.allegro_dof_count  # 23
+        self.num_student_obs = (
+            self.num_robot_dof  # robot DOF positions (23)
+            + self.num_robot_dof  # robot DOF velocities (23)
+            + 15  # hand keypoint positions: palm(3) + 4 fingertips(12)
+            + 15  # hand keypoint velocities: palm(3) + 4 fingertips(12)
+            + 3   # goal position
+            + self.num_actions  # previous action (11)
+            + self.num_robot_dof  # fabric state q (23)
+            + self.num_robot_dof  # fabric state qd (23)
+            + self.num_robot_dof  # fabric state qdd (23)
+        )  # = 159
+
+        # Teacher: student obs + privileged object info
+        self.num_teacher_privileged = 3 + 4 + 3 + 3  # obj_pos(3) + obj_rot(4) + obj_vel(3) + obj_angvel(3)
+        self.num_teacher_obs = self.num_student_obs + self.num_teacher_privileged  # = 172
+
+        # For backward compatibility
+        self.num_state_obs = self.num_student_obs
+        self.num_depth_obs = config.depth_width * config.depth_height if config.use_depth_sensor else 0
+        self.num_obs = self.num_state_obs + self.num_depth_obs
+
+        # Observation buffers
+        self.student_obs_buf = torch.zeros(self.num_envs, self.num_student_obs, dtype=torch.float32, device=self.torch_device)
+        self.teacher_obs_buf = torch.zeros(self.num_envs, self.num_teacher_obs, dtype=torch.float32, device=self.torch_device)
+        # Depth as separate tensor (batch, 1, H, W) for CNN
+        self.depth_obs_buf = None
+        if config.use_depth_sensor:
+            self.depth_obs_buf = torch.zeros(
+                self.num_envs, 1, config.depth_height, config.depth_width,
+                dtype=torch.float32, device=self.torch_device,
+            )
+
+        # Legacy obs_buf for backward compatibility (visualization)
         self.obs_buf = torch.zeros(self.num_envs, self.num_obs, dtype=torch.float32, device=self.torch_device)
+
         self.reward_buf = torch.zeros(self.num_envs, dtype=torch.float32, device=self.torch_device)
         self.done_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.torch_device)
         self.info_buf: dict[str, Any] = {}
@@ -102,9 +133,17 @@ class FrankaAllegroGraspEnv:
         self.actions = torch.zeros(self.num_envs, self.num_actions, dtype=torch.float32, device=self.torch_device)
         self.prev_actions = torch.zeros_like(self.actions)
 
-        # Current joint targets (always 23D = 7 Franka + 16 Allegro, regardless of action mode)
-        self.num_joint_targets = 7 + 16  # Always 23
+        # Current joint targets (always 23D = 7 Franka + 16 Allegro)
+        self.num_joint_targets = 7 + 16
         self.current_targets = torch.zeros(self.num_envs, self.num_joint_targets, dtype=torch.float32, device=self.torch_device)
+
+        # Fabric state tracking (q, qd, qdd from IK output)
+        self.fabric_q = torch.zeros(self.num_envs, self.num_robot_dof, dtype=torch.float32, device=self.torch_device)
+        self.fabric_qd = torch.zeros_like(self.fabric_q)
+        self.fabric_qdd = torch.zeros_like(self.fabric_q)
+        self.prev_fabric_q = torch.zeros_like(self.fabric_q)
+        self.prev_fabric_qd = torch.zeros_like(self.fabric_q)
+        self.fabric_dt = self.control_decimation / self.fps  # Fabric timestep
 
         # Goal state (lift target position)
         self.goal_pos = torch.zeros(self.num_envs, 3, dtype=torch.float32, device=self.torch_device)
@@ -362,12 +401,14 @@ class FrankaAllegroGraspEnv:
         self.bodies_per_env = self.model.body_q.shape[0] // self.num_envs
 
         # Solver
+        # Contact buffer sizes: ~30 contacts per env is sufficient for
+        # robot + cube + table scene. Large values cause OOM in collision narrowphase.
         self.solver = newton.solvers.SolverMuJoCo(
             self.model,
             solver="newton",
             integrator="implicitfast",
-            njmax=500 * self.num_envs,
-            nconmax=300 * self.num_envs,
+            njmax=30 * self.num_envs,
+            nconmax=20 * self.num_envs,
             impratio=100.0,
             cone="elliptic",
             iterations=50,
@@ -574,6 +615,13 @@ class FrankaAllegroGraspEnv:
         self.prev_actions[env_ids] = 0.0
         self.actions[env_ids] = 0.0
 
+        # Reset fabric state tracking
+        self.fabric_q[env_ids] = 0.0
+        self.fabric_qd[env_ids] = 0.0
+        self.fabric_qdd[env_ids] = 0.0
+        self.prev_fabric_q[env_ids] = 0.0
+        self.prev_fabric_qd[env_ids] = 0.0
+
         # Reset current targets
         joint_q_reshaped = self.state_0.joint_q.numpy().reshape(self.num_envs, self.joint_q_per_env)
         franka_q = joint_q_reshaped[env_ids_np, :self.franka_dof_count]
@@ -585,33 +633,44 @@ class FrankaAllegroGraspEnv:
         return self._compute_observations()
 
     def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-        """Take a step in all environments."""
+        """Take a step in all environments.
+
+        With policy_decimation > 1, the same action is applied for multiple
+        fabric/control steps. This matches DEXTRAH-G where:
+        - Policy runs at 15Hz
+        - Fabric runs at 60Hz (policy_decimation=4 fabric steps per policy step)
+        - Physics runs at 120Hz (control_decimation=2 physics steps per fabric step)
+        """
         self.prev_actions = self.actions.clone()
         self.actions = actions.clone()
 
+        # Save previous fabric state for velocity/acceleration computation
+        self.prev_fabric_q = self.fabric_q.clone()
+        self.prev_fabric_qd = self.fabric_qd.clone()
+
         if self.use_fabric_actions:
             # === FABRICS Action Mode ===
-            # Convert 11D fabric actions to 23D joint targets
-            self._apply_fabric_actions(actions)
+            # Run policy_decimation fabric steps with the same action
+            for _ in range(self.policy_decimation):
+                self._apply_fabric_actions(actions)
         else:
             # === Direct Joint Control Mode ===
-            # Apply delta actions
             if self.config.use_relative_control:
                 action_delta = actions * self.config.action_scale
                 self.current_targets = self.current_targets + action_delta
             else:
                 self.current_targets = self.joint_mid + actions * (self.joint_range / 2) * self.config.action_scale
 
-            # Clamp to joint limits
             self.current_targets = torch.clamp(self.current_targets, self.joint_lower, self.joint_upper)
-
-            # Apply to control
             self._apply_actions(self.current_targets)
 
-        # Step simulation (only for direct joint control; fabric actions handle simulation internally)
-        if not self.use_fabric_actions:
-            for _ in range(self.control_decimation):
+            # Step simulation
+            total_physics_steps = self.control_decimation * self.policy_decimation
+            for _ in range(total_physics_steps):
                 self._simulate_step()
+
+        # Update fabric state tracking
+        self._update_fabric_state()
 
         # Update episode step
         self.episode_step += 1
@@ -631,6 +690,17 @@ class FrankaAllegroGraspEnv:
             self.reset(done_env_ids)
 
         return obs, rewards, dones, self.info_buf
+
+    def _update_fabric_state(self):
+        """Update fabric state (q, qd, qdd) from current targets."""
+        # fabric_q = current joint targets (IK output)
+        self.fabric_q = self.current_targets.clone()
+
+        # fabric_qd = finite difference of fabric_q
+        dt = self.fabric_dt * self.policy_decimation
+        if dt > 0:
+            self.fabric_qd = (self.fabric_q - self.prev_fabric_q) / dt
+            self.fabric_qdd = (self.fabric_qd - self.prev_fabric_qd) / dt
 
     def _apply_actions(self, target_pos: torch.Tensor):
         """Apply joint position targets to control buffer."""
@@ -701,7 +771,12 @@ class FrankaAllegroGraspEnv:
             current_franka_q = joint_q_reshaped[:, :self.franka_dof_count]
 
     def _compute_observations(self) -> torch.Tensor:
-        """Compute observations for all environments."""
+        """Compute DEXTRAH-G observations for all environments.
+
+        Fills both student_obs_buf (159D) and teacher_obs_buf (172D).
+        Also updates depth_obs_buf if depth sensor is enabled.
+        Returns teacher_obs_buf for backward compatibility.
+        """
         joint_q = torch.from_numpy(self.state_0.joint_q.numpy()).to(self.torch_device)
         joint_qd = torch.from_numpy(self.state_0.joint_qd.numpy()).to(self.torch_device)
         body_q = torch.from_numpy(self.state_0.body_q.numpy()).to(self.torch_device)
@@ -713,87 +788,110 @@ class FrankaAllegroGraspEnv:
         body_q_reshaped = body_q.reshape(self.num_envs, self.bodies_per_env, 7)
         body_qd_reshaped = body_qd.reshape(self.num_envs, self.bodies_per_env, 6)
 
-        idx = 0
-
-        # Franka joint positions (normalized)
+        # Extract robot state
         franka_q = joint_q_reshaped[:, :self.franka_dof_count]
-        franka_q_norm = (franka_q - self.franka_joint_lower) / (self.franka_joint_upper - self.franka_joint_lower + 1e-6) * 2 - 1
-        self.obs_buf[:, idx:idx + 7] = franka_q_norm
-        idx += 7
-
-        # Franka joint velocities (scaled)
         franka_qd = joint_qd_reshaped[:, :self.franka_dof_count]
-        self.obs_buf[:, idx:idx + 7] = franka_qd * 0.1
-        idx += 7
-
-        # Allegro joint positions (normalized)
         allegro_q = joint_q_reshaped[:, self.allegro_dof_start:self.allegro_dof_start + self.allegro_dof_count]
-        allegro_q_norm = (allegro_q - self.allegro_joint_lower) / (self.allegro_joint_upper - self.allegro_joint_lower + 1e-6) * 2 - 1
-        self.obs_buf[:, idx:idx + 16] = allegro_q_norm
-        idx += 16
-
-        # Allegro joint velocities (scaled)
         allegro_qd = joint_qd_reshaped[:, self.allegro_dof_start:self.allegro_dof_start + self.allegro_dof_count]
-        self.obs_buf[:, idx:idx + 16] = allegro_qd * 0.1
-        idx += 16
 
-        # End effector position
+        # Robot DOF concatenated (23D each)
+        robot_q = torch.cat([franka_q, allegro_q], dim=-1)  # (batch, 23)
+        robot_qd = torch.cat([franka_qd, allegro_qd], dim=-1)  # (batch, 23)
+
+        # End effector state
         ee_pos = body_q_reshaped[:, self.ee_body_idx, :3]
-        self.obs_buf[:, idx:idx + 3] = ee_pos
-        idx += 3
-
-        # End effector orientation
         ee_quat = body_q_reshaped[:, self.ee_body_idx, 3:7]
-        self.obs_buf[:, idx:idx + 4] = ee_quat
-        idx += 4
+        ee_vel = body_qd_reshaped[:, self.ee_body_idx, :3]
 
-        # Cube position relative to EE
-        cube_pos = body_q_reshaped[:, self.cube_body_idx, :3]
-        self.obs_buf[:, idx:idx + 3] = cube_pos - ee_pos
+        # Fingertip positions (world frame) via FK
+        fingertip_pos = self.fabric.compute_fingertip_positions(allegro_q, ee_pos, ee_quat)  # (batch, 4, 3)
+        fingertip_pos_flat = fingertip_pos.reshape(self.num_envs, 12)  # (batch, 12)
+
+        # Hand keypoint positions: palm(3) + 4 fingertips(12) = 15
+        hand_kp_pos = torch.cat([ee_pos, fingertip_pos_flat], dim=-1)  # (batch, 15)
+
+        # Hand keypoint velocities (approximate: use EE velocity for palm, zero for fingertips for now)
+        # Full implementation would compute fingertip Jacobian velocities
+        fingertip_vel_approx = torch.zeros(self.num_envs, 12, device=self.torch_device)
+        hand_kp_vel = torch.cat([ee_vel, fingertip_vel_approx], dim=-1)  # (batch, 15)
+
+        # === Build student observation (159D) ===
+        idx = 0
+        self.student_obs_buf[:, idx:idx + self.num_robot_dof] = robot_q
+        idx += self.num_robot_dof  # 23
+
+        self.student_obs_buf[:, idx:idx + self.num_robot_dof] = robot_qd * 0.1
+        idx += self.num_robot_dof  # 23
+
+        self.student_obs_buf[:, idx:idx + 15] = hand_kp_pos
+        idx += 15
+
+        self.student_obs_buf[:, idx:idx + 15] = hand_kp_vel * 0.1
+        idx += 15
+
+        self.student_obs_buf[:, idx:idx + 3] = self.goal_pos
         idx += 3
 
-        # Cube orientation
-        cube_quat = body_q_reshaped[:, self.cube_body_idx, 3:7]
-        self.obs_buf[:, idx:idx + 4] = cube_quat
-        idx += 4
+        self.student_obs_buf[:, idx:idx + self.num_actions] = self.prev_actions
+        idx += self.num_actions  # 11
 
-        # Cube velocities
+        self.student_obs_buf[:, idx:idx + self.num_robot_dof] = self.fabric_q
+        idx += self.num_robot_dof  # 23
+
+        self.student_obs_buf[:, idx:idx + self.num_robot_dof] = self.fabric_qd * 0.1
+        idx += self.num_robot_dof  # 23
+
+        self.student_obs_buf[:, idx:idx + self.num_robot_dof] = self.fabric_qdd * 0.01
+        idx += self.num_robot_dof  # 23
+
+        # === Build teacher observation (student + privileged) ===
+        self.teacher_obs_buf[:, :self.num_student_obs] = self.student_obs_buf
+
+        tidx = self.num_student_obs
+        # Object position
+        cube_pos = body_q_reshaped[:, self.cube_body_idx, :3]
+        self.teacher_obs_buf[:, tidx:tidx + 3] = cube_pos
+        tidx += 3
+
+        # Object orientation
+        cube_quat = body_q_reshaped[:, self.cube_body_idx, 3:7]
+        self.teacher_obs_buf[:, tidx:tidx + 4] = cube_quat
+        tidx += 4
+
+        # Object velocities
         cube_vel = body_qd_reshaped[:, self.cube_body_idx, :3]
         cube_ang_vel = body_qd_reshaped[:, self.cube_body_idx, 3:6]
-        self.obs_buf[:, idx:idx + 3] = cube_vel * 0.1
-        idx += 3
-        self.obs_buf[:, idx:idx + 3] = cube_ang_vel * 0.1
-        idx += 3
+        self.teacher_obs_buf[:, tidx:tidx + 3] = cube_vel * 0.1
+        tidx += 3
+        self.teacher_obs_buf[:, tidx:tidx + 3] = cube_ang_vel * 0.1
+        tidx += 3
 
-        # Goal position
-        self.obs_buf[:, idx:idx + 3] = self.goal_pos
-        idx += 3
-
-        # Task phase (one-hot)
-        phase_onehot = torch.zeros(self.num_envs, 3, device=self.torch_device)
-        phase_onehot.scatter_(1, self.task_phase.unsqueeze(1), 1.0)
-        self.obs_buf[:, idx:idx + 3] = phase_onehot
-        idx += 3
-
-        # Depth image if enabled
+        # === Depth image as separate tensor for CNN ===
         if self.config.use_depth_sensor and self.depth_sensor is not None:
             self._update_depth_sensor()
-            # New output shape: (num_worlds, num_cameras, height, width)
             depth_np = self.depth_image.numpy()
-            # Flatten to (num_envs, height * width) for observation
-            depth_flat = depth_np.reshape(self.num_envs, -1)
+            # Shape: (num_worlds, num_cameras, height, width) -> (num_envs, 1, H, W)
+            depth_2d = depth_np.reshape(self.num_envs, 1, self.config.depth_height, self.config.depth_width)
 
-            # Normalize depth
-            depth_normalized = (depth_flat - self.config.depth_min) / (self.config.depth_max - self.config.depth_min)
+            # Normalize and clip
+            depth_normalized = (depth_2d - self.config.depth_min) / (self.config.depth_max - self.config.depth_min)
             depth_normalized = np.clip(depth_normalized, 0.0, 1.0)
+            # Invalid pixels (too close or too far)
+            depth_normalized[depth_2d <= 1e-8] = 0.0
 
-            self.obs_buf[:, idx:idx + self.num_depth_obs] = torch.from_numpy(depth_normalized).to(self.torch_device)
+            self.depth_obs_buf = torch.from_numpy(depth_normalized).to(self.torch_device)
 
         # Handle NaN
-        self.obs_buf = torch.nan_to_num(self.obs_buf, nan=0.0, posinf=5.0, neginf=-5.0)
-        self.obs_buf = torch.clamp(self.obs_buf, -5.0, 5.0)
+        self.student_obs_buf = torch.nan_to_num(self.student_obs_buf, nan=0.0, posinf=5.0, neginf=-5.0)
+        self.student_obs_buf = torch.clamp(self.student_obs_buf, -5.0, 5.0)
+        self.teacher_obs_buf = torch.nan_to_num(self.teacher_obs_buf, nan=0.0, posinf=5.0, neginf=-5.0)
+        self.teacher_obs_buf = torch.clamp(self.teacher_obs_buf, -5.0, 5.0)
 
-        return self.obs_buf
+        # Legacy: fill obs_buf with teacher obs (truncated) for backward compatibility
+        obs_len = min(self.num_obs, self.num_teacher_obs)
+        self.obs_buf[:, :obs_len] = self.teacher_obs_buf[:, :obs_len]
+
+        return self.teacher_obs_buf
 
     def _update_depth_sensor(self):
         """Update depth sensor based on current EE pose."""
@@ -805,7 +903,7 @@ class FrankaAllegroGraspEnv:
         # Camera placed at Y = 0.1 (beyond the near Y edge), looking toward table
         grid_size = int(np.ceil(np.sqrt(self.num_envs)))
 
-        transforms_list = []
+        transforms_row = []
         for i in range(self.num_envs):
             # Calculate environment offset
             grid_x = i // grid_size
@@ -842,13 +940,13 @@ class FrankaAllegroGraspEnv:
             else:
                 quat = wp.quat_identity()
 
-            transforms_list.append([wp.transform(
+            transforms_row.append(wp.transform(
                 wp.vec3(cam_x, cam_y, cam_z),
                 quat
-            )])
+            ))
 
-        # Create 2D warp array (num_envs, 1)
-        self.camera_transforms = wp.array(transforms_list, dtype=wp.transformf, device=self.device)
+        # Create 2D warp array (num_cameras, num_worlds) = (1, num_envs)
+        self.camera_transforms = wp.array([transforms_row], dtype=wp.transformf, device=self.device)
 
         # Render depth
         self.depth_sensor.render(

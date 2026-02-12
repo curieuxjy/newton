@@ -620,18 +620,40 @@ class FabricActionController(nn.Module):
         self._init_franka_kinematics()
 
     def _init_franka_kinematics(self):
-        """Initialize Franka kinematics parameters (DH parameters)."""
-        # Franka Emika Panda DH parameters (simplified)
-        # These are approximate and used for differential IK
+        """Initialize Franka kinematics using modified DH parameters.
+
+        Franka Emika Panda / FR3 modified DH parameters (Craig convention):
+        T_i = Rx(alpha_{i-1}) * Dx(a_{i-1}) * Rz(theta_i) * Dz(d_i)
+
+        Joint | a_{i-1}  | d_i   | alpha_{i-1} | theta_offset
+        ------|----------|-------|-------------|-------------
+          1   | 0        | 0.333 | 0           | 0
+          2   | 0        | 0     | -pi/2       | 0
+          3   | 0        | 0.316 | pi/2        | 0
+          4   | 0.0825   | 0     | pi/2        | 0
+          5   | -0.0825  | 0.384 | -pi/2       | 0
+          6   | 0        | 0     | pi/2        | 0
+          7   | 0.088    | 0     | pi/2        | 0
+        flange| 0        | 0.107 | 0           | 0
+        """
+        # a_{i-1} parameters (link lengths)
         self.register_buffer(
-            "franka_d",
-            torch.tensor([0.333, 0.0, 0.316, 0.0, 0.384, 0.0, 0.107],
-                        dtype=torch.float32, device=self.device)
+            "dh_a",
+            torch.tensor([0.0, 0.0, 0.0, 0.0825, -0.0825, 0.0, 0.088, 0.0],
+                         dtype=torch.float32, device=self.device)
         )
+        # d_i parameters (link offsets)
         self.register_buffer(
-            "franka_a",
-            torch.tensor([0.0, 0.0, 0.0825, -0.0825, 0.0, 0.088, 0.0],
-                        dtype=torch.float32, device=self.device)
+            "dh_d",
+            torch.tensor([0.333, 0.0, 0.316, 0.0, 0.384, 0.0, 0.0, 0.107],
+                         dtype=torch.float32, device=self.device)
+        )
+        # alpha_{i-1} parameters (link twists)
+        pi = torch.pi
+        self.register_buffer(
+            "dh_alpha",
+            torch.tensor([0.0, -pi/2, pi/2, pi/2, -pi/2, pi/2, pi/2, 0.0],
+                         dtype=torch.float32, device=self.device)
         )
 
     def normalize_action(self, action: torch.Tensor) -> torch.Tensor:
@@ -702,14 +724,115 @@ class FabricActionController(nn.Module):
 
         return torch.stack([x, y, z, w], dim=-1)
 
+    def _dh_transform(
+        self,
+        theta: torch.Tensor,
+        d: float,
+        a: float,
+        alpha: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute modified DH homogeneous transform (rotation + position).
+
+        T = Rx(alpha) * Dx(a) * Rz(theta) * Dz(d)
+
+        Args:
+            theta: Joint angle (batch,)
+            d: Link offset
+            a: Link length
+            alpha: Link twist
+
+        Returns:
+            R: Rotation matrix (batch, 3, 3)
+            p: Translation vector (batch, 3)
+        """
+        ct = torch.cos(theta)
+        st = torch.sin(theta)
+        ca = np.cos(alpha)
+        sa = np.sin(alpha)
+
+        batch_size = theta.shape[0]
+        R = torch.zeros(batch_size, 3, 3, device=theta.device)
+
+        R[:, 0, 0] = ct
+        R[:, 0, 1] = -st
+        R[:, 0, 2] = 0.0
+        R[:, 1, 0] = st * ca
+        R[:, 1, 1] = ct * ca
+        R[:, 1, 2] = -sa
+        R[:, 2, 0] = st * sa
+        R[:, 2, 1] = ct * sa
+        R[:, 2, 2] = ca
+
+        p = torch.zeros(batch_size, 3, device=theta.device)
+        p[:, 0] = a
+        p[:, 1] = -sa * d
+        p[:, 2] = ca * d
+
+        return R, p
+
+    def compute_franka_fk(
+        self,
+        franka_q: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], torch.Tensor]:
+        """Compute Franka FK: joint positions, joint axes, and EE pose.
+
+        Uses modified DH parameters to compute the full kinematic chain.
+
+        Args:
+            franka_q: Joint positions (batch, 7)
+
+        Returns:
+            joint_positions: List of 7 joint origin positions, each (batch, 3)
+            joint_axes: List of 7 joint z-axes in world frame, each (batch, 3)
+            ee_pos: End-effector position (batch, 3)
+        """
+        batch_size = franka_q.shape[0]
+        device = franka_q.device
+
+        # Accumulated transform (world to current frame)
+        R_acc = torch.eye(3, device=device).unsqueeze(0).expand(batch_size, -1, -1).clone()
+        p_acc = torch.zeros(batch_size, 3, device=device)
+
+        joint_positions = []
+        joint_axes = []
+
+        # 7 joints + 1 flange transform = 8 DH transforms
+        # Joint angles: [q0, q1, ..., q6, 0 (flange)]
+        thetas = torch.cat([franka_q, torch.zeros(batch_size, 1, device=device)], dim=-1)
+
+        for i in range(8):
+            # Store joint position and axis BEFORE applying this joint's transform
+            if i < 7:
+                joint_positions.append(p_acc.clone())
+                # z-axis of current frame = 3rd column of accumulated rotation
+                joint_axes.append(R_acc[:, :, 2].clone())
+
+            # Apply DH transform for joint i
+            R_i, p_i = self._dh_transform(
+                thetas[:, i],
+                self.dh_d[i].item(),
+                self.dh_a[i].item(),
+                self.dh_alpha[i].item(),
+            )
+
+            # Update accumulated transform: T_new = T_acc * T_i
+            # p_new = p_acc + R_acc @ p_i
+            p_acc = p_acc + torch.bmm(R_acc, p_i.unsqueeze(-1)).squeeze(-1)
+            # R_new = R_acc @ R_i
+            R_acc = torch.bmm(R_acc, R_i)
+
+        ee_pos = p_acc
+        return joint_positions, joint_axes, ee_pos
+
     def compute_franka_jacobian(
         self,
         franka_q: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute approximate Franka Jacobian using finite differences.
+        """Compute analytical geometric Jacobian for Franka arm.
 
-        For production use, this should be replaced with analytical Jacobian
-        from the robot model or a proper IK library.
+        For revolute joint i:
+            J_v_i = z_i × (p_ee - p_i)   (linear velocity contribution)
+            J_w_i = z_i                    (angular velocity contribution)
 
         Args:
             franka_q: Current Franka joint positions (batch, 7)
@@ -717,27 +840,24 @@ class FabricActionController(nn.Module):
         Returns:
             J: Jacobian matrix (batch, 6, 7)
         """
+        joint_positions, joint_axes, ee_pos = self.compute_franka_fk(franka_q)
+
         batch_size = franka_q.shape[0]
-        eps = 1e-4
+        J = torch.zeros(batch_size, 6, 7, device=franka_q.device)
 
-        # Approximate Jacobian using numerical differentiation
-        # This is a simplified version; real implementation would use FK
-        J = torch.zeros(batch_size, 6, 7, device=self.device)
+        for i in range(7):
+            z_i = joint_axes[i]  # (batch, 3)
+            p_diff = ee_pos - joint_positions[i]  # (batch, 3)
 
-        # For now, use a simple diagonal approximation
-        # Real IK would compute proper Jacobian from FK
-        # Joints 0-2 primarily affect XYZ position
-        # Joints 3-6 primarily affect orientation
-        J[:, 0, 0] = 0.5   # Joint 0 -> X
-        J[:, 1, 0] = 0.3   # Joint 0 -> Y
-        J[:, 0, 1] = 0.3   # Joint 1 -> X
-        J[:, 2, 1] = 0.4   # Joint 1 -> Z
-        J[:, 1, 2] = 0.4   # Joint 2 -> Y
-        J[:, 0, 3] = 0.2   # Joint 3 -> X
-        J[:, 2, 3] = 0.3   # Joint 3 -> Z
-        J[:, 3, 4] = 0.5   # Joint 4 -> Roll
-        J[:, 4, 5] = 0.5   # Joint 5 -> Pitch
-        J[:, 5, 6] = 0.5   # Joint 6 -> Yaw
+            # Linear velocity: z_i × (p_ee - p_i)
+            J[:, 0, i] = z_i[:, 1] * p_diff[:, 2] - z_i[:, 2] * p_diff[:, 1]
+            J[:, 1, i] = z_i[:, 2] * p_diff[:, 0] - z_i[:, 0] * p_diff[:, 2]
+            J[:, 2, i] = z_i[:, 0] * p_diff[:, 1] - z_i[:, 1] * p_diff[:, 0]
+
+            # Angular velocity: z_i
+            J[:, 3, i] = z_i[:, 0]
+            J[:, 4, i] = z_i[:, 1]
+            J[:, 5, i] = z_i[:, 2]
 
         return J
 

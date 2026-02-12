@@ -51,6 +51,8 @@ class VisualizeExample:
 
         # Load checkpoint if provided
         self.policy = None
+        self._policy_type = None
+        self._policy_hidden = None
         if args.checkpoint:
             self._load_checkpoint(args.checkpoint)
 
@@ -127,73 +129,106 @@ class VisualizeExample:
         self.depth_fig.canvas.flush_events()
 
     def _load_checkpoint(self, path: str):
-        """Load trained policy from checkpoint."""
+        """Load trained policy from checkpoint.
+
+        Supports both teacher checkpoints (TeacherActorCritic) and
+        student checkpoints (StudentNetwork).
+        """
         try:
-            import torch.nn as nn
-
-            # Simple MLP policy (matches PPO architecture)
-            class Policy(nn.Module):
-                def __init__(self, obs_dim, act_dim, hidden_dims=(512, 256, 128)):
-                    super().__init__()
-                    layers = []
-                    in_dim = obs_dim
-                    for h_dim in hidden_dims:
-                        layers.append(nn.Linear(in_dim, h_dim))
-                        layers.append(nn.ELU())
-                        in_dim = h_dim
-                    layers.append(nn.Linear(in_dim, act_dim))
-                    layers.append(nn.Tanh())
-                    self.net = nn.Sequential(*layers)
-
-                def forward(self, x):
-                    return self.net(x)
+            from .networks import TeacherActorCritic
 
             checkpoint = torch.load(path, map_location="cuda")
-            self.policy = Policy(self.env.num_obs, self.env.num_actions)
-            self.policy.load_state_dict(checkpoint["policy"])
-            self.policy.eval()
-            self.policy.cuda()
-            print(f"[INFO] Loaded policy from {path}")
+
+            if "actor_critic" in checkpoint:
+                # Teacher checkpoint
+                config = checkpoint.get("config", {})
+                teacher_cfg = config.get("teacher", {})
+
+                self.policy = TeacherActorCritic(
+                    num_actor_obs=self.env.num_teacher_obs,
+                    num_critic_obs=self.env.num_teacher_obs,
+                    num_actions=self.env.num_actions,
+                    actor_lstm_units=teacher_cfg.get("actor_lstm_units", 1024),
+                    critic_lstm_units=teacher_cfg.get("critic_lstm_units", 2048),
+                    actor_mlp_dims=tuple(teacher_cfg.get("actor_mlp_dims", (512, 512))),
+                    critic_mlp_dims=tuple(teacher_cfg.get("critic_mlp_dims", (1024, 512))),
+                )
+                self.policy.load_state_dict(checkpoint["actor_critic"])
+                self.policy.eval()
+                self.policy.cuda()
+                self._policy_hidden = self.policy.init_hidden(self.env.num_envs, "cuda")["actor"]
+                self._policy_type = "teacher"
+                print(f"[INFO] Loaded teacher policy from {path}")
+
+            elif "student" in checkpoint:
+                from .networks import StudentNetwork
+
+                config = checkpoint.get("config", {})
+                student_cfg = config.get("student", {})
+
+                self.policy = StudentNetwork(
+                    num_proprio_obs=self.env.num_student_obs,
+                    num_actions=self.env.num_actions,
+                    cnn_output_dim=student_cfg.get("cnn_output_dim", 128),
+                    lstm_units=student_cfg.get("lstm_units", 512),
+                )
+                self.policy.load_state_dict(checkpoint["student"])
+                self.policy.eval()
+                self.policy.cuda()
+                self._policy_hidden = self.policy.init_hidden(self.env.num_envs, "cuda")
+                self._policy_type = "student"
+                print(f"[INFO] Loaded student policy from {path}")
+            else:
+                print(f"[WARNING] Unknown checkpoint format: {list(checkpoint.keys())}")
+                self.policy = None
+
         except Exception as e:
             print(f"[WARNING] Failed to load checkpoint: {e}")
             self.policy = None
 
     def _scripted_action(self) -> torch.Tensor:
-        """Generate scripted demo action for visualization."""
-        actions = torch.zeros(self.env.num_envs, self.env.num_actions, device="cuda")
+        """Generate scripted demo action for visualization.
 
-        # Simple reaching motion
+        With FABRICS mode (11D): actions are [palm_x, palm_y, palm_z, roll, pitch, yaw, pca0..pca4]
+        Without FABRICS (23D): actions are direct joint position deltas.
+        """
+        actions = torch.zeros(self.env.num_envs, self.env.num_actions, device="cuda")
         t = self.demo_time
 
-        # Phase 0: Move arm forward (first 3 seconds)
-        if t < 3.0:
-            # Franka: extend arm forward
-            actions[:, 0] = 0.0   # Joint 1
-            actions[:, 1] = 0.2   # Joint 2 - lower
-            actions[:, 2] = 0.0   # Joint 3
-            actions[:, 3] = -0.3  # Joint 4 - extend
-            actions[:, 4] = 0.0   # Joint 5
-            actions[:, 5] = 0.2   # Joint 6
-            actions[:, 6] = 0.0   # Joint 7
-
-        # Phase 1: Close fingers (3-6 seconds)
-        elif t < 6.0:
-            # Allegro: close fingers
-            finger_close = min((t - 3.0) / 3.0, 1.0) * 0.5
-            for i in range(7, 23):
-                if (i - 7) % 4 != 0:  # Skip abduction joints
-                    actions[:, i] = finger_close
-
-        # Phase 2: Lift (6+ seconds)
+        if self.env.use_fabric_actions:
+            # FABRICS 11D action space: [palm_xyz(3), palm_rpy(3), hand_pca(5)]
+            # All in [-1, 1] range
+            if t < 3.0:
+                # Phase 0: Move palm toward cube area
+                actions[:, 0] = 0.0   # palm x (centered)
+                actions[:, 1] = -0.3  # palm y (toward table)
+                actions[:, 2] = 0.0   # palm z (table height)
+            elif t < 6.0:
+                # Phase 1: Close fingers (increase PCA component 0 = power grasp)
+                finger_close = min((t - 3.0) / 3.0, 1.0)
+                actions[:, 1] = -0.3
+                actions[:, 6] = finger_close * 0.8  # PCA 0: power grasp
+            else:
+                # Phase 2: Lift up
+                actions[:, 2] = 0.3   # palm z up
+                actions[:, 6] = 0.8   # Keep fingers closed
         else:
-            # Franka: lift up
-            actions[:, 1] = -0.3  # Joint 2 - raise
-            actions[:, 3] = 0.2   # Joint 4 - bend up
-
-            # Keep fingers closed
-            for i in range(7, 23):
-                if (i - 7) % 4 != 0:
-                    actions[:, i] = 0.3
+            # Direct joint control (23D)
+            if t < 3.0:
+                actions[:, 1] = 0.2   # Joint 2 - lower
+                actions[:, 3] = -0.3  # Joint 4 - extend
+                actions[:, 5] = 0.2   # Joint 6
+            elif t < 6.0:
+                finger_close = min((t - 3.0) / 3.0, 1.0) * 0.5
+                for i in range(7, 23):
+                    if (i - 7) % 4 != 0:
+                        actions[:, i] = finger_close
+            else:
+                actions[:, 1] = -0.3
+                actions[:, 3] = 0.2
+                for i in range(7, 23):
+                    if (i - 7) % 4 != 0:
+                        actions[:, i] = 0.3
 
         return actions
 
@@ -204,8 +239,31 @@ class VisualizeExample:
         # Get action
         if self.policy is not None:
             with torch.no_grad():
-                obs = self.env._compute_observations()
-                actions = self.policy(obs)
+                if self._policy_type == "teacher":
+                    obs = self.env.teacher_obs_buf
+                    result = self.policy.get_action_and_value(
+                        actor_obs=obs, critic_obs=obs,
+                        actor_hidden=self._policy_hidden,
+                        critic_hidden=None,
+                    )
+                    actions = torch.clamp(result["action"], -1.0, 1.0)
+                    self._policy_hidden = result["actor_hidden"]
+                elif self._policy_type == "student":
+                    obs = self.env.student_obs_buf
+                    depth = self.env.depth_obs_buf
+                    if depth is None:
+                        depth = torch.zeros(
+                            self.env.num_envs, 1, self.config.depth_height,
+                            self.config.depth_width, device="cuda"
+                        )
+                    result = self.policy.get_action_and_value(
+                        depth_image=depth, proprio_obs=obs,
+                        hidden=self._policy_hidden,
+                    )
+                    actions = torch.clamp(result["action"], -1.0, 1.0)
+                    self._policy_hidden = result["hidden"]
+                else:
+                    actions = self._scripted_action()
         elif self.args.random:
             actions = torch.randn(self.env.num_envs, self.env.num_actions, device="cuda") * 0.1
         else:

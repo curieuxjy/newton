@@ -1,6 +1,6 @@
 """Configuration for Franka + Allegro cube grasping environment.
 
-Reference: DEXTRAH (NVlabs/DEXTRAH) - dextrah_kuka_allegro_env.py
+Reference: DEXTRAH-G (NVlabs/DEXTRAH) - dextrah_kuka_allegro_env.py
 """
 
 from dataclasses import dataclass, field
@@ -13,10 +13,11 @@ class EnvConfig:
     num_envs: int = 256
     episode_length: int = 600  # 10 seconds at 60Hz control (DEXTRAH: 10.0s)
 
-    # Simulation (DEXTRAH: 120Hz physics, 60Hz control)
+    # Simulation (DEXTRAH: 120Hz physics, 60Hz fabric, 15Hz policy)
     fps: int = 120  # Physics frequency
-    sim_substeps: int = 1  # No additional substeps (already 120Hz)
-    control_decimation: int = 2  # 60Hz control (120Hz / 2)
+    sim_substeps: int = 1
+    control_decimation: int = 2  # 60Hz fabric (120Hz / 2)
+    policy_decimation: int = 4  # 15Hz policy (60Hz fabric / 4)
 
     # Robot - Franka arm
     franka_stiffness: float = 500.0
@@ -32,72 +33,58 @@ class EnvConfig:
 
     # Action
     action_scale: float = 0.1
-    use_relative_control: bool = True  # Delta position control (for direct joint control)
+    use_relative_control: bool = True
 
-    # FABRICS Action Space (DEXTRAH-style)
-    # Action space is 11D instead of 23D:
-    # - 6D palm pose (XYZ + RPY) for arm control
-    # - 5D hand PCA for finger control
-    # Set to False for direct 23D joint control
-    use_fabric_actions: bool = True  # Default: FABRICS action space (DEXTRAH-style)
+    # FABRICS Action Space (DEXTRAH-style 11D)
+    use_fabric_actions: bool = True
+    fabric_ik_damping: float = 0.1
+    fabric_ik_step_size: float = 0.5
+    fabric_decimation: int = 2  # Fabric steps per physics step
 
-    # Fabric IK parameters
-    fabric_ik_damping: float = 0.1  # Damping for differential IK
-    fabric_ik_step_size: float = 0.5  # Step size for IK updates
-    fabric_decimation: int = 2  # Number of fabric steps per physics step (DEXTRAH: 2)
-
-    # Table - positioned where robot arm points (EE at approx -0.4, -0.7)
+    # Table
     table_height: float = 0.4
-    table_size: tuple = (0.6, 0.8, 0.02)  # (x, y, z) - width, depth, thickness
-    table_pos: tuple = (-0.3, -0.5)  # (x, y) center position - in front of robot arm
+    table_size: tuple = (0.6, 0.8, 0.02)
+    table_pos: tuple = (-0.3, -0.5)
 
     # Cube
     cube_size: float = 0.05
     cube_mass: float = 0.1
-    cube_spawn_pos: tuple = (-0.3, -0.5, 0.45)  # (x, y, z) - on table, reachable by robot
-    cube_spawn_noise: float = 0.05  # XY randomization range
+    cube_spawn_pos: tuple = (-0.3, -0.5, 0.45)
+    cube_spawn_noise: float = 0.05
 
     # Goal
-    lift_height: float = 0.15  # How high to lift the cube above table (DEXTRAH: object_height_thresh)
-    goal_tolerance: float = 0.1  # Distance tolerance for success (DEXTRAH: object_goal_tol)
+    lift_height: float = 0.15
+    goal_tolerance: float = 0.1
 
-    # Depth sensor
+    # Depth sensor (DEXTRAH-G values)
     use_depth_sensor: bool = True
     depth_width: int = 160
     depth_height: int = 120
-    depth_fov: float = 60.0  # degrees
-    depth_min: float = 0.1
-    depth_max: float = 2.0
+    depth_fov: float = 48.0  # DEXTRAH-G: 48 degrees
+    depth_min: float = 0.5  # DEXTRAH-G: 0.5m
+    depth_max: float = 1.3  # DEXTRAH-G: 1.3m
 
     # Reward weights (DEXTRAH original values)
-    # Hand-to-object reward: weight * exp(-sharpness * dist)
     hand_to_object_weight: float = 1.0
     hand_to_object_sharpness: float = 10.0
-    hand_to_object_dist_threshold: float = 0.3  # meters
+    hand_to_object_dist_threshold: float = 0.3
 
-    # Object-to-goal reward: weight * exp(-sharpness * dist)
     object_to_goal_weight: float = 5.0
-    object_to_goal_sharpness: float = 15.0  # ADR range: 15-20
+    object_to_goal_sharpness: float = 15.0
 
-    # Lift reward: weight * exp(-sharpness * vertical_error)
     lift_weight: float = 5.0
     lift_sharpness: float = 8.5
-    object_height_thresh: float = 0.15  # meters for lift criteria
+    object_height_thresh: float = 0.15
 
-    # Finger curl regularization (penalty)
     finger_curl_reg_weight: float = -0.01
 
-    # Success bonus
     in_success_region_weight: float = 10.0
-    object_goal_tol: float = 0.1  # meters
-
-    # Note: DEXTRAH does NOT use action/velocity penalties in reward
-    # Only the 4 core reward components are used
+    object_goal_tol: float = 0.1
 
     # Success/Failure
-    consecutive_successes: int = 10  # Hold for N steps
-    fall_height: float = 0.3  # Below this z, cube is dropped
-    min_episode_steps: int = 60  # DEXTRAH minimum episode length
+    consecutive_successes: int = 10
+    fall_height: float = 0.3
+    min_episode_steps: int = 60
 
     # Domain randomization
     randomize_cube_pos: bool = True
@@ -105,52 +92,133 @@ class EnvConfig:
 
 
 @dataclass
-class PPOConfig:
-    """PPO algorithm configuration (DEXTRAH original values)."""
+class TeacherPPOConfig:
+    """Teacher PPO configuration (DEXTRAH-G privileged RL)."""
 
-    # Learning (DEXTRAH: 5e-4 with adaptive schedule)
-    learning_rate: float = 5e-4
-    lr_schedule: str = "adaptive"  # "adaptive" or "linear" or "constant"
-    gamma: float = 0.99
-    gae_lambda: float = 0.95  # DEXTRAH: tau = 0.95
+    # Learning (DEXTRAH teacher: lr=3e-4, critic_lr=5e-5)
+    learning_rate: float = 3e-4
+    critic_lr: float = 5e-5
+    lr_schedule: str = "adaptive"
+    gamma: float = 0.998  # DEXTRAH: 0.998
+    gae_lambda: float = 0.95
 
-    # Clipping (DEXTRAH values)
-    clip_epsilon: float = 0.2  # DEXTRAH: e_clip = 0.2
-    kl_threshold: float = 0.016  # DEXTRAH: kl_threshold = 0.016
+    # Clipping
+    clip_epsilon: float = 0.2
+    kl_threshold: float = 0.016
     clip_value: bool = True
 
-    # Loss coefficients (DEXTRAH values)
-    entropy_coef: float = 0.0  # DEXTRAH: 0.0
-    value_coef: float = 4.0  # DEXTRAH: critic_coef = 4
-    bounds_loss_coef: float = 0.0001  # DEXTRAH: bounds_loss_coef = 0.0001
+    # Loss coefficients (DEXTRAH teacher values)
+    entropy_coef: float = 0.002  # DEXTRAH teacher: 0.002
+    value_coef: float = 4.0
+    bounds_loss_coef: float = 0.005  # DEXTRAH teacher: 0.005
     max_grad_norm: float = 1.0
 
-    # Training dynamics (DEXTRAH values)
-    num_epochs: int = 5  # DEXTRAH: mini_epochs = 5
-    num_minibatches: int = 4  # Will adjust based on num_envs
-    minibatch_size: int = 8192  # DEXTRAH: 8192
-    total_timesteps: int = 100_000_000
-    rollout_steps: int = 16  # DEXTRAH: horizon_length = 16
-    max_iterations: int = 5000  # DEXTRAH: max_epochs = 5000
+    # Training dynamics
+    num_epochs: int = 4  # DEXTRAH: mini_epochs=4
+    minibatch_size: int = 16384  # DEXTRAH: 16384
+    rollout_steps: int = 16  # DEXTRAH: horizon_length=16
+    max_iterations: int = 20000  # DEXTRAH: max_epochs=20000
 
-    # Normalization (DEXTRAH values)
+    # Normalization
     normalize_input: bool = True
     normalize_value: bool = True
     normalize_advantage: bool = True
-    observation_clip: float = 5.0  # DEXTRAH: 5.0
-    action_clip: float = 1.0  # DEXTRAH: 1.0
+    observation_clip: float = 5.0
+    action_clip: float = 1.0
 
-    # Network (DEXTRAH: [512, 512, 256, 128])
-    hidden_dims: tuple = (512, 512, 256, 128)
+    # Actor network: LSTM(1024) -> MLP[512,512]
+    actor_lstm_units: int = 1024
+    actor_mlp_dims: tuple = (512, 512)
+
+    # Critic network (central value): LSTM(2048) -> MLP[1024,512]
+    critic_lstm_units: int = 2048
+    critic_mlp_dims: tuple = (1024, 512)
+
+    # LSTM common
+    lstm_layers: int = 1
+    lstm_layer_norm: bool = True
+    seq_len: int = 16  # DEXTRAH: sequence_length=16
+
+    # Activation
     activation: str = "elu"
 
-    # Sigma (DEXTRAH: fixed sigma)
+    # Sigma
     fixed_sigma: bool = True
-    init_sigma: float = 0.0  # DEXTRAH: 0.0
+    init_sigma: float = 0.0
 
-    # Depth encoder (if using depth)
-    depth_encoder_dims: tuple = (32, 64, 128)
-    depth_latent_dim: int = 64
+
+@dataclass
+class StudentConfig:
+    """Student distillation configuration (DEXTRAH-G depth policy)."""
+
+    # Learning
+    learning_rate: float = 1e-4
+    lr_schedule: str = "adaptive"
+    kl_threshold: float = 0.016
+    gamma: float = 0.998
+    gae_lambda: float = 0.95
+
+    # PPO params
+    clip_epsilon: float = 0.2
+    entropy_coef: float = 0.0
+    value_coef: float = 4.0
+    bounds_loss_coef: float = 0.0001
+    max_grad_norm: float = 1.0
+    num_epochs: int = 4
+    minibatch_size: int = 16384
+    rollout_steps: int = 16
+
+    # CNN depth encoder: [16,32,64,128] channels + LayerNorm
+    cnn_channels: tuple = (16, 32, 64, 128)
+    cnn_kernel_sizes: tuple = (6, 4, 4, 4)
+    cnn_strides: tuple = (2, 2, 2, 2)
+    cnn_output_dim: int = 128
+    cnn_use_layer_norm: bool = True
+
+    # Student LSTM
+    lstm_units: int = 512
+    lstm_layers: int = 1
+    lstm_layer_norm: bool = True
+    seq_len: int = 20  # DEXTRAH student: sequence_length=20
+
+    # Student MLP: [512,512,256]
+    mlp_dims: tuple = (512, 512, 256)
+
+    # Auxiliary head: MLP[512,256] -> object_pos(3)
+    aux_mlp_dims: tuple = (512, 256)
+    aux_output_dim: int = 3  # Object position prediction
+
+    activation: str = "elu"
+    fixed_sigma: bool = True
+    init_sigma: float = 0.0
+
+    # Normalization
+    normalize_input: bool = True
+    normalize_value: bool = True
+    normalize_advantage: bool = True
+    observation_clip: float = 5.0
+    action_clip: float = 1.0
+
+
+@dataclass
+class DistillConfig:
+    """Distillation training configuration."""
+
+    learning_rate: float = 1e-4
+    warmup_steps: int = 1000
+    max_iterations: int = 100000
+
+    # Auxiliary loss weight schedule
+    beta_initial: float = 1.0
+    beta_final: float = 0.0
+    beta_decay_iteration: int = 15000
+
+    # Distillation loss
+    use_inverse_variance_weighting: bool = True  # w = 1/sigma_teacher^2
+
+    # Logging
+    log_interval: int = 100
+    save_interval: int = 5000
 
 
 @dataclass
@@ -171,11 +239,17 @@ class TrainConfig:
 
     seed: int = 42
     device: str = "cuda"
-    log_interval: int = 1000
-    save_interval: int = 50000
+    log_interval: int = 10
+    save_interval: int = 100
     checkpoint_dir: str = "checkpoints"
     experiment_name: str = "franka_allegro_grasp"
 
     env: EnvConfig = field(default_factory=EnvConfig)
-    ppo: PPOConfig = field(default_factory=PPOConfig)
+    teacher: TeacherPPOConfig = field(default_factory=TeacherPPOConfig)
+    student: StudentConfig = field(default_factory=StudentConfig)
+    distill: DistillConfig = field(default_factory=DistillConfig)
     wandb: WandbConfig = field(default_factory=WandbConfig)
+
+
+# Backward compatibility alias
+PPOConfig = TeacherPPOConfig
