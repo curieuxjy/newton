@@ -249,13 +249,13 @@ class LSTMBlock(nn.Module):
 class TeacherActorCritic(nn.Module):
     """Teacher actor-critic with asymmetric LSTM networks (rl_games style).
 
-    Actor (before_mlp=True, concat_input=True):
+    Actor (before_mlp=True, concat_output=True):
         obs -> LSTM(1024) -> LayerNorm -> [concat obs] -> MLP[512,512] -> action(11)
-    Critic (before_mlp=False, concat_input=True):
-        obs -> MLP[1024,512] -> [concat obs] -> LSTM(2048) -> LayerNorm -> value(1)
+    Critic (before_mlp=False, concat_input=True, concat_output=True):
+        obs -> MLP[1024,512] -> [concat obs] -> LSTM(2048) -> LayerNorm -> [concat obs] -> value(1)
 
     The actor and critic are fully separate networks (asymmetric central value).
-    Skip connections (concat_input) are critical for LSTM policy training.
+    Skip connections (concat_output) are critical for LSTM policy training.
     """
 
     def __init__(
@@ -284,13 +284,13 @@ class TeacherActorCritic(nn.Module):
         self.actor_mean = layer_init(nn.Linear(actor_mlp_dims[-1], num_actions), std=0.01)
         self.actor_log_std = nn.Parameter(torch.full((num_actions,), init_sigma))
 
-        # Critic (rl_games before_mlp=False, concat_input=True):
-        # obs -> MLP -> [concat MLP_out, obs] -> LSTM -> value
+        # Critic (rl_games before_mlp=False, concat_input=True, concat_output=True):
+        # obs -> MLP -> [concat MLP_out, obs] -> LSTM -> [concat LSTM_out, obs] -> value
         self.critic_mlp = _build_mlp(num_critic_obs, critic_mlp_dims, activation)
         self.critic_lstm = LSTMBlock(
             critic_mlp_dims[-1] + num_critic_obs, critic_lstm_units, lstm_layers, lstm_layer_norm
         )
-        self.critic_head = layer_init(nn.Linear(critic_lstm_units, 1))
+        self.critic_head = layer_init(nn.Linear(critic_lstm_units + num_critic_obs, 1))
 
     def forward_actor(
         self,
@@ -322,18 +322,20 @@ class TeacherActorCritic(nn.Module):
         hidden: tuple[torch.Tensor, torch.Tensor] | None = None,
         dones: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple]:
-        """Critic forward pass (before_mlp=False, concat_input=True).
+        """Critic forward pass (before_mlp=False, concat_input=True, concat_output=True).
 
-        Flow: obs -> MLP -> [concat MLP_out, obs] -> LSTM -> value
+        Flow: obs -> MLP -> [concat MLP_out, obs] -> LSTM -> [concat LSTM_out, obs] -> value
 
         Returns:
             value, new_hidden
         """
         mlp_out = self.critic_mlp(obs)
-        # Skip connection: concat MLP output with original input
+        # concat_input: concat MLP output with original input
         lstm_input = torch.cat([mlp_out, obs], dim=-1)
         lstm_out, new_hidden = self.critic_lstm(lstm_input, hidden, dones)
-        value = self.critic_head(lstm_out).squeeze(-1)
+        # concat_output: concat LSTM output with original input
+        value_input = torch.cat([lstm_out, obs], dim=-1)
+        value = self.critic_head(value_input).squeeze(-1)
         return value, new_hidden
 
     def get_action_and_value(

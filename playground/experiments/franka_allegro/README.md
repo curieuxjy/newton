@@ -204,22 +204,24 @@ uv run --extra examples --extra torch-cu12 --with matplotlib \
 ### Teacher Actor-Critic (rl_games 스타일)
 
 ```
-Actor (before_mlp=True, concat_input=True):
+Actor (before_mlp=True, concat_output=True):
   obs(172D) -> LSTM(1024) -> LayerNorm -> [concat obs(172D)]
     -> MLP[512,512](ELU) -> action_mean(11D)
   MLP input: 1024 + 172 = 1196D
 
-Critic (before_mlp=False, concat_input=True):
+Critic (before_mlp=False, concat_input=True, concat_output=True):
   obs(172D) -> MLP[1024,512](ELU) -> [concat obs(172D)]
-    -> LSTM(2048) -> LayerNorm -> value(1)
+    -> LSTM(2048) -> LayerNorm -> [concat obs(172D)] -> value(1)
   LSTM input: 512 + 172 = 684D
+  Value head input: 2048 + 172 = 2220D
 ```
 
 - Actor와 Critic은 완전히 분리된 네트워크 (asymmetric central value)
-- **Skip connection** (`concat_input=True`): LSTM/MLP 출력에 원본 obs를 concat
-- Actor: LSTM이 먼저 temporal 정보 추출 -> obs와 합쳐서 MLP가 action 결정
-- Critic: MLP가 먼저 feature 추출 -> obs와 합쳐서 LSTM이 temporal value 추정
-- Total: Actor 5.8M + Critic 23.1M = **28.9M params**
+- **concat_output** (rl_games): LSTM/MLP 출력에 원본 obs를 concat하는 skip connection
+- **concat_input** (critic): MLP 출력에 원본 obs를 concat하여 LSTM 입력 구성
+- Actor: LSTM → concat obs → MLP → action
+- Critic: MLP → concat obs → LSTM → concat obs → value
+- Total: Actor 5.8M + Critic 23.1M = **28.8M params**
 
 ### Student (CNN + LSTM)
 
@@ -294,17 +296,18 @@ Differential IK              PCA Projection
 ## Reward Structure
 
 ```
-total = (hand_to_object + object_to_goal + lift + finger_curl_reg + success_bonus) * 0.01
+total = (hand_to_object + object_to_goal + lift + finger_curl_reg) * 0.01
 ```
 
 | Component | 수식 | Weight | Sharpness |
 |-----------|------|--------|-----------|
 | `hand_to_object` | `w * exp(-s * max_dist(hand_points, cube))` | 1.0 | 10.0 |
-| `object_to_goal` | `w * exp(-s * dist_cube_to_goal)` | 5.0 | 15.0 |
-| `lift` | `w * exp(-s * vertical_error)` | 5.0 | 8.5 |
-| `finger_curl_reg` | `w * norm(q - curled_q)^2` | -0.01 | - |
-| `success_bonus` | `w * in_success_region` | 10.0 | - |
+| `object_to_goal` | `w * exp(-s * dist_cube_to_goal)` | 5.0 | 15.0 (ADR: -15→-20) |
+| `lift` | `w * exp(-s * vertical_error)` | 5.0 (ADR: 5→0) | 8.5 |
+| `finger_curl_reg` | `w * norm(q - curled_q)^2` | -0.01 (ADR: -0.01→-0.005) | - |
 | **reward_scale** | 모든 reward에 곱함 | **0.01** | - |
+
+참고: `in_success_region_at_rest_weight=10.0`은 config에 정의되어 있지만 실제 reward 계산에는 사용되지 않음 (ADR/distillation 추적용).
 
 ## Timing
 
@@ -326,7 +329,7 @@ Episode:   10s   (600 steps at 60Hz)
 | **Critic** | MLP -> [concat obs] -> LSTM(2048) | 동일 | MLP-first 순서 |
 | learning_rate (actor) | 3e-4 | 3e-4 | |
 | learning_rate (critic) | 5e-5 | 5e-5 | |
-| lr_schedule | linear | adaptive | |
+| lr_schedule | linear | linear | LR → 0 over training |
 | gamma | 0.998 | 0.998 | |
 | kl_threshold | 0.013 | 0.013 | |
 | entropy_coef | 0.002 | 0.002 | |
@@ -339,15 +342,17 @@ Episode:   10s   (600 steps at 60Hz)
 | normalize_input | True | True | ObsRunningMeanStd |
 | normalize_value | True | True | scalar RunningMeanStd |
 | reward_scale | 0.01 | 0.01 | |
-| success_bonus | 10.0 | 10.0 | |
+| value_bootstrap | False | True | 개선: truncation 처리 |
 
 ## 원본 DEXTRAH-G와의 차이점
 
-### 일치하는 부분
-- LSTM skip connection (concat_input=True)
-- Critic: MLP -> LSTM 순서 (before_mlp=False)
-- Reward 구조 (4 components + success bonus) x 0.01 scaling
+### 일치하는 부분 (원본 소스 `/home/ai5090/Documents/DEXTRAH/` 기반 검증)
+- Actor: LSTM → concat_output → MLP (before_mlp=True, concat_output=True)
+- Critic: MLP → concat_input → LSTM → concat_output → value (before_mlp=False)
+- Reward 구조: 4 components (hand_to_object, object_to_goal, finger_curl_reg, lift) x 0.01 scaling
 - Observation/Value normalization (RunningMeanStd)
+- LR schedule: linear (0으로 선형 감소)
+- Episode termination: XY workspace boundary + Z fall + timeout (terminated/truncated 분리)
 - PCA hand mapping (5D -> 16D, 원본 matrix 사용)
 - Timing hierarchy (120/60/15Hz)
 - Minibatch당 epoch 수 (4)
@@ -356,7 +361,7 @@ Episode:   10s   (600 steps at 60Hz)
 | 항목 | 원본 | 현재 | 영향도 |
 |------|------|------|--------|
 | num_envs | 4096 | 256 | 높음 (VRAM 제한) |
-| LR schedule | linear | adaptive | 중간 |
+| value_bootstrap | False | True | 개선 (truncation GAE) |
 | Observation noise | per-step + bias noise | 없음 | 중간 |
 | Asymmetric critic | clean obs for critic | 동일 obs | 중간 |
 | ADR | 50-stage curriculum | 없음 | 중간 (sim-to-real) |

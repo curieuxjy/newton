@@ -105,7 +105,7 @@ class TeacherPPOConfig:
     # Learning (DEXTRAH teacher: lr=3e-4, critic_lr=5e-5)
     learning_rate: float = 3e-4
     critic_lr: float = 5e-5
-    lr_schedule: str = "adaptive"
+    lr_schedule: str = "linear"  # DEXTRAH: linear
     gamma: float = 0.998  # DEXTRAH: 0.998
     gae_lambda: float = 0.95
 

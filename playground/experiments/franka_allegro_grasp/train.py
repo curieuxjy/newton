@@ -475,7 +475,7 @@ class TeacherTrainer:
                 epoch_kl += kl.item()
                 epoch_batches += 1
 
-            # Adaptive LR
+            # LR schedule
             avg_epoch_kl = epoch_kl / max(epoch_batches, 1)
             if ppo.lr_schedule == "adaptive":
                 current_lr = self.actor_optimizer.param_groups[0]["lr"]
@@ -579,6 +579,16 @@ class TeacherTrainer:
 
             # Update
             update_metrics = self.update()
+
+            # Linear LR schedule: decay to 0 over max_iterations
+            if self.ppo.lr_schedule == "linear":
+                progress = iteration / self.ppo.max_iterations
+                new_actor_lr = self.ppo.learning_rate * (1.0 - progress)
+                new_critic_lr = self.ppo.critic_lr * (1.0 - progress)
+                for pg in self.actor_optimizer.param_groups:
+                    pg["lr"] = new_actor_lr
+                for pg in self.critic_optimizer.param_groups:
+                    pg["lr"] = new_critic_lr
 
             self.buffer.reset()
             global_step += batch_size

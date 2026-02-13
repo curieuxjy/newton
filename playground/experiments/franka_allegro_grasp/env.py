@@ -1033,16 +1033,14 @@ class FrankaAllegroGraspEnv:
             grasp_features_for_reward, self.config.cube_size
         )
 
-        # 5. Success bonus (DEXTRAH: in_success_region_at_rest_weight = 10.0)
-        success_bonus = self.config.in_success_region_weight * in_success_region.float()
-
-        # === DEXTRAH Total Reward (4 core components + success bonus) ===
+        # === DEXTRAH Total Reward (4 core components, no success bonus) ===
+        # Note: in_success_region_at_rest_weight exists in DEXTRAH config but is
+        # NOT used in compute_rewards(). It's only for ADR/distillation tracking.
         reward = (
             hand_to_object_reward +
             object_to_goal_reward +
             finger_curl_reg +  # This is negative (penalty)
-            lift_reward +
-            success_bonus
+            lift_reward
         )
 
         # Apply reward scaling (DEXTRAH: reward_shaper.scale_value = 0.01)
@@ -1084,7 +1082,7 @@ class FrankaAllegroGraspEnv:
             "object_to_goal_reward": object_to_goal_reward.mean().item(),
             "finger_curl_reg": finger_curl_reg.mean().item(),
             "lift_reward": lift_reward.mean().item(),
-            "success_bonus": success_bonus.mean().item(),
+            "in_success_region": in_success_region.float().mean().item(),
             # Distances
             "hand_to_object_dist": hand_to_object_dist.mean().item(),
             "object_to_goal_dist": object_to_goal_dist.mean().item(),
