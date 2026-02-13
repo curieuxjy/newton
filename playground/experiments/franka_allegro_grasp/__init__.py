@@ -26,7 +26,7 @@ from .fabric import (
     PALM_POSE_MINS,
     TaskMap,
 )
-from .networks import StudentNetwork, TeacherActorCritic
+from .networks import ObsRunningMeanStd, StudentNetwork, TeacherActorCritic
 
 __all__ = [
     "FrankaAllegroGraspEnv",

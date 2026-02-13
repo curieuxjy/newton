@@ -270,7 +270,8 @@ class VisualizeExample:
             actions = self._scripted_action()
 
         # Step environment
-        obs, rewards, dones, info = self.env.step(actions)
+        obs, rewards, terminated, truncated, info = self.env.step(actions)
+        dones = terminated | truncated
 
         self.sim_time += self.frame_dt
 

@@ -81,10 +81,17 @@ class EnvConfig:
     in_success_region_weight: float = 10.0
     object_goal_tol: float = 0.1
 
+    # Reward scaling (DEXTRAH: reward_shaper.scale_value = 0.01)
+    reward_scale: float = 0.01
+
     # Success/Failure
     consecutive_successes: int = 10
     fall_height: float = 0.3
     min_episode_steps: int = 60
+
+    # Workspace bounds for out-of-reach termination (DEXTRAH-style)
+    workspace_margin: float = 0.15  # Margin beyond table edges
+    z_height_cutoff: float = 0.2  # Below this = fell off table
 
     # Domain randomization
     randomize_cube_pos: bool = True
@@ -104,7 +111,7 @@ class TeacherPPOConfig:
 
     # Clipping
     clip_epsilon: float = 0.2
-    kl_threshold: float = 0.016
+    kl_threshold: float = 0.013  # DEXTRAH: 0.013
     clip_value: bool = True
 
     # Loss coefficients (DEXTRAH teacher values)
@@ -115,7 +122,7 @@ class TeacherPPOConfig:
 
     # Training dynamics
     num_epochs: int = 4  # DEXTRAH: mini_epochs=4
-    minibatch_size: int = 16384  # DEXTRAH: 16384
+    minibatch_size: int = 1024  # 4 minibatches with 256 envs (DEXTRAH: 16384 with 4096 envs → 4 mb)
     rollout_steps: int = 16  # DEXTRAH: horizon_length=16
     max_iterations: int = 20000  # DEXTRAH: max_epochs=20000
 

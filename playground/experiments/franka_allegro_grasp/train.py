@@ -32,7 +32,7 @@ from torch.utils.tensorboard import SummaryWriter
 from .config import EnvConfig, TeacherPPOConfig, TrainConfig
 from .env import FrankaAllegroGraspEnv
 from .fabric import GraspFabric
-from .networks import RunningMeanStd, TeacherActorCritic, gaussian_kl
+from .networks import ObsRunningMeanStd, RunningMeanStd, TeacherActorCritic, gaussian_kl
 
 
 class SequenceRolloutBuffer:
@@ -63,6 +63,7 @@ class SequenceRolloutBuffer:
         self.log_probs = torch.zeros(num_steps, num_envs, device=device)
         self.rewards = torch.zeros(num_steps, num_envs, device=device)
         self.dones = torch.zeros(num_steps, num_envs, device=device)
+        self.timeouts = torch.zeros(num_steps, num_envs, device=device)
         self.values = torch.zeros(num_steps, num_envs, device=device)
 
         # LSTM hidden states at the start of each step
@@ -109,6 +110,7 @@ class SequenceRolloutBuffer:
         done: torch.Tensor,
         value: torch.Tensor,
         action_mean: torch.Tensor,
+        timeout: torch.Tensor | None = None,
     ):
         self.actor_obs[self.step] = actor_obs
         self.critic_obs[self.step] = critic_obs
@@ -117,6 +119,7 @@ class SequenceRolloutBuffer:
         self.log_probs[self.step] = log_prob
         self.rewards[self.step] = reward
         self.dones[self.step] = done.float()
+        self.timeouts[self.step] = timeout.float() if timeout is not None else 0.0
         self.values[self.step] = value
         self.step += 1
 
@@ -127,9 +130,15 @@ class SequenceRolloutBuffer:
                 next_value = last_value
             else:
                 next_value = self.values[t + 1]
-            next_non_terminal = 1.0 - self.dones[t]
+            # Only cut value chain on true termination (failure), not timeout.
+            # For timeout: bootstrap from next value (continuation estimate).
+            terminated = self.dones[t] - self.timeouts[t]  # 1 if failure, 0 if timeout or alive
+            next_non_terminal = 1.0 - terminated
             delta = self.rewards[t] + gamma * next_value * next_non_terminal - self.values[t]
-            last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
+            # Reset GAE accumulation on ANY done (both terminated and timeout)
+            # because the next step's observation is from a new episode.
+            gae_non_terminal = 1.0 - self.dones[t]
+            last_gae = delta + gamma * gae_lambda * gae_non_terminal * last_gae
             self.advantages[t] = last_gae
         self.returns = self.advantages + self.values
 
@@ -231,19 +240,19 @@ class TeacherTrainer:
         ).to(self.device)
 
         # Separate optimizers for actor and critic (DEXTRAH: different LRs)
-        self.actor_optimizer = optim.Adam(
+        self.actor_params = (
             list(self.actor_critic.actor_lstm.parameters())
             + list(self.actor_critic.actor_mlp.parameters())
             + [self.actor_critic.actor_mean.weight, self.actor_critic.actor_mean.bias]
-            + [self.actor_critic.actor_log_std],
-            lr=self.ppo.learning_rate,
+            + [self.actor_critic.actor_log_std]
         )
-        self.critic_optimizer = optim.Adam(
+        self.critic_params = (
             list(self.actor_critic.critic_lstm.parameters())
             + list(self.actor_critic.critic_mlp.parameters())
-            + [self.actor_critic.critic_head.weight, self.actor_critic.critic_head.bias],
-            lr=self.ppo.critic_lr,
+            + [self.actor_critic.critic_head.weight, self.actor_critic.critic_head.bias]
         )
+        self.actor_optimizer = optim.Adam(self.actor_params, lr=self.ppo.learning_rate)
+        self.critic_optimizer = optim.Adam(self.critic_params, lr=self.ppo.critic_lr)
 
         # Rollout buffer
         self.buffer = SequenceRolloutBuffer(
@@ -254,6 +263,11 @@ class TeacherTrainer:
             num_actions=env.num_actions,
             device=self.device,
         )
+
+        # Observation normalization (DEXTRAH: normalize_input=True with running_mean_std)
+        self.obs_normalizer = ObsRunningMeanStd(
+            shape=(env.num_teacher_obs,), device=self.device
+        ) if self.ppo.normalize_input else None
 
         # Value normalization
         self.value_normalizer = RunningMeanStd(device=self.device) if self.ppo.normalize_value else None
@@ -272,9 +286,14 @@ class TeacherTrainer:
             if self.actor_hidden is not None:
                 self.buffer.store_hidden(self.actor_hidden, self.critic_hidden, step)
 
-            # Get teacher observations
-            actor_obs = self.env.teacher_obs_buf
-            critic_obs = self.env.teacher_obs_buf  # Privileged
+            # Get teacher observations and normalize
+            raw_obs = self.env.teacher_obs_buf
+            if self.obs_normalizer is not None:
+                self.obs_normalizer.update(raw_obs)
+                actor_obs = self.obs_normalizer.normalize(raw_obs)
+            else:
+                actor_obs = raw_obs
+            critic_obs = actor_obs  # Same normalized obs for both
 
             with torch.no_grad():
                 result = self.actor_critic.get_action_and_value(
@@ -296,7 +315,8 @@ class TeacherTrainer:
                 self.critic_hidden = result["critic_hidden"]
 
             # Step environment
-            _, reward, done, _ = self.env.step(action)
+            _, reward, terminated, truncated, _ = self.env.step(action)
+            done = terminated | truncated
 
             # Reset hidden states for done environments
             done_indices = torch.where(done)[0]
@@ -313,6 +333,7 @@ class TeacherTrainer:
                 action, result["log_prob"],
                 reward, done, value,
                 result["action_mean"],
+                timeout=truncated,
             )
 
             # Track metrics
@@ -431,16 +452,13 @@ class TeacherTrainer:
                 actor_loss = pg_loss - ppo.entropy_coef * entropy_loss + ppo.bounds_loss_coef * bounds_loss
                 critic_loss = ppo.value_coef * value_loss
 
-                # Update actor
+                # Combined backward, separate optimizer steps
                 self.actor_optimizer.zero_grad()
-                actor_loss.backward(retain_graph=True)
-                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), ppo.max_grad_norm)
-                self.actor_optimizer.step()
-
-                # Update critic
                 self.critic_optimizer.zero_grad()
-                critic_loss.backward()
-                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), ppo.max_grad_norm)
+                (actor_loss + critic_loss).backward()
+                nn.utils.clip_grad_norm_(self.actor_params, ppo.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.critic_params, ppo.max_grad_norm)
+                self.actor_optimizer.step()
                 self.critic_optimizer.step()
 
                 # KL divergence
@@ -543,8 +561,11 @@ class TeacherTrainer:
 
             # Compute returns
             with torch.no_grad():
+                last_obs = self.env.teacher_obs_buf
+                if self.obs_normalizer is not None:
+                    last_obs = self.obs_normalizer.normalize(last_obs)
                 last_value, self.critic_hidden = self.actor_critic.get_value(
-                    self.env.teacher_obs_buf, self.critic_hidden
+                    last_obs, self.critic_hidden
                 )
                 if self.value_normalizer is not None:
                     last_value = self.value_normalizer.denormalize(last_value)
@@ -577,6 +598,13 @@ class TeacherTrainer:
                     avg_reward = self._last_avg_reward
                     avg_length = self._last_avg_length
 
+                # Compute average reward components
+                avg_rc = {}
+                if self._rc_counts > 0:
+                    for k, v in self._rc_sums.items():
+                        avg_rc[k] = v / self._rc_counts
+
+                # Console output: main metrics
                 print(
                     f"[iter {iteration:>6} | step {global_step:>10}] "
                     f"FPS: {fps:.0f} | "
@@ -588,6 +616,27 @@ class TeacherTrainer:
                     f"kl: {update_metrics['kl']:.4f} | "
                     f"lr: {update_metrics['learning_rate']:.2e}"
                 )
+                # Console output: reward components
+                if avg_rc:
+                    h2o = avg_rc.get("hand_to_object_reward", 0)
+                    o2g = avg_rc.get("object_to_goal_reward", 0)
+                    lift = avg_rc.get("lift_reward", 0)
+                    curl = avg_rc.get("finger_curl_reg", 0)
+                    h2o_d = avg_rc.get("hand_to_object_dist", 0)
+                    o2g_d = avg_rc.get("object_to_goal_dist", 0)
+                    c_h = avg_rc.get("cube_height", 0)
+                    p_r = avg_rc.get("phase_reach", 0)
+                    p_g = avg_rc.get("phase_grasp", 0)
+                    p_l = avg_rc.get("phase_lift", 0)
+                    print(
+                        f"  rewards  | h2o: {h2o:.3f} | o2g: {o2g:.3f} | "
+                        f"lift: {lift:.3f} | curl: {curl:.4f}"
+                    )
+                    print(
+                        f"  metrics  | h2o_d: {h2o_d:.3f} | o2g_d: {o2g_d:.3f} | "
+                        f"cube_h: {c_h:.3f} | "
+                        f"phase: R{p_r:.0%}/G{p_g:.0%}/L{p_l:.0%}"
+                    )
 
                 if self.writer:
                     self.writer.add_scalar("charts/fps", fps, global_step)
@@ -596,11 +645,6 @@ class TeacherTrainer:
                     self.writer.add_scalar("episode/length_mean", avg_length, global_step)
                     for k, v in update_metrics.items():
                         self.writer.add_scalar(f"losses/{k}", v, global_step)
-
-                    avg_rc = {}
-                    if self._rc_counts > 0:
-                        for k, v in self._rc_sums.items():
-                            avg_rc[k] = v / self._rc_counts
                     for k, v in avg_rc.items():
                         self.writer.add_scalar(f"reward/{k}", v, global_step)
 
@@ -611,6 +655,7 @@ class TeacherTrainer:
                         "episode/reward_mean": avg_reward,
                         "episode/length_mean": avg_length,
                         **{f"losses/{k}": v for k, v in update_metrics.items()},
+                        **{f"reward/{k}": v for k, v in avg_rc.items()},
                     }, step=global_step)
 
                 # Reset tracking

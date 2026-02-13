@@ -153,7 +153,8 @@ class DistillationTrainer:
         # Step environment with teacher action (to generate new observations)
         with torch.no_grad():
             action_to_apply = torch.clamp(teacher_action, -1.0, 1.0)
-        _, _, done, _ = self.env.step(action_to_apply)
+        _, _, terminated, truncated, _ = self.env.step(action_to_apply)
+        done = terminated | truncated
 
         # Reset hidden states for done environments
         done_indices = torch.where(done)[0]

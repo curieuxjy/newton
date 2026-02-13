@@ -83,7 +83,7 @@ def run_realtime_visualization(env, config):
         while plt.fignum_exists(fig.number):
             # Step environment with small random actions
             noise = torch.randn_like(actions) * 0.05
-            obs, rewards, dones, info = env.step(actions + noise)
+            obs, rewards, terminated, truncated, info = env.step(actions + noise)
 
             # Get depth data - new API shape is (num_worlds, num_cameras, height, width)
             depth_data = env.depth_image.numpy()

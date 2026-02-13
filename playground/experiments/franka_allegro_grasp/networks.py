@@ -21,7 +21,7 @@ def layer_init(layer: nn.Linear, std: float = 1.0) -> nn.Linear:
 
 
 class RunningMeanStd:
-    """Running mean and standard deviation tracker (rl_games style)."""
+    """Scalar running mean and standard deviation tracker for value normalization."""
 
     def __init__(self, shape: tuple = (), device: str = "cuda", epsilon: float = 1e-5):
         self.mean = torch.zeros(shape, dtype=torch.float32, device=device)
@@ -48,6 +48,45 @@ class RunningMeanStd:
 
     def denormalize(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sqrt(self.var) + self.mean
+
+
+class ObsRunningMeanStd:
+    """Per-feature running mean and std for observation normalization (rl_games style).
+
+    Unlike scalar RunningMeanStd (for value normalization), this maintains
+    separate statistics for each observation feature dimension.
+    """
+
+    def __init__(self, shape: tuple, device: str = "cuda", epsilon: float = 1e-5):
+        self.mean = torch.zeros(shape, dtype=torch.float32, device=device)
+        self.var = torch.ones(shape, dtype=torch.float32, device=device)
+        self.count = epsilon
+        self.epsilon = epsilon
+
+    def update(self, x: torch.Tensor):
+        """Update statistics with new observations.
+
+        Args:
+            x: Observations (..., features). All dims except last are flattened.
+        """
+        x_flat = x.reshape(-1, x.shape[-1])
+        batch_mean = x_flat.mean(dim=0)
+        batch_var = x_flat.var(dim=0, unbiased=False)
+        batch_count = x_flat.shape[0]
+
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+
+        self.mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        self.var = (m_a + m_b + delta**2 * self.count * batch_count / total_count) / total_count
+        self.count = total_count
+
+    def normalize(self, x: torch.Tensor, clip: float = 5.0) -> torch.Tensor:
+        """Normalize and clip observations."""
+        normalized = (x - self.mean) / (torch.sqrt(self.var) + self.epsilon)
+        return torch.clamp(normalized, -clip, clip)
 
 
 def _build_mlp(input_dim: int, hidden_dims: tuple, activation: str = "elu") -> nn.Sequential:
@@ -208,12 +247,15 @@ class LSTMBlock(nn.Module):
 
 
 class TeacherActorCritic(nn.Module):
-    """Teacher actor-critic with asymmetric LSTM networks.
+    """Teacher actor-critic with asymmetric LSTM networks (rl_games style).
 
-    Actor: obs -> LSTM(1024) -> LayerNorm -> MLP[512,512] -> action_mean(11)
-    Critic: critic_obs -> LSTM(2048) -> LayerNorm -> MLP[1024,512] -> value(1)
+    Actor (before_mlp=True, concat_input=True):
+        obs -> LSTM(1024) -> LayerNorm -> [concat obs] -> MLP[512,512] -> action(11)
+    Critic (before_mlp=False, concat_input=True):
+        obs -> MLP[1024,512] -> [concat obs] -> LSTM(2048) -> LayerNorm -> value(1)
 
     The actor and critic are fully separate networks (asymmetric central value).
+    Skip connections (concat_input) are critical for LSTM policy training.
     """
 
     def __init__(
@@ -235,16 +277,20 @@ class TeacherActorCritic(nn.Module):
         self.num_critic_obs = num_critic_obs
         self.num_actions = num_actions
 
-        # Actor: LSTM -> MLP -> action
+        # Actor (rl_games before_mlp=True, concat_input=True):
+        # obs -> LSTM -> [concat LSTM_out, obs] -> MLP -> action
         self.actor_lstm = LSTMBlock(num_actor_obs, actor_lstm_units, lstm_layers, lstm_layer_norm)
-        self.actor_mlp = _build_mlp(actor_lstm_units, actor_mlp_dims, activation)
+        self.actor_mlp = _build_mlp(actor_lstm_units + num_actor_obs, actor_mlp_dims, activation)
         self.actor_mean = layer_init(nn.Linear(actor_mlp_dims[-1], num_actions), std=0.01)
         self.actor_log_std = nn.Parameter(torch.full((num_actions,), init_sigma))
 
-        # Critic: LSTM -> MLP -> value (asymmetric, separate network)
-        self.critic_lstm = LSTMBlock(num_critic_obs, critic_lstm_units, lstm_layers, lstm_layer_norm)
-        self.critic_mlp = _build_mlp(critic_lstm_units, critic_mlp_dims, activation)
-        self.critic_head = layer_init(nn.Linear(critic_mlp_dims[-1], 1))
+        # Critic (rl_games before_mlp=False, concat_input=True):
+        # obs -> MLP -> [concat MLP_out, obs] -> LSTM -> value
+        self.critic_mlp = _build_mlp(num_critic_obs, critic_mlp_dims, activation)
+        self.critic_lstm = LSTMBlock(
+            critic_mlp_dims[-1] + num_critic_obs, critic_lstm_units, lstm_layers, lstm_layer_norm
+        )
+        self.critic_head = layer_init(nn.Linear(critic_lstm_units, 1))
 
     def forward_actor(
         self,
@@ -252,13 +298,17 @@ class TeacherActorCritic(nn.Module):
         hidden: tuple[torch.Tensor, torch.Tensor] | None = None,
         dones: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, tuple]:
-        """Actor forward pass.
+        """Actor forward pass (before_mlp=True, concat_input=True).
+
+        Flow: obs -> LSTM -> [concat LSTM_out, obs] -> MLP -> action
 
         Returns:
             action_mean, action_std, new_hidden
         """
         lstm_out, new_hidden = self.actor_lstm(obs, hidden, dones)
-        features = self.actor_mlp(lstm_out)
+        # Skip connection: concat LSTM output with original input
+        features = torch.cat([lstm_out, obs], dim=-1)
+        features = self.actor_mlp(features)
         action_mean = self.actor_mean(features)
 
         log_std = torch.clamp(self.actor_log_std, min=-5.0, max=2.0)
@@ -272,14 +322,18 @@ class TeacherActorCritic(nn.Module):
         hidden: tuple[torch.Tensor, torch.Tensor] | None = None,
         dones: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple]:
-        """Critic forward pass.
+        """Critic forward pass (before_mlp=False, concat_input=True).
+
+        Flow: obs -> MLP -> [concat MLP_out, obs] -> LSTM -> value
 
         Returns:
             value, new_hidden
         """
-        lstm_out, new_hidden = self.critic_lstm(obs, hidden, dones)
-        features = self.critic_mlp(lstm_out)
-        value = self.critic_head(features).squeeze(-1)
+        mlp_out = self.critic_mlp(obs)
+        # Skip connection: concat MLP output with original input
+        lstm_input = torch.cat([mlp_out, obs], dim=-1)
+        lstm_out, new_hidden = self.critic_lstm(lstm_input, hidden, dones)
+        value = self.critic_head(lstm_out).squeeze(-1)
         return value, new_hidden
 
     def get_action_and_value(
@@ -301,6 +355,8 @@ class TeacherActorCritic(nn.Module):
         # Actor
         action_mean, action_std, new_actor_hidden = self.forward_actor(actor_obs, actor_hidden, dones)
         action_mean = torch.nan_to_num(action_mean, nan=0.0, posinf=1.0, neginf=-1.0)
+        action_std = torch.nan_to_num(action_std, nan=1.0, posinf=1.0, neginf=0.01)
+        action_std = torch.clamp(action_std, min=1e-6)
 
         dist = Normal(action_mean, action_std)
         if action is None:

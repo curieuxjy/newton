@@ -681,15 +681,15 @@ class FrankaAllegroGraspEnv:
         # Compute rewards
         rewards = self._compute_rewards()
 
-        # Check termination
-        dones = self._compute_dones()
+        # Check termination (separated for proper value bootstrapping)
+        terminated, truncated = self._compute_dones()
 
         # Auto-reset done environments
-        done_env_ids = torch.where(dones)[0]
+        done_env_ids = torch.where(terminated | truncated)[0]
         if len(done_env_ids) > 0:
             self.reset(done_env_ids)
 
-        return obs, rewards, dones, self.info_buf
+        return obs, rewards, terminated, truncated, self.info_buf
 
     def _update_fabric_state(self):
         """Update fabric state (q, qd, qdd) from current targets."""
@@ -1033,13 +1033,20 @@ class FrankaAllegroGraspEnv:
             grasp_features_for_reward, self.config.cube_size
         )
 
-        # === DEXTRAH Total Reward (4 core components, no success bonus) ===
+        # 5. Success bonus (DEXTRAH: in_success_region_at_rest_weight = 10.0)
+        success_bonus = self.config.in_success_region_weight * in_success_region.float()
+
+        # === DEXTRAH Total Reward (4 core components + success bonus) ===
         reward = (
             hand_to_object_reward +
             object_to_goal_reward +
             finger_curl_reg +  # This is negative (penalty)
-            lift_reward
+            lift_reward +
+            success_bonus
         )
+
+        # Apply reward scaling (DEXTRAH: reward_shaper.scale_value = 0.01)
+        reward = reward * self.config.reward_scale
 
         # === Update task phase (for logging/visualization) ===
         reached = hand_to_object_dist < self.config.hand_to_object_dist_threshold
@@ -1064,20 +1071,20 @@ class FrankaAllegroGraspEnv:
             self.successes
         )
 
-        # Total reward (DEXTRAH: no extra penalties)
         self.reward_buf = reward
 
-        # Store components for logging
+        # Store components for logging (unscaled for readability)
         phase_0_mask = self.task_phase == 0
         phase_1_mask = self.task_phase == 1
         phase_2_mask = self.task_phase == 2
 
         self.reward_components = {
-            # DEXTRAH reward components (4 core, no success bonus)
+            # DEXTRAH reward components (5 core, unscaled)
             "hand_to_object_reward": hand_to_object_reward.mean().item(),
             "object_to_goal_reward": object_to_goal_reward.mean().item(),
             "finger_curl_reg": finger_curl_reg.mean().item(),
             "lift_reward": lift_reward.mean().item(),
+            "success_bonus": success_bonus.mean().item(),
             # Distances
             "hand_to_object_dist": hand_to_object_dist.mean().item(),
             "object_to_goal_dist": object_to_goal_dist.mean().item(),
@@ -1097,20 +1104,45 @@ class FrankaAllegroGraspEnv:
 
         return self.reward_buf
 
-    def _compute_dones(self) -> torch.Tensor:
-        """Check termination conditions."""
+    def _compute_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Check termination conditions.
+
+        Returns:
+            terminated: True failure (object out of reach). Value = 0.
+            truncated: Timeout (max episode length). Value should be bootstrapped.
+        """
         body_q = torch.from_numpy(self.state_0.body_q.numpy()).to(self.torch_device)
         body_q_reshaped = body_q.reshape(self.num_envs, self.bodies_per_env, 7)
 
         cube_pos = body_q_reshaped[:, self.cube_body_idx, :3]
 
-        # Termination conditions
+        # Workspace bounds from table geometry + margin (DEXTRAH-style)
+        margin = self.config.workspace_margin
+        tx, ty = self.config.table_pos
+        tsx, tsy, _ = self.config.table_size
+        x_min = tx - tsx / 2 - margin
+        x_max = tx + tsx / 2 + margin
+        y_min = ty - tsy / 2 - margin
+        y_max = ty + tsy / 2 + margin
+
+        # Failure: object out of workspace (XY bounds + Z fall)
+        out_of_reach = (
+            (cube_pos[:, 0] < x_min)
+            | (cube_pos[:, 0] > x_max)
+            | (cube_pos[:, 1] < y_min)
+            | (cube_pos[:, 1] > y_max)
+            | (cube_pos[:, 2] < self.config.z_height_cutoff)
+        )
+
+        # Timeout: episode length exceeded
         timeout = self.episode_step >= self.max_episode_length
-        cube_fell = cube_pos[:, 2] < self.config.fall_height - 0.1
 
-        self.done_buf = timeout | cube_fell
+        terminated = out_of_reach & ~timeout  # Pure failure (not also timeout)
+        truncated = timeout
 
-        return self.done_buf
+        self.done_buf = terminated | truncated
+
+        return terminated, truncated
 
     def close(self):
         """Clean up resources."""
