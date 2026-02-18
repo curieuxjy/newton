@@ -1,7 +1,7 @@
-﻿newton.SAPSortType
+﻿newton.Heightfield
 ==================
 
-.. autoclass:: newton.SAPSortType
+.. autoclass:: newton.Heightfield
    :members:
    :undoc-members:
    :show-inheritance:
