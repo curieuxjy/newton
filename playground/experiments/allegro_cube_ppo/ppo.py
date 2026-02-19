@@ -1,4 +1,12 @@
-"""PPO algorithm implementation (CleanRL style) for Newton environments."""
+"""PPO algorithm implementation for Newton environments.
+
+Supports both LSTM and MLP architectures matching the DextrEme paper (Section 4).
+
+Paper architecture:
+    Actor:  LSTM(1024, layer_norm) + MLP [512, 512] + ELU
+    Critic: LSTM(2048, layer_norm) + MLP [1024, 512] + ELU
+    Separate optimizers: actor lr=1e-4 (linear), critic lr=5e-5 (fixed)
+"""
 
 import torch
 import torch.nn as nn
@@ -63,115 +71,321 @@ def layer_init(layer: nn.Linear, std: float = 0.01) -> nn.Linear:
     return layer
 
 
+def _build_mlp(input_dim: int, hidden_dims: tuple, act_fn, use_layer_norm: bool) -> tuple[nn.Sequential, int]:
+    """Build an MLP with optional layer normalization.
+
+    Returns:
+        (sequential_module, output_dim)
+    """
+    layers = []
+    prev = input_dim
+    for dim in hidden_dims:
+        layers.append(layer_init(nn.Linear(prev, dim), std=1.0))
+        if use_layer_norm:
+            layers.append(nn.LayerNorm(dim))
+        layers.append(act_fn())
+        prev = dim
+    return nn.Sequential(*layers), prev
+
+
 class ActorCritic(nn.Module):
-    """Actor-Critic network for continuous action spaces."""
+    """Separate actor-critic networks supporting LSTM and MLP architectures.
 
-    def __init__(
-        self,
-        num_obs: int,
-        num_actions: int,
-        hidden_dims: tuple[int, ...] = (256, 256, 128),
-        activation: str = "elu",
-        init_sigma: float = 0.0,
-    ):
+    LSTM mode (paper):
+        Actor:  obs -> LSTM(1024) -> LayerNorm -> MLP[512,512] -> action_mean
+        Critic: obs -> LSTM(2048) -> LayerNorm -> MLP[1024,512] -> value
+    MLP mode (simplified):
+        Actor:  obs -> MLP[512,512,256,128] with LayerNorm -> action_mean
+        Critic: obs -> MLP[512,512,256,128] with LayerNorm -> value
+
+    Both modes have completely separate actor/critic parameters (no shared network).
+    """
+
+    def __init__(self, num_obs: int, num_actions: int, config: PPOConfig):
         super().__init__()
-
+        self.network_type = config.network_type
         self.num_obs = num_obs
         self.num_actions = num_actions
+        self.use_layer_norm = config.use_layer_norm
 
-        # Activation function
-        if activation == "elu":
-            act_fn = nn.ELU
-        elif activation == "relu":
-            act_fn = nn.ReLU
-        elif activation == "tanh":
-            act_fn = nn.Tanh
-        else:
-            act_fn = nn.ELU
+        act_fn = nn.ELU
 
-        # Shared feature extractor
-        layers = []
-        prev_dim = num_obs
-        for dim in hidden_dims:
-            layers.append(layer_init(nn.Linear(prev_dim, dim), std=1.0))
-            layers.append(act_fn())
-            prev_dim = dim
-        self.shared = nn.Sequential(*layers)
+        if config.network_type == "lstm":
+            self.actor_lstm_size = config.actor_lstm_size
+            self.critic_lstm_size = config.critic_lstm_size
 
-        # Actor head (mean)
-        self.actor_mean = layer_init(nn.Linear(prev_dim, num_actions), std=0.01)
+            # Actor: LSTM(1024) + LayerNorm + MLP [512, 512]
+            self.actor_lstm = nn.LSTM(num_obs, config.actor_lstm_size, num_layers=1, batch_first=False)
+            if config.use_layer_norm:
+                self.actor_lstm_ln = nn.LayerNorm(config.actor_lstm_size)
+            self.actor_mlp, actor_out = _build_mlp(
+                config.actor_lstm_size, config.actor_mlp_dims, act_fn, config.use_layer_norm
+            )
+            self.actor_mean = layer_init(nn.Linear(actor_out, num_actions), std=0.01)
 
-        # Actor log std (learnable parameter)
-        # Initialize from config (DextrEme: 0.0 → σ=1.0 for wide exploration)
-        self.actor_log_std = nn.Parameter(torch.full((num_actions,), init_sigma))
+            # Critic: LSTM(2048) + LayerNorm + MLP [1024, 512]
+            self.critic_lstm = nn.LSTM(num_obs, config.critic_lstm_size, num_layers=1, batch_first=False)
+            if config.use_layer_norm:
+                self.critic_lstm_ln = nn.LayerNorm(config.critic_lstm_size)
+            self.critic_mlp, critic_out = _build_mlp(
+                config.critic_lstm_size, config.critic_mlp_dims, act_fn, config.use_layer_norm
+            )
+            self.critic_value = layer_init(nn.Linear(critic_out, 1), std=1.0)
 
-        # Critic head
-        self.critic = layer_init(nn.Linear(prev_dim, 1), std=1.0)
+        else:  # MLP mode
+            self.actor_lstm_size = 0
+            self.critic_lstm_size = 0
 
-    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass returning action mean and value."""
-        features = self.shared(obs)
-        action_mean = self.actor_mean(features)
-        value = self.critic(features)
-        return action_mean, value
+            # Separate actor MLP
+            self.actor_mlp, actor_out = _build_mlp(
+                num_obs, config.mlp_hidden_dims, act_fn, config.use_layer_norm
+            )
+            self.actor_mean = layer_init(nn.Linear(actor_out, num_actions), std=0.01)
 
-    def get_action_and_value(
-        self, obs: torch.Tensor, action: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Get action, log prob, entropy, value, action mean, and action std.
+            # Separate critic MLP
+            self.critic_mlp, critic_out = _build_mlp(
+                num_obs, config.mlp_hidden_dims, act_fn, config.use_layer_norm
+            )
+            self.critic_value = layer_init(nn.Linear(critic_out, 1), std=1.0)
+
+        # Learnable log_std (DextrEme: init 0.0 -> sigma=1.0 for wide exploration)
+        self.actor_log_std = nn.Parameter(torch.full((num_actions,), config.init_sigma))
+
+    @property
+    def is_lstm(self) -> bool:
+        return self.network_type == "lstm"
+
+    def actor_parameters(self) -> list[nn.Parameter]:
+        """Return actor parameters for separate optimizer."""
+        params = list(self.actor_mlp.parameters()) + list(self.actor_mean.parameters()) + [self.actor_log_std]
+        if self.is_lstm:
+            params += list(self.actor_lstm.parameters())
+            if self.use_layer_norm:
+                params += list(self.actor_lstm_ln.parameters())
+        return params
+
+    def critic_parameters(self) -> list[nn.Parameter]:
+        """Return critic parameters for separate optimizer."""
+        params = list(self.critic_mlp.parameters()) + list(self.critic_value.parameters())
+        if self.is_lstm:
+            params += list(self.critic_lstm.parameters())
+            if self.use_layer_norm:
+                params += list(self.critic_lstm_ln.parameters())
+        return params
+
+    def init_hidden(self, num_envs: int, device: str) -> dict | None:
+        """Initialize LSTM hidden states. Returns None for MLP."""
+        if not self.is_lstm:
+            return None
+        return {
+            "actor": (
+                torch.zeros(1, num_envs, self.actor_lstm_size, device=device),
+                torch.zeros(1, num_envs, self.actor_lstm_size, device=device),
+            ),
+            "critic": (
+                torch.zeros(1, num_envs, self.critic_lstm_size, device=device),
+                torch.zeros(1, num_envs, self.critic_lstm_size, device=device),
+            ),
+        }
+
+    def reset_hidden(self, hidden: dict, env_ids: torch.Tensor) -> dict:
+        """Zero hidden states for specified environments."""
+        if hidden is None:
+            return None
+        hidden["actor"][0][:, env_ids] = 0
+        hidden["actor"][1][:, env_ids] = 0
+        hidden["critic"][0][:, env_ids] = 0
+        hidden["critic"][1][:, env_ids] = 0
+        return hidden
+
+    def _sanitize_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        obs = torch.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
+        return torch.clamp(obs, -100.0, 100.0)
+
+    def _get_action_std(self) -> torch.Tensor:
+        log_std_clamped = torch.clamp(self.actor_log_std, min=-5.0, max=2.0)
+        return torch.exp(log_std_clamped)
+
+    def _actor_features(self, obs: torch.Tensor, hidden=None):
+        """Compute actor features from observation.
 
         Args:
-            obs: Observation tensor
-            action: If provided, compute log prob for this action
+            obs: (B, obs_dim) for single step
+            hidden: (h, c) LSTM state or None
 
         Returns:
-            action, log_prob, entropy, value, action_mean, action_std
+            features: (B, mlp_out_dim)
+            new_hidden: (h, c) or None
         """
-        # Sanitize input observations
-        obs = torch.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
-        obs = torch.clamp(obs, -100.0, 100.0)
+        if self.is_lstm:
+            obs_seq = obs.unsqueeze(0)  # (1, B, obs_dim)
+            lstm_out, new_hidden = self.actor_lstm(obs_seq, hidden)
+            if self.use_layer_norm:
+                lstm_out = self.actor_lstm_ln(lstm_out)
+            features = self.actor_mlp(lstm_out.squeeze(0))
+            return features, new_hidden
+        else:
+            features = self.actor_mlp(obs)
+            return features, None
 
-        features = self.shared(obs)
-        action_mean = self.actor_mean(features)
+    def _critic_features(self, obs: torch.Tensor, hidden=None):
+        """Compute critic features from observation."""
+        if self.is_lstm:
+            obs_seq = obs.unsqueeze(0)
+            lstm_out, new_hidden = self.critic_lstm(obs_seq, hidden)
+            if self.use_layer_norm:
+                lstm_out = self.critic_lstm_ln(lstm_out)
+            features = self.critic_mlp(lstm_out.squeeze(0))
+            return features, new_hidden
+        else:
+            features = self.critic_mlp(obs)
+            return features, None
 
-        # Clamp log_std (rl_games style: wider range for exploration)
-        # min=-5.0 → σ=0.007, max=2.0 → σ=7.39
-        log_std_clamped = torch.clamp(self.actor_log_std, min=-5.0, max=2.0)
-        action_std = torch.exp(log_std_clamped)
+    def get_action_and_value(
+        self, obs: torch.Tensor, action: torch.Tensor | None = None, hidden: dict | None = None
+    ) -> tuple:
+        """Single-step forward pass (for rollout collection and MLP training).
 
-        # Replace NaN in action_mean with zeros
+        Returns:
+            action, log_prob, entropy, value, action_mean, action_std, new_hidden
+        """
+        obs = self._sanitize_obs(obs)
+        actor_hidden = hidden["actor"] if hidden else None
+        critic_hidden = hidden["critic"] if hidden else None
+
+        # Actor
+        actor_feat, new_actor_hidden = self._actor_features(obs, actor_hidden)
+        action_mean = self.actor_mean(actor_feat)
         action_mean = torch.nan_to_num(action_mean, nan=0.0, posinf=1.0, neginf=-1.0)
+        action_std = self._get_action_std()
 
         dist = Normal(action_mean, action_std)
-
         if action is None:
             action = dist.sample()
-
         log_prob = dist.log_prob(action).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
-        value = self.critic(features).squeeze(-1)
 
-        return action, log_prob, entropy, value, action_mean, action_std
+        # Critic
+        critic_feat, new_critic_hidden = self._critic_features(obs, critic_hidden)
+        value = self.critic_value(critic_feat).squeeze(-1)
 
-    def get_value(self, obs: torch.Tensor) -> torch.Tensor:
-        """Get value estimate for observations."""
-        # Sanitize input observations
-        obs = torch.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
-        obs = torch.clamp(obs, -100.0, 100.0)
+        new_hidden = None
+        if hidden is not None:
+            new_hidden = {"actor": new_actor_hidden, "critic": new_critic_hidden}
 
-        features = self.shared(obs)
-        return self.critic(features).squeeze(-1)
+        return action, log_prob, entropy, value, action_mean, action_std, new_hidden
+
+    def evaluate_actions_sequence(
+        self,
+        obs_seq: torch.Tensor,
+        actions_seq: torch.Tensor,
+        dones_seq: torch.Tensor,
+        actor_hidden_init: tuple,
+        critic_hidden_init: tuple,
+    ) -> tuple:
+        """Evaluate actions over a sequence for LSTM training (BPTT).
+
+        Processes the sequence step by step, resetting hidden states at
+        episode boundaries (where done=True).
+
+        Args:
+            obs_seq: (T, B, obs_dim)
+            actions_seq: (T, B, act_dim)
+            dones_seq: (T, B)
+            actor_hidden_init: (h, c) each (1, B, actor_lstm_size)
+            critic_hidden_init: (h, c) each (1, B, critic_lstm_size)
+
+        Returns:
+            log_probs (T*B,), entropy (T*B,), values (T*B,),
+            action_means (T*B, act_dim), action_stds (act_dim,)
+        """
+        T, B = obs_seq.shape[:2]
+        obs_seq = self._sanitize_obs(obs_seq)
+
+        # --- Actor LSTM: step by step with done-based hidden reset ---
+        actor_h, actor_c = actor_hidden_init
+        actor_features_list = []
+        for t in range(T):
+            if t > 0:
+                # Zero hidden for envs that terminated at previous step
+                not_done = (1.0 - dones_seq[t - 1]).unsqueeze(0).unsqueeze(-1)
+                actor_h = actor_h * not_done
+                actor_c = actor_c * not_done
+            lstm_out, (actor_h, actor_c) = self.actor_lstm(obs_seq[t : t + 1], (actor_h, actor_c))
+            if self.use_layer_norm:
+                lstm_out = self.actor_lstm_ln(lstm_out)
+            actor_features_list.append(lstm_out.squeeze(0))
+
+        actor_features = torch.stack(actor_features_list)  # (T, B, lstm_size)
+        actor_mlp_out = self.actor_mlp(actor_features)  # (T, B, mlp_out)
+        action_means = self.actor_mean(actor_mlp_out)  # (T, B, act_dim)
+        action_means = torch.nan_to_num(action_means, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        action_stds = self._get_action_std()
+        dist = Normal(action_means, action_stds)
+        log_probs = dist.log_prob(actions_seq).sum(dim=-1)  # (T, B)
+        entropy = dist.entropy().sum(dim=-1)  # (T, B)
+
+        # --- Critic LSTM: step by step with done-based hidden reset ---
+        critic_h, critic_c = critic_hidden_init
+        critic_features_list = []
+        for t in range(T):
+            if t > 0:
+                not_done = (1.0 - dones_seq[t - 1]).unsqueeze(0).unsqueeze(-1)
+                critic_h = critic_h * not_done
+                critic_c = critic_c * not_done
+            lstm_out, (critic_h, critic_c) = self.critic_lstm(obs_seq[t : t + 1], (critic_h, critic_c))
+            if self.use_layer_norm:
+                lstm_out = self.critic_lstm_ln(lstm_out)
+            critic_features_list.append(lstm_out.squeeze(0))
+
+        critic_features = torch.stack(critic_features_list)  # (T, B, lstm_size)
+        critic_mlp_out = self.critic_mlp(critic_features)
+        values = self.critic_value(critic_mlp_out).squeeze(-1)  # (T, B)
+
+        return (
+            log_probs.reshape(-1),
+            entropy.reshape(-1),
+            values.reshape(-1),
+            action_means.reshape(-1, action_means.shape[-1]),
+            action_stds,
+        )
+
+    def get_value(self, obs: torch.Tensor, hidden: dict | None = None) -> tuple:
+        """Get value estimate.
+
+        Returns:
+            (value, new_hidden)
+        """
+        obs = self._sanitize_obs(obs)
+        critic_hidden = hidden["critic"] if hidden else None
+        critic_feat, new_critic_hidden = self._critic_features(obs, critic_hidden)
+        value = self.critic_value(critic_feat).squeeze(-1)
+        new_hidden = None
+        if hidden is not None:
+            new_hidden = {"actor": hidden["actor"], "critic": new_critic_hidden}
+        return value, new_hidden
 
 
 class RolloutBuffer:
-    """Buffer for storing rollout data."""
+    """Buffer for storing rollout data. Supports both MLP and LSTM modes."""
 
-    def __init__(self, num_steps: int, num_envs: int, num_obs: int, num_actions: int, device: str):
+    def __init__(
+        self,
+        num_steps: int,
+        num_envs: int,
+        num_obs: int,
+        num_actions: int,
+        device: str,
+        actor_lstm_size: int = 0,
+        critic_lstm_size: int = 0,
+    ):
         self.num_steps = num_steps
         self.num_envs = num_envs
         self.device = device
+        self.is_lstm = actor_lstm_size > 0
 
-        # Storage
+        # Standard storage
         self.observations = torch.zeros(num_steps, num_envs, num_obs, device=device)
         self.actions = torch.zeros(num_steps, num_envs, num_actions, device=device)
         self.action_means = torch.zeros(num_steps, num_envs, num_actions, device=device)
@@ -184,7 +398,23 @@ class RolloutBuffer:
         self.advantages = torch.zeros(num_steps, num_envs, device=device)
         self.returns = torch.zeros(num_steps, num_envs, device=device)
 
+        # LSTM: store initial hidden state (at the start of rollout)
+        if self.is_lstm:
+            self.initial_actor_h = torch.zeros(1, num_envs, actor_lstm_size, device=device)
+            self.initial_actor_c = torch.zeros(1, num_envs, actor_lstm_size, device=device)
+            self.initial_critic_h = torch.zeros(1, num_envs, critic_lstm_size, device=device)
+            self.initial_critic_c = torch.zeros(1, num_envs, critic_lstm_size, device=device)
+
         self.step = 0
+
+    def set_initial_hidden(self, hidden: dict):
+        """Store LSTM hidden states at the start of a rollout."""
+        if hidden is None:
+            return
+        self.initial_actor_h.copy_(hidden["actor"][0])
+        self.initial_actor_c.copy_(hidden["actor"][1])
+        self.initial_critic_h.copy_(hidden["critic"][0])
+        self.initial_critic_c.copy_(hidden["critic"][1])
 
     def add(
         self,
@@ -224,12 +454,10 @@ class RolloutBuffer:
 
         self.returns = self.advantages + self.values
 
-    def get_batches(self, num_minibatches: int):
-        """Generate minibatches for training."""
+    def get_batches(self, minibatch_size: int):
+        """Generate random minibatches for MLP training."""
         batch_size = self.num_steps * self.num_envs
-        minibatch_size = batch_size // num_minibatches
 
-        # Flatten data
         obs_flat = self.observations.reshape(-1, self.observations.shape[-1])
         actions_flat = self.actions.reshape(-1, self.actions.shape[-1])
         action_means_flat = self.action_means.reshape(-1, self.action_means.shape[-1])
@@ -238,7 +466,6 @@ class RolloutBuffer:
         returns_flat = self.returns.reshape(-1)
         values_flat = self.values.reshape(-1)
 
-        # Random permutation
         indices = torch.randperm(batch_size, device=self.device)
 
         for start in range(0, batch_size, minibatch_size):
@@ -255,13 +482,52 @@ class RolloutBuffer:
                 action_means_flat[batch_indices],
             )
 
+    def get_sequential_batches(self, minibatch_size: int):
+        """Generate sequential minibatches for LSTM training.
+
+        Preserves temporal ordering. Each batch is a subset of environments
+        processed over the full sequence length (num_steps).
+
+        minibatch_size is total timesteps per batch:
+            envs_per_batch = minibatch_size // num_steps
+        """
+        envs_per_batch = minibatch_size // self.num_steps
+        env_indices = torch.randperm(self.num_envs, device=self.device)
+
+        for start in range(0, self.num_envs, envs_per_batch):
+            end = min(start + envs_per_batch, self.num_envs)
+            batch_env_ids = env_indices[start:end]
+
+            yield (
+                self.observations[:, batch_env_ids],  # (T, B, obs_dim)
+                self.actions[:, batch_env_ids],  # (T, B, act_dim)
+                self.log_probs[:, batch_env_ids],  # (T, B)
+                self.advantages[:, batch_env_ids],  # (T, B)
+                self.returns[:, batch_env_ids],  # (T, B)
+                self.values[:, batch_env_ids],  # (T, B)
+                self.action_means[:, batch_env_ids],  # (T, B, act_dim)
+                self.dones[:, batch_env_ids],  # (T, B)
+                (
+                    self.initial_actor_h[:, batch_env_ids].contiguous(),
+                    self.initial_actor_c[:, batch_env_ids].contiguous(),
+                ),
+                (
+                    self.initial_critic_h[:, batch_env_ids].contiguous(),
+                    self.initial_critic_c[:, batch_env_ids].contiguous(),
+                ),
+            )
+
     def reset(self):
         """Reset buffer for new rollout."""
         self.step = 0
 
 
 class PPO:
-    """Proximal Policy Optimization algorithm."""
+    """Proximal Policy Optimization with separate actor/critic optimizers.
+
+    Paper: actor lr=1e-4 with linear schedule, critic lr=5e-5 fixed.
+    Supports both "linear" (paper best) and "adaptive" (rl_games KL-based) LR schedules.
+    """
 
     def __init__(
         self,
@@ -273,27 +539,31 @@ class PPO:
         self.config = config
         self.device = device
 
-        self.optimizer = optim.Adam(actor_critic.parameters(), lr=config.learning_rate)
+        # Separate optimizers (paper: different LR for actor and critic)
+        self.actor_optimizer = optim.Adam(actor_critic.actor_parameters(), lr=config.learning_rate)
+        self.critic_optimizer = optim.Adam(actor_critic.critic_parameters(), lr=config.critic_learning_rate)
 
         # Value normalization (DextrEme: normalize_value = True)
         self.value_normalizer = RunningMeanStd(device=device) if config.normalize_value else None
 
-    def update(self, buffer: RolloutBuffer) -> dict[str, float]:
-        """Update policy using PPO algorithm (rl_games style).
-
-        Matches rl_games behavior:
-        - Analytical Gaussian KL divergence
-        - No KL-based early stopping (rl_games doesn't use it)
-        - Clipped value loss
-        - Bounds loss on action mean (mu) with soft bound 1.1
-        - Adaptive LR: /1.5 decrease, *1.5 increase, applied per epoch
+    def update(self, buffer: RolloutBuffer, update_num: int = 0, total_updates: int = 1) -> dict[str, float]:
+        """Update policy using PPO algorithm.
 
         Args:
             buffer: Rollout buffer with collected data
+            update_num: Current update number (for linear LR schedule)
+            total_updates: Total number of updates (for linear LR schedule)
 
         Returns:
             Dictionary of training metrics
         """
+        # Linear LR schedule for actor (applied at start of each update)
+        if self.config.lr_schedule == "linear" and total_updates > 1:
+            progress = update_num / total_updates
+            new_actor_lr = max(self.config.learning_rate * (1.0 - progress), 1e-6)
+            for pg in self.actor_optimizer.param_groups:
+                pg["lr"] = new_actor_lr
+
         # Normalize advantages
         advantages = buffer.advantages.reshape(-1)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -313,33 +583,57 @@ class PPO:
         total_kl = 0.0
         num_updates = 0
 
-        kl_threshold = self.config.kl_threshold
-        lr_schedule = self.config.lr_schedule
-        bounds_loss_coef = self.config.bounds_loss_coef
-
         for epoch in range(self.config.num_epochs):
             epoch_kl = 0.0
             epoch_batches = 0
 
-            for obs, actions, old_log_probs, advs, returns, old_values, old_mu in buffer.get_batches(
-                self.config.num_minibatches
-            ):
-                # Get current policy outputs (including mu and sigma)
-                _, new_log_probs, entropy, new_values, new_mu, new_sigma = (
-                    self.actor_critic.get_action_and_value(obs, actions)
-                )
+            if self.actor_critic.is_lstm:
+                batch_iter = buffer.get_sequential_batches(self.config.minibatch_size)
+            else:
+                batch_iter = buffer.get_batches(self.config.minibatch_size)
 
-                # Policy loss (clipped surrogate objective)
+            for batch_data in batch_iter:
+                if self.actor_critic.is_lstm:
+                    (
+                        obs_seq,
+                        actions_seq,
+                        old_log_probs_seq,
+                        advs_seq,
+                        returns_seq,
+                        old_values_seq,
+                        old_mu_seq,
+                        dones_seq,
+                        actor_h0,
+                        critic_h0,
+                    ) = batch_data
+
+                    new_log_probs, entropy, new_values, new_mu, new_sigma = (
+                        self.actor_critic.evaluate_actions_sequence(
+                            obs_seq, actions_seq, dones_seq, actor_h0, critic_h0
+                        )
+                    )
+
+                    # Flatten old data for loss computation
+                    old_log_probs = old_log_probs_seq.reshape(-1)
+                    advs = advs_seq.reshape(-1)
+                    returns = returns_seq.reshape(-1)
+                    old_values = old_values_seq.reshape(-1)
+                    old_mu = old_mu_seq.reshape(-1, old_mu_seq.shape[-1])
+                else:
+                    obs, actions, old_log_probs, advs, returns, old_values, old_mu = batch_data
+
+                    _, new_log_probs, entropy, new_values, new_mu, new_sigma, _ = (
+                        self.actor_critic.get_action_and_value(obs, actions)
+                    )
+
+                # --- Policy loss (clipped surrogate objective) ---
                 log_ratio = new_log_probs - old_log_probs
                 ratio = torch.exp(log_ratio)
-
                 pg_loss1 = -advs * ratio
                 pg_loss2 = -advs * torch.clamp(ratio, 1 - self.config.clip_epsilon, 1 + self.config.clip_epsilon)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
-                # Clipped value loss (rl_games style)
-                # Normalize returns and old_values if value normalization is enabled
-                # (critic predicts in normalized space, so compare in normalized space)
+                # --- Clipped value loss ---
                 if self.value_normalizer is not None:
                     norm_returns = self.value_normalizer.normalize(returns)
                     norm_old_values = self.value_normalizer.normalize(old_values)
@@ -356,30 +650,33 @@ class PPO:
                 value_loss_clipped = (value_pred_clipped - norm_returns) ** 2
                 value_loss = 0.5 * torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
-                # Entropy loss
+                # --- Entropy loss ---
                 entropy_loss = entropy.mean()
 
-                # Bounds loss on action mean (rl_games style: penalize mu, soft bound 1.1)
+                # --- Bounds loss on action mean (rl_games style) ---
                 soft_bound = 1.1
                 mu_loss_high = torch.clamp_min(new_mu - soft_bound, 0.0) ** 2
                 mu_loss_low = torch.clamp_max(new_mu + soft_bound, 0.0) ** 2
                 bounds_loss = (mu_loss_high + mu_loss_low).sum(dim=-1).mean()
 
-                # Total loss
-                loss = (
-                    pg_loss
-                    + self.config.value_coef * value_loss
-                    - self.config.entropy_coef * entropy_loss
-                    + bounds_loss_coef * bounds_loss
-                )
+                # --- Separate losses for actor and critic ---
+                actor_loss = pg_loss - self.config.entropy_coef * entropy_loss + self.config.bounds_loss_coef * bounds_loss
+                critic_loss = self.config.value_coef * value_loss
 
-                # Gradient step
-                self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.config.max_grad_norm)
-                self.optimizer.step()
+                # --- Gradient steps ---
+                self.actor_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
 
-                # Analytical Gaussian KL divergence (rl_games style, no grad)
+                actor_loss.backward()
+                critic_loss.backward()
+
+                nn.utils.clip_grad_norm_(self.actor_critic.actor_parameters(), self.config.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.actor_critic.critic_parameters(), self.config.max_grad_norm)
+
+                self.actor_optimizer.step()
+                self.critic_optimizer.step()
+
+                # --- Analytical Gaussian KL divergence ---
                 with torch.no_grad():
                     kl = gaussian_kl(old_mu, old_sigma.expand_as(old_mu), new_mu, new_sigma.expand_as(new_mu))
 
@@ -388,26 +685,24 @@ class PPO:
                 total_value_loss += value_loss.item()
                 total_entropy_loss += entropy_loss.item()
                 total_bounds_loss += bounds_loss.item()
-                total_loss += loss.item()
+                total_loss += (actor_loss + critic_loss).item()
                 total_kl += kl.item()
                 num_updates += 1
                 epoch_kl += kl.item()
                 epoch_batches += 1
 
-            # Adaptive LR per epoch (rl_games style: applied after each mini-epoch)
-            avg_epoch_kl = epoch_kl / max(epoch_batches, 1)
-            if lr_schedule == "adaptive":
-                current_lr = self.optimizer.param_groups[0]["lr"]
-                if avg_epoch_kl > kl_threshold * 2.0:
+            # Adaptive LR per epoch (only for actor, only if schedule is adaptive)
+            if self.config.lr_schedule == "adaptive":
+                avg_epoch_kl = epoch_kl / max(epoch_batches, 1)
+                current_lr = self.actor_optimizer.param_groups[0]["lr"]
+                if avg_epoch_kl > self.config.kl_threshold * 2.0:
                     new_lr = max(current_lr / 1.5, 1e-6)
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = new_lr
-                elif avg_epoch_kl < kl_threshold * 0.5:
+                    for pg in self.actor_optimizer.param_groups:
+                        pg["lr"] = new_lr
+                elif avg_epoch_kl < self.config.kl_threshold * 0.5:
                     new_lr = min(current_lr * 1.5, 1e-2)
-                    for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = new_lr
-
-        avg_kl = total_kl / max(num_updates, 1)
+                    for pg in self.actor_optimizer.param_groups:
+                        pg["lr"] = new_lr
 
         return {
             "policy_loss": total_pg_loss / max(num_updates, 1),
@@ -415,8 +710,9 @@ class PPO:
             "entropy": total_entropy_loss / max(num_updates, 1),
             "bounds_loss": total_bounds_loss / max(num_updates, 1),
             "total_loss": total_loss / max(num_updates, 1),
-            "kl_divergence": avg_kl,
-            "learning_rate": self.optimizer.param_groups[0]["lr"],
+            "kl_divergence": total_kl / max(num_updates, 1),
+            "actor_learning_rate": self.actor_optimizer.param_groups[0]["lr"],
+            "critic_learning_rate": self.critic_optimizer.param_groups[0]["lr"],
         }
 
     def save(self, path: str):
@@ -424,7 +720,8 @@ class PPO:
         torch.save(
             {
                 "actor_critic": self.actor_critic.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
+                "actor_optimizer": self.actor_optimizer.state_dict(),
+                "critic_optimizer": self.critic_optimizer.state_dict(),
             },
             path,
         )
@@ -433,4 +730,5 @@ class PPO:
         """Load model checkpoint."""
         checkpoint = torch.load(path, map_location=self.device)
         self.actor_critic.load_state_dict(checkpoint["actor_critic"])
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        self.actor_optimizer.load_state_dict(checkpoint["actor_optimizer"])
+        self.critic_optimizer.load_state_dict(checkpoint["critic_optimizer"])

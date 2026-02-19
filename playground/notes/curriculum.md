@@ -197,8 +197,8 @@ uv run -m newton.examples robot_panda_hydro
 - IK + 물리 시뮬레이션 통합
 
 **핵심 개념:**
-- `SDFHydroelasticConfig` - Hydroelastic 접촉
-- `CollisionPipeline` + `BroadPhaseMode` - 충돌 파이프라인
+- Hydroelastic 접촉
+- `model.collide()` + `model.contacts()` - 충돌 감지
 - IK + 물리 + 조작 계획 통합
 - 그리퍼 제어
 
@@ -298,7 +298,7 @@ model = builder.finalize()
 **주요 파라미터:**
 - `floating`: 로봇이 공중에 떠있을 수 있는지 (휴머노이드는 True, 고정 팔은 False)
 - `scale`: 모델 크기 조정
-- `ignore_inertial_definitions`: True면 지오메트리에서 관성 계산 (기본값)
+- `ignore_inertial_definitions`: True면 지오메트리에서 관성 계산 (기본값: False, 파일 정의 존중)
 
 ---
 
@@ -306,7 +306,7 @@ model = builder.finalize()
 
 ```python
 builder = newton.ModelBuilder()
-builder.default_shape_cfg.mu = 0.75  # 마찰 계수
+builder.default_shape_cfg.mu = 0.75  # 마찰 계수 (기본값: 1.0)
 
 builder.add_mjcf(
     "/path/to/my_robot.xml",
@@ -427,15 +427,14 @@ class Example:
 
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
-        self.collision_pipeline = newton.examples.create_collision_pipeline(self.model, args)
-        self.contacts = self.model.collide(self.state_0, collision_pipeline=self.collision_pipeline)
+        self.contacts = self.model.collide(self.state_0)
 
         self.viewer.set_model(self.model)
 
     def step(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
-            self.contacts = self.model.collide(self.state_0, collision_pipeline=self.collision_pipeline)
+            self.contacts = self.model.collide(self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
         self.sim_time += self.frame_dt

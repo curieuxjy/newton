@@ -2,7 +2,6 @@
 
 import os
 import time
-from dataclasses import asdict
 from datetime import datetime
 
 import torch
@@ -37,7 +36,6 @@ def init_wandb(config: TrainConfig, actor_critic: ActorCritic) -> bool:
             print("[WARN] wandb not installed. Run: pip install wandb")
         return False
 
-    # Flatten config for wandb
     wandb_config = {
         "seed": config.seed,
         "device": config.device,
@@ -52,18 +50,42 @@ def init_wandb(config: TrainConfig, actor_critic: ActorCritic) -> bool:
         "rot_reward_scale": config.env.rot_reward_scale,
         "action_penalty_scale": config.env.action_penalty_scale,
         # PPO config
+        "network_type": config.ppo.network_type,
         "learning_rate": config.ppo.learning_rate,
+        "critic_learning_rate": config.ppo.critic_learning_rate,
+        "lr_schedule": config.ppo.lr_schedule,
         "gamma": config.ppo.gamma,
         "gae_lambda": config.ppo.gae_lambda,
         "clip_epsilon": config.ppo.clip_epsilon,
         "entropy_coef": config.ppo.entropy_coef,
         "value_coef": config.ppo.value_coef,
         "num_epochs": config.ppo.num_epochs,
-        "num_minibatches": config.ppo.num_minibatches,
+        "minibatch_size": config.ppo.minibatch_size,
         "rollout_steps": config.ppo.rollout_steps,
         "total_timesteps": config.ppo.total_timesteps,
-        "hidden_dims": config.ppo.hidden_dims,
+        "use_layer_norm": config.ppo.use_layer_norm,
+        # DR config
+        "dr_mode": config.dr.mode,
     }
+    if config.dr.mode == "adr":
+        wandb_config.update({
+            "adr_boundary_fraction": config.dr.adr_boundary_fraction,
+            "adr_queue_length": config.dr.adr_queue_length,
+            "adr_threshold_high": config.dr.adr_threshold_high,
+            "adr_threshold_low": config.dr.adr_threshold_low,
+        })
+    # Architecture-specific config
+    if config.ppo.network_type == "lstm":
+        wandb_config.update(
+            {
+                "actor_lstm_size": config.ppo.actor_lstm_size,
+                "critic_lstm_size": config.ppo.critic_lstm_size,
+                "actor_mlp_dims": config.ppo.actor_mlp_dims,
+                "critic_mlp_dims": config.ppo.critic_mlp_dims,
+            }
+        )
+    else:
+        wandb_config["mlp_hidden_dims"] = config.ppo.mlp_hidden_dims
 
     wandb.init(
         project=config.wandb.project,
@@ -76,7 +98,6 @@ def init_wandb(config: TrainConfig, actor_critic: ActorCritic) -> bool:
         save_code=True,
     )
 
-    # Watch model for gradient tracking
     wandb.watch(actor_critic, log="gradients", log_freq=100)
 
     print(f"[INFO] wandb initialized: {wandb.run.url}")
@@ -85,7 +106,6 @@ def init_wandb(config: TrainConfig, actor_critic: ActorCritic) -> bool:
 
 def train(config: TrainConfig):
     """Main training loop."""
-    # Set random seeds
     torch.manual_seed(config.seed)
 
     device = config.device
@@ -93,7 +113,7 @@ def train(config: TrainConfig):
 
     # Create environment
     print("[INFO] Creating environment...")
-    env = AllegroHandCubeEnv(config.env, device=device, headless=True)
+    env = AllegroHandCubeEnv(config.env, device=device, headless=True, dr_config=config.dr)
     print(f"[INFO] Num envs: {env.num_envs}")
     print(f"[INFO] Obs dim: {env.num_obs}, Action dim: {env.num_actions}")
 
@@ -101,11 +121,13 @@ def train(config: TrainConfig):
     actor_critic = ActorCritic(
         num_obs=env.num_obs,
         num_actions=env.num_actions,
-        hidden_dims=config.ppo.hidden_dims,
-        activation=config.ppo.activation,
-        init_sigma=config.ppo.init_sigma,
+        config=config.ppo,
     )
-    print(f"[INFO] Actor-Critic parameters: {sum(p.numel() for p in actor_critic.parameters()):,}")
+    num_params = sum(p.numel() for p in actor_critic.parameters())
+    num_actor = sum(p.numel() for p in actor_critic.actor_parameters())
+    num_critic = sum(p.numel() for p in actor_critic.critic_parameters())
+    print(f"[INFO] Network type: {config.ppo.network_type}")
+    print(f"[INFO] Total parameters: {num_params:,} (actor: {num_actor:,}, critic: {num_critic:,})")
 
     # Create PPO algorithm
     ppo = PPO(actor_critic, config.ppo, device=device)
@@ -128,6 +150,8 @@ def train(config: TrainConfig):
         num_obs=env.num_obs,
         num_actions=env.num_actions,
         device=device,
+        actor_lstm_size=config.ppo.actor_lstm_size if config.ppo.network_type == "lstm" else 0,
+        critic_lstm_size=config.ppo.critic_lstm_size if config.ppo.network_type == "lstm" else 0,
     )
 
     # Create checkpoint directory
@@ -140,8 +164,9 @@ def train(config: TrainConfig):
     num_updates = config.ppo.total_timesteps // (config.ppo.rollout_steps * env.num_envs)
     print(f"[INFO] Total updates: {num_updates}")
 
-    # Initialize environment
+    # Initialize environment and LSTM hidden states
     obs = env.reset()
+    hidden = actor_critic.init_hidden(env.num_envs, device)  # None for MLP
     global_step = 0
     start_time = time.time()
 
@@ -162,14 +187,19 @@ def train(config: TrainConfig):
     for update in range(1, num_updates + 1):
         update_start = time.time()
 
-        # Collect rollout
+        # Store initial hidden state for LSTM training
         buffer.reset()
+        if actor_critic.is_lstm:
+            buffer.set_initial_hidden(hidden)
+
+        # Collect rollout
         for step in range(config.ppo.rollout_steps):
             with torch.no_grad():
-                action, log_prob, _, value, action_mean, _ = actor_critic.get_action_and_value(obs)
-                # Clamp actions to valid range before environment step
+                action, log_prob, _, value, action_mean, _, hidden = actor_critic.get_action_and_value(
+                    obs, hidden=hidden
+                )
                 action = torch.clamp(action, -1.0, 1.0)
-                # Denormalize value for GAE computation (critic predicts in normalized space)
+                # Denormalize value (critic predicts in normalized space)
                 if ppo.value_normalizer is not None:
                     value = ppo.value_normalizer.denormalize(value)
 
@@ -201,12 +231,15 @@ def train(config: TrainConfig):
                 episode_rewards[idx] = 0
                 episode_lengths[idx] = 0
 
+            # Reset LSTM hidden states for done environments
+            if hidden is not None and len(done_indices) > 0:
+                hidden = actor_critic.reset_hidden(hidden, done_indices)
+
             obs = next_obs
 
         # Compute returns and advantages
         with torch.no_grad():
-            last_value = actor_critic.get_value(obs)
-            # Denormalize last_value (critic predicts in normalized space)
+            last_value, _ = actor_critic.get_value(obs, hidden=hidden)
             if ppo.value_normalizer is not None:
                 last_value = ppo.value_normalizer.denormalize(last_value)
         buffer.compute_returns_and_advantages(last_value, config.ppo.gamma, config.ppo.gae_lambda)
@@ -216,7 +249,7 @@ def train(config: TrainConfig):
             ppo.value_normalizer.update(buffer.returns)
 
         # PPO update
-        metrics = ppo.update(buffer)
+        metrics = ppo.update(buffer, update_num=update, total_updates=num_updates)
 
         # Logging
         if update % config.log_interval == 0:
@@ -236,7 +269,8 @@ def train(config: TrainConfig):
                 f"VL {metrics['value_loss']:7.4f} | "
                 f"Ent {metrics['entropy']:6.3f} | "
                 f"KL {metrics['kl_divergence']:.4f} | "
-                f"LR {metrics['learning_rate']:.2e}"
+                f"aLR {metrics['actor_learning_rate']:.2e} | "
+                f"cLR {metrics['critic_learning_rate']:.2e}"
             )
 
             # Compute average reward components
@@ -249,14 +283,24 @@ def train(config: TrainConfig):
             if avg_reward_components:
                 rc = avg_reward_components
                 print(
-                    f"  Rewards: rot={rc.get('rot_reward', 0):.2f} "
-                    f"dist={rc.get('dist_penalty', 0):.2f} "
+                    f"  Rewards: rot={rc.get('rot_rew', 0):.2f} "
+                    f"dist={rc.get('dist_rew', 0):.2f} "
                     f"act={rc.get('action_penalty', 0):.3f} "
-                    f"vel={rc.get('vel_penalty', 0):.3f} "
-                    f"fall={rc.get('fall_penalty', 0):.2f} "
+                    f"vel={rc.get('velocity_penalty', 0):.3f} "
+                    f"goal={rc.get('reach_goal_rew', 0):.2f} "
                     f"| rot_dist={rc.get('rot_dist', 0):.3f} "
-                    f"cube_dist={rc.get('cube_dist', 0):.3f}"
+                    f"goal_dist={rc.get('goal_dist', 0):.3f} "
+                    f"successes={rc.get('consecutive_successes', 0):.1f}"
                 )
+
+            # Split reward components: adr/ keys → randomization/, rest → reward/
+            reward_logs = {}
+            adr_logs = {}
+            for key, val in avg_reward_components.items():
+                if key.startswith("adr/"):
+                    adr_logs[f"randomization/{key}"] = val
+                else:
+                    reward_logs[f"reward/{key}"] = val
 
             # TensorBoard logging
             if writer:
@@ -264,35 +308,34 @@ def train(config: TrainConfig):
                 writer.add_scalar("train/value_loss", metrics["value_loss"], global_step)
                 writer.add_scalar("train/entropy", metrics["entropy"], global_step)
                 writer.add_scalar("train/kl_divergence", metrics["kl_divergence"], global_step)
-                writer.add_scalar("train/learning_rate", metrics["learning_rate"], global_step)
+                writer.add_scalar("train/actor_learning_rate", metrics["actor_learning_rate"], global_step)
+                writer.add_scalar("train/critic_learning_rate", metrics["critic_learning_rate"], global_step)
                 writer.add_scalar("episode/reward_mean", avg_reward, global_step)
                 writer.add_scalar("episode/length_mean", avg_length, global_step)
                 writer.add_scalar("perf/fps", fps, global_step)
-                # Log reward components
-                for key, val in avg_reward_components.items():
-                    writer.add_scalar(f"reward/{key}", val, global_step)
+                for key, val in reward_logs.items():
+                    writer.add_scalar(key, val, global_step)
+                for key, val in adr_logs.items():
+                    writer.add_scalar(key, val, global_step)
 
             # Wandb logging
             if use_wandb:
                 log_dict = {
-                    # Training metrics
                     "train/policy_loss": metrics["policy_loss"],
                     "train/value_loss": metrics["value_loss"],
                     "train/entropy": metrics["entropy"],
                     "train/total_loss": metrics["total_loss"],
                     "train/kl_divergence": metrics["kl_divergence"],
-                    "train/learning_rate": metrics["learning_rate"],
-                    # Episode metrics
+                    "train/actor_learning_rate": metrics["actor_learning_rate"],
+                    "train/critic_learning_rate": metrics["critic_learning_rate"],
                     "episode/reward_mean": avg_reward,
                     "episode/length_mean": avg_length,
-                    # Performance
                     "perf/fps": fps,
                     "perf/global_step": global_step,
                     "perf/update": update,
                 }
-                # Add reward components
-                for key, val in avg_reward_components.items():
-                    log_dict[f"reward/{key}"] = val
+                log_dict.update(reward_logs)
+                log_dict.update(adr_logs)
                 wandb.log(log_dict, step=global_step)
 
             # Reset episode tracking
@@ -308,20 +351,28 @@ def train(config: TrainConfig):
         if update % config.save_interval == 0:
             checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_{update}.pt")
             ppo.save(checkpoint_path)
-            print(f"[INFO] Saved checkpoint: {checkpoint_path}")
 
-            # Save to wandb
+            # Save ADR state alongside PPO checkpoint
+            if env.adr is not None:
+                adr_path = os.path.join(checkpoint_dir, f"adr_{update}.pt")
+                torch.save(env.adr.state_dict(), adr_path)
+                print(f"[INFO] Saved checkpoint: {checkpoint_path} + ADR: {adr_path}")
+            else:
+                print(f"[INFO] Saved checkpoint: {checkpoint_path}")
+
             if use_wandb and config.wandb.save_model:
                 wandb.save(checkpoint_path)
 
     # Final save
     final_path = os.path.join(checkpoint_dir, "final.pt")
     ppo.save(final_path)
+    if env.adr is not None:
+        adr_final_path = os.path.join(checkpoint_dir, "adr_final.pt")
+        torch.save(env.adr.state_dict(), adr_final_path)
     print(f"[INFO] Training complete! Final model saved to: {final_path}")
 
     # Finalize wandb
     if use_wandb:
-        # Save final model as artifact
         if config.wandb.save_model:
             artifact = wandb.Artifact(
                 name=f"{config.experiment_name}_model",
@@ -334,7 +385,6 @@ def train(config: TrainConfig):
         wandb.finish()
         print("[INFO] wandb run finished")
 
-    # Close TensorBoard
     if writer:
         writer.close()
 
@@ -351,6 +401,14 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Checkpoint directory")
+    parser.add_argument(
+        "--network-type", type=str, default="lstm", choices=["lstm", "mlp"], help="Network type: lstm (paper) or mlp"
+    )
+    # DR arguments
+    parser.add_argument(
+        "--dr-mode", type=str, default="adr", choices=["off", "static", "adr"],
+        help="Domain randomisation mode: off, static, or adr (vectorised ADR)"
+    )
     # Wandb arguments
     parser.add_argument("--wandb", action="store_true", default=True, help="Enable wandb logging")
     parser.add_argument("--no-wandb", action="store_false", dest="wandb", help="Disable wandb logging")
@@ -367,6 +425,10 @@ def main():
     )
     config.env.num_envs = args.num_envs
     config.ppo.total_timesteps = args.total_timesteps
+    config.ppo.network_type = args.network_type
+
+    # DR config
+    config.dr.mode = args.dr_mode
 
     # Wandb config
     config.wandb.enabled = args.wandb

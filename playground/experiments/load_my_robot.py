@@ -93,9 +93,8 @@ class Example:
         # 순운동학 계산 (초기 포즈 설정)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
-        # 충돌 파이프라인
-        self.collision_pipeline = newton.examples.create_collision_pipeline(self.model, self.args)
-        self.contacts = self.model.collide(self.state_0, collision_pipeline=self.collision_pipeline)
+        # 충돌 감지
+        self.contacts = self.model.collide(self.state_0)
 
         self.viewer.set_model(self.model)
 
@@ -117,7 +116,7 @@ class Example:
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.viewer.apply_forces(self.state_0)
-            self.contacts = self.model.collide(self.state_0, collision_pipeline=self.collision_pipeline)
+            self.contacts = self.model.collide(self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 

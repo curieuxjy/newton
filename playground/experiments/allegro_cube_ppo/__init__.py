@@ -11,19 +11,24 @@ Usage:
     from playground.experiments.allegro_cube_ppo import AllegroHandCubeEnv, PPO, train
 """
 
-from .config import EnvConfig, PPOConfig, TrainConfig, WandbConfig
+from .adr import ADRManager, ADRParamDef, make_default_adr_params
+from .config import DRConfig, EnvConfig, PPOConfig, TrainConfig, WandbConfig
 from .env import AllegroHandCubeEnv
 from .ppo import ActorCritic, PPO, RolloutBuffer
 from .train import train
 
 __all__ = [
+    "ADRManager",
+    "ADRParamDef",
     "AllegroHandCubeEnv",
     "ActorCritic",
+    "DRConfig",
     "PPO",
     "RolloutBuffer",
     "EnvConfig",
     "PPOConfig",
     "TrainConfig",
     "WandbConfig",
+    "make_default_adr_params",
     "train",
 ]

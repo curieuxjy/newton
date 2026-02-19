@@ -1,16 +1,17 @@
 # Allegro Hand Cube Rotation with PPO
 
 Newton 물리 엔진을 사용한 Allegro Hand 큐브 회전 강화학습 예제입니다.
-IsaacGymEnvs의 [DextrEme](https://github.com/isaac-sim/IsaacGymEnvs/tree/main/isaacgymenvs/tasks/dextreme)를 참고하여 구현되었습니다.
+IsaacGymEnvs의 [DextrEme ManualDR](https://github.com/isaac-sim/IsaacGymEnvs/tree/main/isaacgymenvs/tasks/dextreme)를 참고하여 구현되었습니다.
 
 ## 프로젝트 구조
 
 ```
 allegro_cube_ppo/
 ├── __init__.py      # 패키지 export
-├── config.py        # 하이퍼파라미터 설정 (DextrEme 스타일)
+├── adr.py           # Vectorised ADR (DextrEme paper Section 4)
+├── config.py        # 하이퍼파라미터 설정 (DextrEme ManualDR 정렬)
 ├── env.py           # AllegroHandCubeEnv (Newton 기반 환경)
-├── ppo.py           # PPO 알고리즘 (rl_games 스타일)
+├── ppo.py           # PPO 알고리즘 (LSTM + 분리 actor/critic)
 ├── train.py         # 학습 스크립트
 ├── visualize.py     # Newton viewer로 시각화
 └── README.md
@@ -20,59 +21,64 @@ allegro_cube_ppo/
 
 **목표**: Allegro Hand로 큐브를 잡고 목표 방향(quaternion)으로 회전시키기
 
-### Observation (49 dims)
+### Observation (72 dims)
 
 | 항목 | 차원 | 설명 |
 |------|------|------|
-| Joint positions (normalized) | 16 | 손가락 관절 위치 [-1, 1] |
-| Joint velocities (×0.2) | 16 | 손가락 관절 속도 |
-| Cube relative position | 3 | 손바닥 기준 큐브 위치 |
-| Cube orientation | 4 | 큐브 쿼터니언 (x,y,z,w) |
-| Cube linear velocity (×0.2) | 3 | 큐브 선속도 |
-| Cube angular velocity (×0.2) | 3 | 큐브 각속도 |
-| Goal orientation | 4 | 목표 쿼터니언 |
+| Joint positions (normalized) | 16 | 손가락 관절 위치 [-1, 1] (unscale) |
+| Joint velocities | 16 | 손가락 관절 속도 (MLP 보상용, LSTM 대체) |
+| Object pose (relative) | 7 | 손 기준 큐브 위치(3) + 쿼터니언(4) |
+| Object velocities | 6 | 큐브 선속도(3) + 각속도×0.2(3) (MLP 보상용) |
+| Goal pose (relative) | 7 | 손 기준 목표 위치(3) + 목표 쿼터니언(4) |
+| Goal relative rotation | 4 | quat_mul(obj_rot, conjugate(goal_rot)) |
+| Last actions | 16 | 이전 스텝의 액션 |
+
+DextrEme ManualDR 원본 actor inputs (50 dims)에 velocity 정보(22 dims)를 추가하여
+LSTM 없이 MLP만으로 학습할 수 있도록 보상합니다.
 
 ### Action (16 dims)
 
-- **Delta position control**: 현재 위치에서의 변화량
-- Policy 출력은 [-1, 1]로 클램핑
-- 최종 범위: [-1, 1] × action_scale (0.5)
-- joint limits로 추가 클램핑
+- **Absolute position control + EMA smoothing** (DextrEme ManualDR 스타일)
+- Policy 출력 [-1, 1] → `scale()` → [joint_lower, joint_upper]
+- EMA: `cur_targets = ema × targets + (1 - ema) × prev_targets`
+- EMA schedule: 0.2 → 0.15 over 1M frames (DextrEme paper Section 4)
 
-### Reward (DextrEme 스타일)
+### Reward (DextrEme compute_hand_reward 정확 재현)
 
 ```python
-reward = rot_reward + dist_penalty - action_penalty - action_delta_penalty - vel_penalty + success_bonus + fall_penalty
+reward = dist_rew + rot_rew + action_penalty + action_delta_penalty
+       + velocity_penalty + reach_goal_rew + fall_rew + timeout_rew
 ```
 
-| 항목 | 공식 | 설명 |
-|------|------|------|
-| **Rotation reward** | `1.0 / (rot_dist + 0.1)` | 쿼터니언 정렬 보상 |
-| **Distance penalty** | `-10.0 × dist` | 큐브가 손에서 멀어지면 페널티 |
-| **Action penalty** | `-0.0001 × Σ(a²)` | 액션 크기 페널티 |
-| **Action delta penalty** | `-0.01 × Σ(Δa²)` | 액션 변화율 페널티 |
-| **Velocity penalty** | `-0.05 × Σ((v/4)²)` | 관절 속도 페널티 |
-| **Success bonus** | `+250` | N회 연속 성공 시 |
-| **Fall penalty** | `0` | DextrEme 원본: 비활성화 |
+| 항목 | 공식 | Scale |
+|------|------|-------|
+| **Distance reward** | `dist × scale` | -10.0 |
+| **Rotation reward** | `1.0 / (rot_dist + eps) × scale` | 1.0 (eps=0.1) |
+| **Action penalty** | `scale × Σ(a²)` | -0.0001 |
+| **Action delta penalty** | `scale × Σ((cur_targets - prev_targets)²)` | -0.01 |
+| **Velocity penalty** | `-0.05 × Σ((v / (max_vel - tol))²)` | hardcoded |
+| **Reach goal bonus** | goal 달성 시 | +250 |
+| **Fall penalty** | dist ≥ fall_dist 시 | 0.0 (disabled) |
+| **Timeout penalty** | timeout 시 `0.5 × fall_penalty` | 0.0 |
 
 **Rotation distance (DextrEme 방식)**:
-
 ```python
 q_diff = q_cube × conjugate(q_goal)
 rot_dist = 2 × arcsin(||q_diff.xyz||)  # radians
 ```
 
-### Success Condition
+### Success Condition (DextrEme hold_count 방식)
 
-- Rotation distance < `success_tolerance` (0.4 rad ≈ 23°)
-- `consecutive_successes` (50) 회 연속 유지
-- 성공 시 새로운 랜덤 목표 생성
+- Rotation distance < `success_tolerance` (0.4 rad ≈ 23°) → hold_count 증가
+- hold_count > `num_success_hold_steps` (1) → 1 goal 달성, 새 목표 생성
+- `successes` ≥ 50 → 에피소드 리셋
+- 목표 근접 시 `progress_buf = 0` (에피소드 연장, DextrEme 원본)
 
 ### Termination
 
-- Episode timeout (600 steps = 10초)
-- 큐브 낙하 (z < 0.05m)
-- 큐브 이탈 (dist > 0.24m)
+- Episode timeout (240 steps = 8초 at 30Hz control)
+- 큐브 이탈 (dist > 0.24m from goal position)
+- 50개 goal 모두 달성
 
 ## 실행 방법
 
@@ -94,7 +100,7 @@ uv run --extra examples --extra torch-cu12 python -m playground.experiments.alle
 
 - 큐브의 현재 orientation을 3축 좌표계(RGB = XYZ)로 표시합니다
 - 목표 orientation도 동일한 방식으로 각 환경 위에 표시됩니다
-- 실제 큐브가 goal orientation에 5회 연속 도달하면 새로운 랜덤 목표가 생성됩니다
+- 실제 큐브가 goal orientation에 도달하면 새로운 랜덤 목표가 생성됩니다
 - 축 색상: **빨강(X)**, **초록(Y)**, **파랑(Z)**
 
 ## Multi-Environment 시각화 주의사항
@@ -161,15 +167,27 @@ viewer.log_lines("/my_lines", adjusted_starts, adjusted_ends, colors)
 ### 2. 학습
 
 ```bash
-# 기본 학습 (4096 envs)
+# 기본 학습 (4096 envs, LSTM, ADR enabled)
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.train \
     --num-envs 4096 \
-    --total-timesteps 100000000 \
+    --total-timesteps 100000000
+
+# MLP network (LSTM 대신)
+uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.train \
+    --num-envs 4096 \
+    --network-type mlp
+
+# DR 모드 선택
+uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.train \
+    --dr-mode adr      # Vectorised ADR (기본값)
+    # --dr-mode static # 고정 범위 DR
+    # --dr-mode off    # DR 없음
 
 # 빠른 테스트
 uv run --extra examples --extra torch-cu12 python -m playground.experiments.allegro_cube_ppo.train \
     --num-envs 256 \
     --total-timesteps 1000000 \
+    --dr-mode off \
     --no-wandb
 ```
 
@@ -185,171 +203,100 @@ uv run --extra examples --extra torch-cu12 python -m playground.experiments.alle
     --wandb-project newton-allegro-cube
 ```
 
-## 하이퍼파라미터
+## DextrEme ManualDR 원본 정렬
 
-### EnvConfig
-
-```python
-# Simulation (DextrEme: 120Hz physics, 60Hz control)
-fps: int = 120
-sim_substeps: int = 1
-control_decimation: int = 2      # 60Hz control
-episode_length: int = 600        # 10 seconds
-
-# Robot
-hand_stiffness: float = 40.0
-hand_damping: float = 2.0
-action_scale: float = 0.5
-
-# Reward (DextrEme style)
-rot_reward_scale: float = 1.0
-rot_eps: float = 0.1
-dist_reward_scale: float = -10.0
-action_penalty_scale: float = 0.0001  # DextrEme: -0.0001
-action_delta_penalty_scale: float = 0.01  # DextrEme: -0.01
-velocity_penalty_scale: float = 0.05
-
-# Success/Failure
-success_tolerance: float = 0.4   # radians (~23°)
-consecutive_successes: int = 50
-reach_goal_bonus: float = 250.0
-fall_penalty: float = 0.0        # DextrEme: 비활성화
-fall_dist: float = 0.24          # DextrEme: fallDistance = 0.24
-```
-
-### PPOConfig (DextrEme/rl_games 원본 정렬)
-
-```python
-# Learning
-learning_rate: float = 5e-4       # DextrEme: 5e-4
-lr_schedule: str = "adaptive"     # Adaptive LR based on KL
-kl_threshold: float = 0.016       # DextrEme: 0.016
-
-# Loss coefficients
-gamma: float = 0.99
-gae_lambda: float = 0.95
-clip_epsilon: float = 0.2
-entropy_coef: float = 0.0         # DextrEme: 0.0
-value_coef: float = 4.0           # DextrEme: critic_coef = 4
-bounds_loss_coef: float = 0.0001  # 액션 범위 초과 페널티
-max_grad_norm: float = 1.0
-
-# Training
-num_epochs: int = 5
-num_minibatches: int = 4
-rollout_steps: int = 16           # DextrEme: horizon_length = 16
-
-# Normalization (DextrEme: 모두 True)
-normalize_input: bool = True
-normalize_value: bool = True      # RunningMeanStd로 value target 정규화
-normalize_advantage: bool = True
-observation_clip: float = 5.0
-
-# Network (DextrEme: [512, 512, 256, 128])
-hidden_dims: tuple = (512, 512, 256, 128)
-activation: str = "elu"
-init_sigma: float = 0.0           # σ=1.0 for wide exploration
-```
-
-### PPO 알고리즘 (rl_games 원본 정렬)
-
-```python
-# Actor log_std 초기화 및 범위 제한 (rl_games 스타일)
-actor_log_std = nn.Parameter(torch.full((num_actions,), 0.0))  # σ = 1.0
-log_std_clamped = torch.clamp(actor_log_std, min=-5.0, max=2.0)  # σ ∈ [0.007, 7.39]
-
-# Analytical Gaussian KL divergence (rl_games 스타일)
-kl = log(σ1/σ0) + (σ0² + (μ0 - μ1)²) / (2σ1²) - 0.5
-
-# Adaptive LR per epoch (rl_games 스타일)
-# KL > threshold×2 → LR /= 1.5
-# KL < threshold×0.5 → LR *= 1.5
-
-# Clipped value loss (rl_games 스타일)
-value_clipped = old_values + clamp(new_values - old_values, -ε, +ε)
-value_loss = max(unclipped_loss, clipped_loss)
-
-# Bounds loss on action mean (rl_games 스타일, soft bound 1.1)
-bounds_loss = mean(clamp(μ - 1.1, 0)² + clamp(μ + 1.1, max=0)²)
-
-# RunningMeanStd value normalization (DextrEme: normalize_value = True)
-# Critic → normalized space → denormalize for GAE → normalize for value loss
-```
-
-- **KL early stopping**: 사용하지 않음 (rl_games 원본과 동일)
-- **Reward clipping**: 없음 (DextrEme 원본과 동일)
-
-## DextrEme 원본 정렬
-
-이 구현은 [IsaacGymEnvs DextrEme](https://github.com/isaac-sim/IsaacGymEnvs)의 원본 값들과 정렬되어 있습니다.
+이 구현은 [IsaacGymEnvs DextrEme ManualDR](https://github.com/isaac-sim/IsaacGymEnvs)의 원본 값들과 정렬되어 있습니다.
 
 ### Simulation
 
 | 항목 | DextrEme 원본 | 이 구현 |
 |------|-------------|--------|
-| Physics frequency | 120 Hz | 120 Hz ✓ |
-| Control frequency | 60 Hz | 60 Hz ✓ |
-| Episode length | 600 steps (10s) | 600 steps ✓ |
-| Consecutive successes | 50 | 50 ✓ |
+| Physics frequency | 120 Hz (dt=1/60, substeps=2) | 120 Hz (fps=60, substeps=2) |
+| Control frequency | 30 Hz (controlFreqInv=2) | 30 Hz (decimation=2) |
+| Episode length | 240 steps (8s at 30Hz) | 240 steps |
+| Max consecutive successes | 50 goals | 50 goals |
+| Action control | Absolute + EMA | Absolute + EMA |
+| EMA schedule | 0.2 → 0.15 over 1M frames | 0.2 → 0.15 over 1M frames |
 
 ### PPO Hyperparameters
 
 | 항목 | DextrEme 원본 | 이 구현 |
 |------|-------------|--------|
-| learning_rate | 5e-4 | 5e-4 ✓ |
-| lr_schedule | adaptive | adaptive ✓ |
-| gamma | 0.99 | 0.99 ✓ |
-| tau (gae_lambda) | 0.95 | 0.95 ✓ |
-| e_clip | 0.2 | 0.2 ✓ |
-| kl_threshold | 0.016 | 0.016 ✓ |
-| entropy_coef | 0.0 | 0.0 ✓ |
-| critic_coef (value_coef) | 4.0 | 4.0 ✓ |
-| bounds_loss_coef | 0.0001 | 0.0001 ✓ |
-| horizon_length | 16 | 16 ✓ |
-| mini_epochs | 5 | 5 ✓ |
-| network | [512,512,256,128] | [512,512,256,128] ✓ |
-| activation | elu | elu ✓ |
-| normalize_value | True | True (RunningMeanStd) ✓ |
-| normalize_input | True | True ✓ |
-| normalize_advantage | True | True ✓ |
+| actor_learning_rate | 1e-4 (linear schedule) | 1e-4 (linear schedule) |
+| critic_learning_rate | 5e-5 (fixed) | 5e-5 (fixed) |
+| gamma | 0.998 | 0.998 |
+| tau (gae_lambda) | 0.95 | 0.95 |
+| e_clip | 0.2 | 0.2 |
+| entropy_coef | 0.0 | 0.0 |
+| critic_coef (value_coef) | 4.0 | 4.0 |
+| bounds_loss_coef | 0.0001 | 0.0001 |
+| horizon_length (BPTT) | 16 | 16 |
+| mini_epochs | 4 | 4 |
+| minibatch_size | 16384 | 16384 |
+| normalize_value | True | True (RunningMeanStd) |
+| normalize_input | True | True |
+| normalize_advantage | True | True |
 
 ### PPO Algorithm (rl_games)
 
 | 항목 | rl_games 원본 | 이 구현 |
 |------|-------------|--------|
-| KL divergence | Analytical Gaussian | Analytical Gaussian ✓ |
-| KL early stopping | None | None ✓ |
-| Adaptive LR timing | Per epoch | Per epoch ✓ |
-| LR decrease factor | /1.5 | /1.5 ✓ |
-| LR increase factor | ×1.5 | ×1.5 ✓ |
-| Value loss | Clipped | Clipped ✓ |
-| Bounds loss target | Action mean (μ) | Action mean (μ) ✓ |
-| Bounds loss soft bound | 1.1 | 1.1 ✓ |
-| Value normalization | RunningMeanStd | RunningMeanStd ✓ |
-| log_std clamp | [-5.0, 2.0] | [-5.0, 2.0] ✓ |
+| KL divergence | Analytical Gaussian | Analytical Gaussian |
+| Value loss | Clipped | Clipped |
+| Bounds loss target | Action mean (μ) | Action mean (μ) |
+| Bounds loss soft bound | 1.1 | 1.1 |
+| Value normalization | RunningMeanStd | RunningMeanStd |
+| log_std clamp | [-5.0, 2.0] | [-5.0, 2.0] |
+| Actor/Critic optimizers | Separate | Separate |
 
 ### Reward Structure
 
 | 항목 | DextrEme 원본 | 이 구현 |
 |------|-------------|--------|
-| rot_reward_scale | 1.0 | 1.0 ✓ |
-| rot_eps | 0.1 | 0.1 ✓ |
-| dist_reward_scale | -10.0 | -10.0 ✓ |
-| action_penalty_scale | 0.0001 | 0.0001 ✓ |
-| action_delta_penalty_scale | 0.01 | 0.01 ✓ |
-| velocity_penalty_scale | 0.05 | 0.05 ✓ |
-| velocity_norm | 4.0 | 4.0 ✓ |
-| reach_goal_bonus | 250.0 | 250.0 ✓ |
-| fall_penalty | 0.0 (disabled) | 0.0 ✓ |
-| fall_dist | 0.24 | 0.24 ✓ |
-| success_tolerance | 0.4 rad | 0.4 rad ✓ |
-| consecutive_successes | 50 | 50 ✓ |
-| Reward clipping | None | None ✓ |
+| rot_reward_scale | 1.0 | 1.0 |
+| rot_eps | 0.1 | 0.1 |
+| dist_reward_scale | -10.0 | -10.0 |
+| action_penalty_scale | -0.0001 | -0.0001 |
+| action_delta_penalty_scale | -0.01 | -0.01 |
+| velocity_penalty (hardcoded) | -0.05, denom=4.0 | -0.05, denom=4.0 |
+| reach_goal_bonus | 250.0 | 250.0 |
+| fall_penalty | 0.0 (disabled) | 0.0 |
+| fall_dist | 0.24 | 0.24 |
+| success_tolerance | 0.4 rad | 0.4 rad |
+| num_success_hold_steps | 1 | 1 |
 
-### 주요 차이점
+### Network Architecture (DextrEme paper Section 4)
 
-- **시뮬레이터**: DextrEme는 IsaacGym 사용, 이 구현은 Newton 사용
-- **RL 라이브러리**: DextrEme는 rl_games 사용, 이 구현은 직접 구현 (알고리즘 동일)
+| 항목 | DextrEme 원본 | 이 구현 |
+|------|-------------|--------|
+| Actor | LSTM(1024) + LayerNorm + MLP [512, 512] | LSTM(1024) + LayerNorm + MLP [512, 512] |
+| Critic | LSTM(2048) + LayerNorm + MLP [1024, 512] | LSTM(2048) + LayerNorm + MLP [1024, 512] |
+| Activation | ELU | ELU |
+| LayerNorm | Yes | Yes |
+| Actor/Critic 분리 | Separate networks + separate LR | Separate networks + separate LR |
+| Observations | 50 dims (no velocity) | 72 dims (+ velocity) |
+| init_sigma | 0.0 (σ=1.0) | 0.0 (σ=1.0) |
+| MLP fallback | N/A | MLP [512, 512, 256, 128] (`--network-type mlp`) |
+
+### Vectorised ADR (DextrEme paper Section 4)
+
+| 항목 | DextrEme 원본 | 이 구현 |
+|------|-------------|--------|
+| Boundary fraction | 40% | 40% |
+| Queue length (N) | 256 | 256 |
+| Threshold high (tH) | 20 | 20 |
+| Threshold low (tL) | 5 | 5 |
+| Clear other queues | Yes | Yes |
+| DR parameters | 7 (stiffness, damping, mass, friction×2, obs/act noise) | 7 (동일) |
+| Objective metric | consecutive successes | consecutive successes |
+| Default mode | ADR | ADR (`--dr-mode adr`) |
+
+### 주요 차이점 (의도적 변경)
+
+1. **시뮬레이터**: IsaacGym (PhysX) → Newton (MuJoCo solver)
+2. **RL 라이브러리**: rl_games → 직접 구현 (알고리즘 동일)
+3. **Observation**: 50 → 72 dims (dof_vel 16 + object_vels 6 추가)
+4. **Coordinate frame**: wrist-relative → hand-base-relative (간소화)
 
 ## 참고 자료
 
