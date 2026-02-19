@@ -25,6 +25,7 @@ from newton import ActuatorMode
 
 from .adr import ADRManager, make_default_adr_params
 from .config import DRConfig, EnvConfig
+from .rna import RandomNetworkAdversary
 
 
 def _scale(x: torch.Tensor, lower: torch.Tensor, upper: torch.Tensor) -> torch.Tensor:
@@ -310,9 +311,99 @@ class AllegroHandCubeEnv:
         self.obs_noise_scale = torch.zeros(self.num_envs, device=self.torch_device)
         self.action_noise_scale = torch.zeros(self.num_envs, device=self.torch_device)
 
+        # --- Delay buffers (DextrEme paper: Latency & Delay) ---
+        # Action delay: Bernoulli probability for exponential delay
+        self.action_delay_prob = torch.zeros(self.num_envs, device=self.torch_device)
+        # Frozen value for exponential delay: initial dof_pos from episode start
+        # (DextrEme: self.prev_actions, set once per episode, not updated mid-episode)
+        self._action_delay_frozen = torch.zeros(
+            self.num_envs, self.num_actions,
+            dtype=torch.float32, device=self.torch_device,
+        )
+        # Action latency: FIFO queue of previous actions
+        queue_size = self.config.max_action_latency + 1
+        self._action_queue = torch.zeros(
+            self.num_envs, queue_size, self.num_actions,
+            dtype=torch.float32, device=self.torch_device,
+        )
+        self.action_latency_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.torch_device,
+        )
+        # Observation delay: Bernoulli probability for exponential delay
+        self.cube_obs_delay_prob = torch.zeros(self.num_envs, device=self.torch_device)
+        # Observation refresh rate: only update cube pose every N steps
+        self.cube_pose_refresh_rate = torch.ones(
+            self.num_envs, dtype=torch.long, device=self.torch_device,
+        )
+        self.cube_pose_refresh_offset = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.torch_device,
+        )
+        # Persistent cube pose buffers for refresh + delay
+        self.obs_cube_pose_freq = torch.zeros(
+            self.num_envs, 7, dtype=torch.float32, device=self.torch_device,
+        )
+        self.obs_cube_pose = torch.zeros(
+            self.num_envs, 7, dtype=torch.float32, device=self.torch_device,
+        )
+
+        # --- Affine noise buffers (correlated per-episode + white per-step) ---
+        # Actions
+        self.affine_action_scaling = torch.ones(
+            self.num_envs, self.num_actions, dtype=torch.float32, device=self.torch_device,
+        )
+        self.affine_action_additive = torch.zeros(
+            self.num_envs, self.num_actions, dtype=torch.float32, device=self.torch_device,
+        )
+        self._affine_action_white_stdev = torch.zeros(
+            self.num_envs, device=self.torch_device,
+        )
+        # Cube pose
+        self.affine_cube_pose_scaling = torch.ones(
+            self.num_envs, 7, dtype=torch.float32, device=self.torch_device,
+        )
+        self.affine_cube_pose_additive = torch.zeros(
+            self.num_envs, 7, dtype=torch.float32, device=self.torch_device,
+        )
+        self._affine_cube_pose_white_stdev = torch.zeros(
+            self.num_envs, device=self.torch_device,
+        )
+        # Dof pos
+        self.affine_dof_pos_scaling = torch.ones(
+            self.num_envs, self.num_actions, dtype=torch.float32, device=self.torch_device,
+        )
+        self.affine_dof_pos_additive = torch.zeros(
+            self.num_envs, self.num_actions, dtype=torch.float32, device=self.torch_device,
+        )
+        self._affine_dof_pos_white_stdev = torch.zeros(
+            self.num_envs, device=self.torch_device,
+        )
+
+        # --- RNA (Random Network Adversary) ---
+        self.rna: RandomNetworkAdversary | None = None
+        self.rna_alpha = torch.zeros(
+            self.num_envs, 1, dtype=torch.float32, device=self.torch_device,
+        )
+
+        # --- Random Pose Injection (DextrEme paper: Section B.4) ---
+        # Per-env probability of injecting a random cube pose each step
+        self.random_cube_pose_prob = torch.zeros(self.num_envs, device=self.torch_device)
+
         dr = self.dr_config
         if dr.mode == "off":
             return
+
+        # Initialise RNA if enabled
+        if self.config.enable_rna:
+            rna_in_dims = self.num_actions + 7  # dof_pos + object_pose
+            self.rna = RandomNetworkAdversary(
+                num_envs=self.num_envs,
+                in_dims=rna_in_dims,
+                out_dims=self.num_actions,
+                softmax_bins=self.config.rna_softmax_bins,
+                device=self.torch_device,
+            )
+            print(f"[INFO] RNA enabled: in={rna_in_dims}, out={self.num_actions}, "
+                  f"bins={self.config.rna_softmax_bins}")
 
         if dr.mode == "adr":
             params = make_default_adr_params(
@@ -334,7 +425,7 @@ class AllegroHandCubeEnv:
                   f"{dr.adr_boundary_fraction*100:.0f}% boundary workers")
 
         elif dr.mode == "static":
-            print(f"[INFO] Static DR enabled")
+            print("[INFO] Static DR enabled")
 
     def _apply_domain_randomization(self, env_ids: torch.Tensor):
         """Sample and apply domain randomisation for reset environments.
@@ -371,6 +462,36 @@ class AllegroHandCubeEnv:
             dr_vals["obs_noise"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
             lo, hi = dr.action_noise_range
             dr_vals["action_noise"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            # Delay parameters (static DR)
+            lo, hi = dr.cube_obs_delay_prob_range
+            dr_vals["cube_obs_delay_prob"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            lo, hi = dr.action_delay_prob_range
+            dr_vals["action_delay_prob"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            lo, hi = dr.action_latency_range
+            dr_vals["action_latency"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            lo, hi = dr.cube_pose_refresh_rate_range
+            dr_vals["cube_pose_refresh_rate"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            # Affine noise (static DR: use same range for scaling/additive/white)
+            lo, hi = dr.affine_action_noise_range
+            dr_vals["affine_action_scaling"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            dr_vals["affine_action_additive"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            dr_vals["affine_action_white"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            lo, hi = dr.affine_cube_pose_noise_range
+            dr_vals["affine_cube_pose_scaling"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            dr_vals["affine_cube_pose_additive"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            dr_vals["affine_cube_pose_white"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            lo, hi = dr.affine_dof_pos_noise_range
+            dr_vals["affine_dof_pos_scaling"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            dr_vals["affine_dof_pos_additive"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            dr_vals["affine_dof_pos_white"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            # RNA alpha (static DR)
+            lo, hi = dr.rna_alpha_range
+            dr_vals["rna_alpha"] = torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            # Random pose injection probability (static DR)
+            lo, hi = dr.random_pose_injection_prob_range
+            dr_vals["random_pose_injection_prob"] = (
+                torch.rand(num, device=self.torch_device) * (hi - lo) + lo
+            )
 
         env_ids_np = env_ids.cpu().numpy()
 
@@ -421,6 +542,76 @@ class AllegroHandCubeEnv:
         # --- Store per-env noise scales ---
         self.obs_noise_scale[env_ids] = dr_vals["obs_noise"]
         self.action_noise_scale[env_ids] = dr_vals["action_noise"]
+
+        # --- Delay parameters ---
+        self.cube_obs_delay_prob[env_ids] = dr_vals["cube_obs_delay_prob"]
+        self.action_delay_prob[env_ids] = dr_vals["action_delay_prob"]
+
+        # Action latency: categorical sampling with noise for blending
+        latency_raw = dr_vals["action_latency"]
+        noise = -(torch.rand_like(latency_raw) - 0.5)
+        self.action_latency_steps[env_ids] = torch.clamp(
+            (latency_raw + noise).round().long(),
+            min=0, max=self.config.max_action_latency,
+        )
+
+        # Observation refresh rate: categorical sampling with noise
+        refresh_raw = dr_vals["cube_pose_refresh_rate"]
+        noise = -(torch.rand_like(refresh_raw) - 0.5)
+        self.cube_pose_refresh_rate[env_ids] = torch.clamp(
+            (refresh_raw + noise).round().long(),
+            min=1, max=self.config.max_obs_refresh_delay,
+        )
+        # DextrEme: offset = round(rand * rate - 0.5), gives [0, rate-1] per env
+        self.cube_pose_refresh_offset[env_ids] = (
+            torch.rand(num, device=self.torch_device)
+            * self.cube_pose_refresh_rate[env_ids].float()
+            - 0.5
+        ).round().long().clamp(min=0)
+
+        # --- Affine noise (correlated per-episode) ---
+        # Action affine
+        stdev = ADRManager.gaussian_stdev(dr_vals["affine_action_scaling"])
+        self.affine_action_scaling[env_ids] = 1.0 + (
+            torch.randn(num, self.num_actions, device=self.torch_device)
+            * stdev.unsqueeze(1)
+        )
+        stdev = ADRManager.gaussian_stdev(dr_vals["affine_action_additive"])
+        self.affine_action_additive[env_ids] = (
+            torch.randn(num, self.num_actions, device=self.torch_device)
+            * stdev.unsqueeze(1)
+        )
+        self._affine_action_white_stdev[env_ids] = dr_vals["affine_action_white"]
+
+        # Cube pose affine
+        stdev = ADRManager.gaussian_stdev(dr_vals["affine_cube_pose_scaling"])
+        self.affine_cube_pose_scaling[env_ids] = 1.0 + (
+            torch.randn(num, 7, device=self.torch_device) * stdev.unsqueeze(1)
+        )
+        stdev = ADRManager.gaussian_stdev(dr_vals["affine_cube_pose_additive"])
+        self.affine_cube_pose_additive[env_ids] = (
+            torch.randn(num, 7, device=self.torch_device) * stdev.unsqueeze(1)
+        )
+        self._affine_cube_pose_white_stdev[env_ids] = dr_vals["affine_cube_pose_white"]
+
+        # Dof pos affine
+        stdev = ADRManager.gaussian_stdev(dr_vals["affine_dof_pos_scaling"])
+        self.affine_dof_pos_scaling[env_ids] = 1.0 + (
+            torch.randn(num, self.num_actions, device=self.torch_device)
+            * stdev.unsqueeze(1)
+        )
+        stdev = ADRManager.gaussian_stdev(dr_vals["affine_dof_pos_additive"])
+        self.affine_dof_pos_additive[env_ids] = (
+            torch.randn(num, self.num_actions, device=self.torch_device)
+            * stdev.unsqueeze(1)
+        )
+        self._affine_dof_pos_white_stdev[env_ids] = dr_vals["affine_dof_pos_white"]
+
+        # --- RNA alpha ---
+        self.rna_alpha[env_ids] = dr_vals["rna_alpha"].unsqueeze(1)
+
+        # --- Random pose injection probability (per-episode) ---
+        self.random_cube_pose_prob[env_ids] = dr_vals["random_pose_injection_prob"]
 
     def _simulate_step(self):
         """Run one frame of simulation."""
@@ -548,6 +739,17 @@ class AllegroHandCubeEnv:
             body_q_np[env_ids_np, 0, :3].copy()
         ).to(self.torch_device)
 
+        # --- Reset delay and noise buffers ---
+        if self.dr_config.mode != "off":
+            cube_pose_reset = torch.from_numpy(
+                body_q_np[env_ids_np, self.cube_body_offset, :7].copy()
+            ).to(self.torch_device)
+            # Reset observation delay buffers
+            self.obs_cube_pose_freq[env_ids] = cube_pose_reset
+            self.obs_cube_pose[env_ids] = cube_pose_reset
+            # Reset action queue (DextrEme style)
+            self._action_queue[env_ids] = 0.0
+
         return self._compute_observations()
 
     def reset_target_pose(self, env_ids: torch.Tensor):
@@ -592,7 +794,12 @@ class AllegroHandCubeEnv:
         self.prev_actions = self.actions.clone()
         self.actions = torch.clamp(actions.clone(), -1.0, 1.0)
 
-        self._apply_actions()
+        # Apply action delays + affine noise + RNA (DextrEme non-physics)
+        actions_for_control = self.actions
+        if self.dr_config.mode != "off":
+            actions_for_control = self._apply_action_delays_and_noise()
+
+        self._apply_actions(actions_for_control)
 
         # --- Step simulation ---
         for _ in range(self.control_decimation):
@@ -614,13 +821,24 @@ class AllegroHandCubeEnv:
 
         return obs, self.reward_buf, self.reset_buf.bool(), self.info_buf
 
-    def _apply_actions(self):
-        """Apply actions using DextrEme-style control + EMA smoothing."""
-        # Apply action noise (DR/ADR: per-env scale)
-        noisy_actions = self.actions
+    def _apply_actions(self, actions_to_apply: torch.Tensor | None = None):
+        """Apply actions using DextrEme-style control + EMA smoothing.
+
+        Args:
+            actions_to_apply: Processed actions in [-1, 1]. If None, uses
+                self.actions (raw policy output). When DR is active, this
+                should be the output of _apply_action_delays_and_noise().
+        """
+        if actions_to_apply is None:
+            actions_to_apply = self.actions
+
+        # Apply simple action noise (DR/ADR: per-env scale)
+        # Note: this is separate from affine noise which is applied in
+        # _apply_action_delays_and_noise(). Both can be active simultaneously.
+        noisy_actions = actions_to_apply
         if self.dr_config.mode != "off" and self.action_noise_scale.any():
-            act_noise = torch.randn_like(self.actions) * self.action_noise_scale.unsqueeze(1)
-            noisy_actions = torch.clamp(self.actions + act_noise, -1.0, 1.0)
+            act_noise = torch.randn_like(actions_to_apply) * self.action_noise_scale.unsqueeze(1)
+            noisy_actions = torch.clamp(actions_to_apply + act_noise, -1.0, 1.0)
 
         if self.config.use_relative_control:
             # DextrEme relative: targets = prev + speed_scale * dt * actions
@@ -659,6 +877,160 @@ class AllegroHandCubeEnv:
             control_np, dtype=wp.float32, device=self.device
         )
 
+    def _apply_action_delays_and_noise(self) -> torch.Tensor:
+        """Apply action latency, exponential delay, affine noise, and RNA.
+
+        DextrEme pipeline (allegro_hand_dextreme.py apply_actions + apply_action_noise_latency):
+            1. On reset: fill action queue and frozen value with current dof positions
+            2. Shift FIFO queue, insert current action
+            3. Action latency: select action from k steps ago
+            4. Exponential delay: Bernoulli mask, when delayed use frozen value
+               (frozen = initial dof_pos, set once per episode, NOT persistent)
+            5. Affine noise: scaling * action + additive + white_noise
+            6. RNA: blend with random network perturbation
+
+        Returns:
+            Processed actions [num_envs, num_actions] for control
+        """
+        # 1. On first step after reset, fill queue and frozen value with current dof pos
+        refreshed = self.progress_buf == 0
+        if refreshed.any():
+            joint_q = torch.from_numpy(self.state_0.joint_q.numpy()).to(self.torch_device)
+            joint_q_r = joint_q.reshape(self.num_envs, self.joint_q_per_env)
+            joint_pos = joint_q_r[:, self.hand_joint_offset : self.hand_joint_offset + self.num_actions]
+            cur_dof_unscaled = _unscale(joint_pos, self.joint_lower, self.joint_upper)
+            self._action_queue[refreshed] = cur_dof_unscaled[refreshed].unsqueeze(1).expand(
+                -1, self._action_queue.shape[1], -1
+            )
+            # DextrEme: self.prev_actions[refreshed] = unscale(dof_pos)
+            # Set once per episode, used as fallback when delay triggers
+            self._action_delay_frozen[refreshed] = cur_dof_unscaled[refreshed]
+
+        # 2. Shift queue (index 0 = most recent)
+        self._action_queue[:, 1:] = self._action_queue[:, :-1].clone()
+        self._action_queue[:, 0] = self.actions
+
+        # 3. Action latency: select action from k steps ago
+        arange = torch.arange(self.num_envs, device=self.torch_device)
+        clamped_latency = torch.clamp(
+            self.action_latency_steps, 0, self._action_queue.shape[1] - 1
+        )
+        latency_actions = self._action_queue[arange, clamped_latency]
+
+        # 4. Exponential delay: Bernoulli mask (DextrEme apply_action_noise_latency)
+        # When delayed: use frozen initial dof_pos (NOT a persistent buffer)
+        # When not delayed: use latency-selected action from queue
+        delay_mask = (
+            torch.rand(self.num_envs, device=self.torch_device) < self.action_delay_prob
+        ).unsqueeze(1)
+        actions = latency_actions * ~delay_mask + self._action_delay_frozen * delay_mask
+
+        # 5. Affine noise: scaling * action + additive + white_noise
+        white_noise = torch.randn_like(actions) * ADRManager.gaussian_stdev(
+            self._affine_action_white_stdev
+        ).unsqueeze(1)
+        actions = self.affine_action_scaling * actions + self.affine_action_additive + white_noise
+
+        # 6. RNA: blend with random network perturbation
+        if self.rna is not None and self.rna_alpha.any():
+            # Refresh RNA weights periodically
+            if self.frame_count % self.config.rna_weight_refresh_freq == 0:
+                self.rna._refresh()
+
+            # RNA input: current dof_pos + object_pose
+            joint_q = torch.from_numpy(self.state_0.joint_q.numpy()).to(self.torch_device)
+            joint_q_r = joint_q.reshape(self.num_envs, self.joint_q_per_env)
+            dof_pos = joint_q_r[:, self.hand_joint_offset : self.hand_joint_offset + self.num_actions]
+
+            body_q = torch.from_numpy(self.state_0.body_q.numpy()).to(self.torch_device)
+            body_q_r = body_q.reshape(self.num_envs, self.num_hand_bodies, 7)
+            obj_pose = body_q_r[:, self.cube_body_offset, :7]
+
+            rna_input = torch.cat([dof_pos, obj_pose], dim=-1)
+            rna_perturbation = self.rna.get_perturbation(rna_input)
+
+            # Blend: alpha * rna + (1 - alpha) * canonical
+            actions = self.rna_alpha * rna_perturbation + (1.0 - self.rna_alpha) * actions
+
+        return torch.clamp(actions, -1.0, 1.0)
+
+    def _apply_obs_delays_and_noise(self, cube_pose: torch.Tensor) -> torch.Tensor:
+        """Apply observation noise, random pose injection, refresh rate delay, and exponential delay.
+
+        DextrEme pipeline (compute_observations):
+            1. Affine noise: scaling * pose + additive + white_noise
+            2. Random pose injection: replace pose with random pose (Bernoulli per step)
+            3. Refresh rate: only update cached pose when (t + r) mod d == 0
+            4. Exponential delay: Bernoulli freeze (keep old pose with prob p)
+
+        Args:
+            cube_pose: Current relative cube pose [N, 7] (pos + quat)
+
+        Returns:
+            Delayed and noisy cube pose [N, 7]
+        """
+        # 1. Affine noise on raw cube pose
+        white_noise = torch.randn_like(cube_pose) * ADRManager.gaussian_stdev(
+            self._affine_cube_pose_white_stdev
+        ).unsqueeze(1)
+        noisy_pose = (
+            self.affine_cube_pose_scaling * cube_pose
+            + self.affine_cube_pose_additive + white_noise
+        )
+
+        # 2. Random pose injection (DextrEme Section B.4)
+        # Occasionally inject completely random cube poses to handle pose estimator jumps
+        if self.config.enable_random_pose_injection and self.random_cube_pose_prob.any():
+            noisy_pose = self._apply_random_pose_injection(noisy_pose)
+
+        # 3. Refresh rate: update cached pose only at refresh intervals
+        update_freq = (
+            (self.progress_buf + self.cube_pose_refresh_offset) % self.cube_pose_refresh_rate
+        ) == 0
+        self.obs_cube_pose_freq[update_freq] = noisy_pose[update_freq]
+
+        # 4. Exponential delay: update only when NOT delayed
+        not_delayed = (
+            torch.rand(self.num_envs, device=self.torch_device) >= self.cube_obs_delay_prob
+        )
+        self.obs_cube_pose[not_delayed] = self.obs_cube_pose_freq[not_delayed]
+
+        return self.obs_cube_pose.clone()
+
+    def _apply_random_pose_injection(self, cube_pose: torch.Tensor) -> torch.Tensor:
+        """Inject completely random cube poses for some environments.
+
+        DextrEme: get_random_cube_observation()
+        Per-step Bernoulli mask based on per-episode probability.
+        Random pose = random position near initial cube pos + random quaternion.
+
+        Args:
+            cube_pose: Current (noisy) relative cube pose [N, 7]
+
+        Returns:
+            Pose with random injections [N, 7]
+        """
+        # Bernoulli mask: True → replace with random pose
+        inject_mask = (
+            torch.rand(self.num_envs, 1, device=self.torch_device)
+            < self.random_cube_pose_prob.unsqueeze(1)
+        )
+
+        if not inject_mask.any():
+            return cube_pose
+
+        # Generate random poses (relative to hand base, matching cube_pose frame)
+        # DextrEme: object_init_state ± 0.5 * rand_float, random quaternion
+        rand_pos = torch.rand(self.num_envs, 3, device=self.torch_device) * 2.0 - 1.0
+        # Position: near initial cube position relative to hand (goal_pos - hand_base_pos)
+        init_relative_pos = self.goal_pos - self.hand_base_pos
+        random_pos = init_relative_pos + 0.5 * rand_pos
+
+        random_rot = _random_quaternion(self.num_envs, self.torch_device)
+        random_pose = torch.cat([random_pos, random_rot], dim=-1)
+
+        return cube_pose * ~inject_mask + random_pose * inject_mask
+
     def _compute_observations(self) -> torch.Tensor:
         """Compute observations (DextrEme-compatible + velocity for MLP)."""
         joint_q = torch.from_numpy(self.state_0.joint_q.numpy()).to(self.torch_device)
@@ -684,11 +1056,34 @@ class AllegroHandCubeEnv:
         cube_angvel = body_qd_r[:, self.cube_body_offset, 3:6]
         hand_pos = body_q_r[:, 0, :3]
 
+        # Apply observation delays and affine noise (DextrEme non-physics)
+        if self.dr_config.mode != "off":
+            cube_pose = torch.cat([cube_pos - hand_pos, cube_rot], dim=-1)
+            cube_pose = self._apply_obs_delays_and_noise(cube_pose)
+            cube_pos_obs = cube_pose[:, :3]
+            cube_rot_obs = cube_pose[:, 3:7]
+
+            # Affine noise on dof_pos in joint space BEFORE unscaling (DextrEme order)
+            # DextrEme: dof_pos_randomized = scaling * dof_pos + additive + white
+            #           obs = unscale(dof_pos_randomized)
+            white_noise = torch.randn_like(joint_pos) * ADRManager.gaussian_stdev(
+                self._affine_dof_pos_white_stdev
+            ).unsqueeze(1)
+            dof_pos_noisy = (
+                self.affine_dof_pos_scaling * joint_pos
+                + self.affine_dof_pos_additive + white_noise
+            )
+            dof_pos_for_obs = _unscale(dof_pos_noisy, self.joint_lower, self.joint_upper)
+        else:
+            dof_pos_for_obs = _unscale(joint_pos, self.joint_lower, self.joint_upper)
+            cube_pos_obs = cube_pos - hand_pos
+            cube_rot_obs = cube_rot
+
         # --- Build observation (72 dims) ---
         idx = 0
 
         # [0:16] dof_pos: normalized to [-1, 1] (DextrEme unscale)
-        self.obs_buf[:, idx : idx + 16] = _unscale(joint_pos, self.joint_lower, self.joint_upper)
+        self.obs_buf[:, idx : idx + 16] = dof_pos_for_obs
         idx += 16
 
         # [16:32] dof_vel: raw joint velocities (added for MLP, not in original actor)
@@ -697,8 +1092,8 @@ class AllegroHandCubeEnv:
 
         # [32:39] object_pose: [pos_relative(3), quat(4)]
         # Position relative to hand base (simplification of wrist-relative)
-        self.obs_buf[:, idx : idx + 3] = cube_pos - hand_pos
-        self.obs_buf[:, idx + 3 : idx + 7] = cube_rot
+        self.obs_buf[:, idx : idx + 3] = cube_pos_obs
+        self.obs_buf[:, idx + 3 : idx + 7] = cube_rot_obs
         idx += 7
 
         # [39:45] object_vels: [linvel(3), angvel*0.2(3)] (added for MLP)
@@ -713,7 +1108,8 @@ class AllegroHandCubeEnv:
         idx += 7
 
         # [52:56] goal_relative_rot: quat_mul(object_rot, conjugate(goal_rot))
-        self.obs_buf[:, idx : idx + 4] = _quat_mul(cube_rot, _quat_conjugate(self.goal_rot))
+        # Uses delayed/noisy cube_rot_obs (actor sees noisy observation)
+        self.obs_buf[:, idx : idx + 4] = _quat_mul(cube_rot_obs, _quat_conjugate(self.goal_rot))
         idx += 4
 
         # [56:72] last_actions
@@ -862,8 +1258,6 @@ class AllegroHandCubeEnv:
             "fall_rew": fall_rew.mean().item(),
             "rot_dist": rot_dist.mean().item(),
             "goal_dist": goal_dist.mean().item(),
-            "successes": self.successes.float().mean().item(),
-            "consecutive_successes": self.consecutive_successes.item(),
             "act_moving_average": self.act_moving_average,
         }
 

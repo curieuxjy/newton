@@ -15,6 +15,7 @@ from .adr import ADRManager, ADRParamDef, make_default_adr_params
 from .config import DRConfig, EnvConfig, PPOConfig, TrainConfig, WandbConfig
 from .env import AllegroHandCubeEnv
 from .ppo import ActorCritic, PPO, RolloutBuffer
+from .rna import RandomNetworkAdversary
 from .train import train
 
 __all__ = [
@@ -24,6 +25,7 @@ __all__ = [
     "ActorCritic",
     "DRConfig",
     "PPO",
+    "RandomNetworkAdversary",
     "RolloutBuffer",
     "EnvConfig",
     "PPOConfig",

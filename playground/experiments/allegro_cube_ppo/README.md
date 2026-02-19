@@ -12,6 +12,7 @@ allegro_cube_ppo/
 ├── config.py        # 하이퍼파라미터 설정 (DextrEme ManualDR 정렬)
 ├── env.py           # AllegroHandCubeEnv (Newton 기반 환경)
 ├── ppo.py           # PPO 알고리즘 (LSTM + 분리 actor/critic)
+├── rna.py           # Random Network Adversary (DextrEme Section B.3)
 ├── train.py         # 학습 스크립트
 ├── visualize.py     # Newton viewer로 시각화
 └── README.md
@@ -35,6 +36,12 @@ allegro_cube_ppo/
 
 DextrEme ManualDR 원본 actor inputs (50 dims)에 velocity 정보(22 dims)를 추가하여
 LSTM 없이 MLP만으로 학습할 수 있도록 보상합니다.
+
+**DR 적용 시 관측 처리:**
+- `dof_pos`: joint space에서 affine noise 적용 후 unscale (DextrEme 원본 순서)
+- `object_pose`: affine noise → random pose injection → refresh rate gate → exponential delay
+- `goal_relative_rot`: delayed `cube_rot_obs` 사용 (actor는 noisy observation을 봄)
+- Reward 계산은 raw (non-delayed) 상태를 사용
 
 ### Action (16 dims)
 
@@ -203,9 +210,26 @@ uv run --extra examples --extra torch-cu12 python -m playground.experiments.alle
     --wandb-project newton-allegro-cube
 ```
 
-## DextrEme ManualDR 원본 정렬
+**로그 구조:**
 
-이 구현은 [IsaacGymEnvs DextrEme ManualDR](https://github.com/isaac-sim/IsaacGymEnvs)의 원본 값들과 정렬되어 있습니다.
+| 카테고리 | 항목 | 설명 |
+|----------|------|------|
+| `episode/` | `reward_mean` | 에피소드 평균 보상 |
+| | `length_mean` | 에피소드 평균 길이 |
+| | `successes` | 전체 환경 성공 합계 (정수) |
+| | `consecutive_successes` | EMA 연속 성공 (정수) |
+| | `adr_rollout_perf` | ADR rollout worker 성능 EMA |
+| | `adr_boundary_changes` | ADR boundary 변경 누적 횟수 |
+| `train/` | `policy_loss`, `value_loss`, `entropy`, `kl_divergence` | PPO 학습 메트릭 |
+| `reward/` | `rot_rew`, `dist_rew`, `action_penalty`, ... | 보상 구성 요소 |
+| `adr/lower/` | `hand_stiffness`, `cube_mass`, `action_latency`, ... | 각 ADR 파라미터 하한 |
+| `adr/upper/` | `hand_stiffness`, `cube_mass`, `action_latency`, ... | 각 ADR 파라미터 상한 |
+| `perf/` | `fps` | 학습 처리 속도 |
+
+## DextrEme 원본 코드 정렬
+
+이 구현은 [IsaacGymEnvs DextrEme](https://github.com/isaac-sim/IsaacGymEnvs)의 원본 코드와
+1:1 비교 검증되었습니다.
 
 ### Simulation
 
@@ -287,9 +311,48 @@ uv run --extra examples --extra torch-cu12 python -m playground.experiments.alle
 | Threshold high (tH) | 20 | 20 |
 | Threshold low (tL) | 5 | 5 |
 | Clear other queues | Yes | Yes |
-| DR parameters | 7 (stiffness, damping, mass, friction×2, obs/act noise) | 7 (동일) |
+| DR parameters | 22 (physics 7 + non-physics 15) | 22 (동일) |
 | Objective metric | consecutive successes | consecutive successes |
 | Default mode | ADR | ADR (`--dr-mode adr`) |
+
+### Non-Physics Randomisations (DextrEme paper Section B)
+
+**Action delay pipeline** (DextrEme `apply_actions` + `apply_action_noise_latency` 순서):
+```
+raw_action → FIFO queue → latency select → Bernoulli freeze(초기 dof_pos) → affine noise → RNA → clamp
+```
+
+**Observation delay pipeline** (DextrEme `compute_observations` 순서):
+```
+raw_cube_pose → affine noise → random pose injection → refresh rate gate → Bernoulli freeze
+raw_dof_pos → affine noise (joint space) → unscale
+```
+
+| 항목 | DextrEme 원본 | 이 구현 |
+|------|-------------|--------|
+| **Stochastic Delays** | | |
+| Cube obs exponential delay | persistent `obs_object_pose` buffer | persistent `obs_cube_pose` buffer |
+| Action exponential delay | frozen value = initial dof_pos (per episode) | frozen value = initial dof_pos (per episode) |
+| Action latency FIFO | `prev_actions_queue[:, 1:] = queue[:, :-1]` | `_action_queue[:, 1:] = queue[:, :-1]` |
+| Discrete ADR sampling | `round(adr_value + (-(rand - 0.5)))` | `round(adr_value + (-(rand - 0.5)))` |
+| Refresh rate gate | `(frame + offset) % rate == 0` | `(progress_buf + offset) % rate == 0` |
+| Refresh offset | `round(rand * rate - 0.5)` per-env | `round(rand * rate - 0.5)` per-env |
+| **Correlated & Uncorrelated Noise** | | |
+| Affine action noise | `scaling × a + additive + white` | `scaling × a + additive + white` |
+| Affine cube pose noise | `scaling × p + additive + white` | `scaling × p + additive + white` |
+| Affine dof_pos noise | `unscale(scaling × q + additive + white)` | `unscale(scaling × q + additive + white)` |
+| Gaussian stdev mapping | `exp(value²) - 1` | `exp(value²) - 1` |
+| Correlated noise resampling | Per episode (on reset) | Per episode (on reset) |
+| **Random Network Adversary** | | |
+| RNA architecture | 512→512→1024→1024→out×32 | 512→512→1024→1024→out×32 |
+| RNA output | softmax bins → weighted sum | softmax bins → weighted sum |
+| RNA blending | `α × rna + (1-α) × action` | `α × rna + (1-α) × action` |
+| ADR-controlled RNA alpha | Yes | Yes |
+| **Random Pose Injection** | | |
+| Injection method | `Bernoulli(p)` per step | `Bernoulli(p)` per step |
+| Probability sampling | `p ~ U(0, 0.3)` per episode | `p ~ U(0, 0.3)` per episode |
+| Random pose | `init_pos ± 0.5` + random quat | `init_pos ± 0.5` + random quat |
+| Pipeline position | After affine noise, before refresh gate | After affine noise, before refresh gate |
 
 ### 주요 차이점 (의도적 변경)
 

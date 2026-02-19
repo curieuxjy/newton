@@ -110,6 +110,103 @@ def make_default_adr_params(
             limits=[0.0, 0.3],
             delta=0.01,
         ),
+        # --- Non-physics randomisations (DextrEme paper Section B) ---
+        # Delay parameters
+        ADRParamDef(
+            name="cube_obs_delay_prob",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 0.95],
+            delta=0.05,
+        ),
+        ADRParamDef(
+            name="action_delay_prob",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 0.95],
+            delta=0.05,
+        ),
+        ADRParamDef(
+            name="action_latency",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 5.0],
+            delta=0.5,
+        ),
+        ADRParamDef(
+            name="cube_pose_refresh_rate",
+            init_range=[1.0, 1.0],
+            limits=[1.0, 5.0],
+            delta=0.5,
+        ),
+        # Affine action noise (correlated + uncorrelated Gaussian)
+        ADRParamDef(
+            name="affine_action_scaling",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 1.0],
+            delta=0.05,
+        ),
+        ADRParamDef(
+            name="affine_action_additive",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 1.0],
+            delta=0.05,
+        ),
+        ADRParamDef(
+            name="affine_action_white",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 1.0],
+            delta=0.05,
+        ),
+        # Affine cube pose noise
+        ADRParamDef(
+            name="affine_cube_pose_scaling",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 1.0],
+            delta=0.05,
+        ),
+        ADRParamDef(
+            name="affine_cube_pose_additive",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 1.0],
+            delta=0.05,
+        ),
+        ADRParamDef(
+            name="affine_cube_pose_white",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 1.0],
+            delta=0.05,
+        ),
+        # Affine dof pos noise
+        ADRParamDef(
+            name="affine_dof_pos_scaling",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 1.0],
+            delta=0.05,
+        ),
+        ADRParamDef(
+            name="affine_dof_pos_additive",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 1.0],
+            delta=0.05,
+        ),
+        ADRParamDef(
+            name="affine_dof_pos_white",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 1.0],
+            delta=0.05,
+        ),
+        # RNA blending weight
+        ADRParamDef(
+            name="rna_alpha",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 1.0],
+            delta=0.05,
+        ),
+        # Random pose injection probability
+        ADRParamDef(
+            name="random_pose_injection_prob",
+            init_range=[0.0, 0.0],
+            limits=[0.0, 0.5],
+            delta=0.05,
+        ),
     ]
 
 
@@ -339,6 +436,47 @@ class ADRManager:
         """Sample all ADR parameters for specified environments."""
         return {p.name: self.sample(p.name, env_ids) for p in self.params}
 
+    def sample_discrete(self, param_name: str, env_ids: torch.Tensor) -> torch.Tensor:
+        """Sample a discrete value from ADR continuous range with blending noise.
+
+        Used for categorical params (action_latency, cube_pose_refresh_rate).
+        Adds U(-0.5, 0.5) noise for probabilistic blending at boundaries,
+        then rounds to integer.
+        """
+        adr_value = self.sample(param_name, env_ids)
+        noise = -(torch.rand_like(adr_value) - 0.5)
+        return (adr_value + noise).round().long()
+
+    def sample_gaussian(
+        self, param_name: str, env_ids: torch.Tensor, trailing_dim: int = 1
+    ) -> torch.Tensor:
+        """Sample Gaussian noise with ADR-controlled stdev.
+
+        The ADR value is mapped through exp(value^2) - 1 nonlinearity to get
+        the standard deviation. This ensures small ADR values produce negligible
+        noise, growing super-linearly as ADR widens.
+
+        Used for affine noise parameters (correlated + uncorrelated).
+
+        Args:
+            param_name: Name of the ADR parameter controlling stdev
+            env_ids: Environment IDs to sample for
+            trailing_dim: Dimensionality of the noise vector
+
+        Returns:
+            Gaussian noise tensor of shape [len(env_ids), trailing_dim]
+        """
+        adr_value = self.sample(param_name, env_ids).view(-1, 1)
+        nonlinearity = torch.exp(torch.pow(adr_value, 2.0)) - 1.0
+        stdev = torch.where(adr_value > 0, nonlinearity, torch.zeros_like(adr_value))
+        return torch.randn(len(env_ids), trailing_dim, device=self.device) * stdev
+
+    @staticmethod
+    def gaussian_stdev(adr_value: torch.Tensor) -> torch.Tensor:
+        """Map ADR value to Gaussian stdev via exp(value^2) - 1 nonlinearity."""
+        nonlinearity = torch.exp(torch.pow(adr_value, 2.0)) - 1.0
+        return torch.where(adr_value > 0, nonlinearity, torch.zeros_like(adr_value))
+
     def _modify_param(self, value: float, direction: str, param: ADRParamDef, limit: float | None) -> tuple[float, bool]:
         """Modify a parameter boundary by delta in the given direction."""
         if param.delta_style == "additive":
@@ -355,30 +493,22 @@ class ADRManager:
         return new_val, abs(new_val - value) > 1e-9
 
     def get_metrics(self) -> dict[str, float]:
-        """Return ADR metrics for logging."""
+        """Return ADR metrics for logging.
+
+        Metrics layout:
+            episode/adr_*       - rollout_perf, boundary_changes
+            adr/lower/{name}    - current lower bounds for each param
+            adr/upper/{name}    - current upper bounds for each param
+        """
         metrics: dict[str, float] = {
-            "adr/rollout_perf": self.rollout_perf_ema,
-            "adr/boundary_changes": float(self.total_boundary_changes),
+            "episode/adr_rollout_perf": self.rollout_perf_ema,
+            "episode/adr_boundary_changes": float(self.total_boundary_changes),
         }
 
-        total_nats = 0.0
-        for n, param in enumerate(self.params):
+        for param in self.params:
             lo, hi = param.range
-            width = max(hi - lo, 1e-3)
-            total_nats += np.log(width)
-
-            metrics[f"adr/{param.name}/lower"] = lo
-            metrics[f"adr/{param.name}/upper"] = hi
-            metrics[f"adr/{param.name}/width"] = hi - lo
-
-            low_q = self.queues[2 * n]
-            high_q = self.queues[2 * n + 1]
-            if len(low_q) > 0:
-                metrics[f"adr/{param.name}/low_q_mean"] = float(np.mean(low_q))
-            if len(high_q) > 0:
-                metrics[f"adr/{param.name}/high_q_mean"] = float(np.mean(high_q))
-
-        metrics["adr/npd"] = total_nats / max(self.num_params, 1)  # Nats per dimension
+            metrics[f"adr/lower/{param.name}"] = lo
+            metrics[f"adr/upper/{param.name}"] = hi
 
         return metrics
 

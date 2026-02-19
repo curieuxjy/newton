@@ -4,6 +4,7 @@ import os
 import time
 from datetime import datetime
 
+import numpy as np
 import torch
 
 from .config import TrainConfig
@@ -107,6 +108,8 @@ def init_wandb(config: TrainConfig, actor_critic: ActorCritic) -> bool:
 def train(config: TrainConfig):
     """Main training loop."""
     torch.manual_seed(config.seed)
+    torch.cuda.manual_seed_all(config.seed)
+    np.random.seed(config.seed)
 
     device = config.device
     print(f"[INFO] Using device: {device}")
@@ -290,17 +293,21 @@ def train(config: TrainConfig):
                     f"goal={rc.get('reach_goal_rew', 0):.2f} "
                     f"| rot_dist={rc.get('rot_dist', 0):.3f} "
                     f"goal_dist={rc.get('goal_dist', 0):.3f} "
-                    f"successes={rc.get('consecutive_successes', 0):.1f}"
+                    f"successes={int(env.consecutive_successes.item())}"
                 )
 
-            # Split reward components: adr/ keys → randomization/, rest → reward/
+            # Split reward components: adr/ keys separate, rest → reward/
             reward_logs = {}
             adr_logs = {}
             for key, val in avg_reward_components.items():
-                if key.startswith("adr/"):
-                    adr_logs[f"randomization/{key}"] = val
+                if key.startswith("adr/") or key.startswith("episode/"):
+                    adr_logs[key] = val
                 else:
                     reward_logs[f"reward/{key}"] = val
+
+            # Episode-level success metrics (logged as integers, not averaged)
+            episode_successes = int(env.successes.sum().item())
+            episode_consecutive_successes = int(env.consecutive_successes.item())
 
             # TensorBoard logging
             if writer:
@@ -312,6 +319,8 @@ def train(config: TrainConfig):
                 writer.add_scalar("train/critic_learning_rate", metrics["critic_learning_rate"], global_step)
                 writer.add_scalar("episode/reward_mean", avg_reward, global_step)
                 writer.add_scalar("episode/length_mean", avg_length, global_step)
+                writer.add_scalar("episode/successes", episode_successes, global_step)
+                writer.add_scalar("episode/consecutive_successes", episode_consecutive_successes, global_step)
                 writer.add_scalar("perf/fps", fps, global_step)
                 for key, val in reward_logs.items():
                     writer.add_scalar(key, val, global_step)
@@ -330,6 +339,8 @@ def train(config: TrainConfig):
                     "train/critic_learning_rate": metrics["critic_learning_rate"],
                     "episode/reward_mean": avg_reward,
                     "episode/length_mean": avg_length,
+                    "episode/successes": episode_successes,
+                    "episode/consecutive_successes": episode_consecutive_successes,
                     "perf/fps": fps,
                     "perf/global_step": global_step,
                     "perf/update": update,
@@ -396,7 +407,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Train Allegro Hand Cube Rotation with PPO")
-    parser.add_argument("--num-envs", type=int, default=4096, help="Number of parallel environments")
+    parser.add_argument("--num-envs", type=int, default=8281, help="Number of parallel environments")
     parser.add_argument("--total-timesteps", type=int, default=100_000_000, help="Total training timesteps")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")

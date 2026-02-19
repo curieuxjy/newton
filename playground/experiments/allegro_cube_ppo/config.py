@@ -18,7 +18,7 @@ class EnvConfig:
         Episode: resetTime=8s at 30Hz control = 240 steps.
     """
 
-    num_envs: int = 4096
+    num_envs: int = 8281 # 91^2
 
     # Simulation timing (DextrEme: physics 120Hz, control 30Hz)
     fps: int = 60
@@ -79,6 +79,19 @@ class EnvConfig:
     reset_position_noise: float = 0.03
     reset_position_noise_z: float = 0.01
 
+    # Delay parameters (DextrEme paper: Latency & Delay)
+    max_action_latency: int = 5  # Maximum action latency buffer size (control steps)
+    max_obs_refresh_delay: int = 5  # Maximum observation refresh period (control steps)
+
+    # Random Pose Injection (DextrEme paper: Section B.4)
+    # Occasionally inject completely random cube poses to handle pose estimator jumps
+    enable_random_pose_injection: bool = True
+
+    # Random Network Adversary (DextrEme paper: Section B.3)
+    enable_rna: bool = True
+    rna_softmax_bins: int = 32  # Number of discretisation bins per joint
+    rna_weight_refresh_freq: int = 1000  # Steps between RNA weight re-init
+
 
 @dataclass
 class DRConfig:
@@ -110,6 +123,23 @@ class DRConfig:
     cube_friction_range: tuple = (0.5, 2.5)
     obs_noise_range: tuple = (0.0, 0.2)
     action_noise_range: tuple = (0.0, 0.1)
+
+    # Delay static DR ranges (DextrEme paper: Latency & Delay)
+    cube_obs_delay_prob_range: tuple = (0.0, 0.3)
+    action_delay_prob_range: tuple = (0.0, 0.3)
+    action_latency_range: tuple = (0.0, 2.0)
+    cube_pose_refresh_rate_range: tuple = (1.0, 3.0)
+
+    # Affine noise static DR ranges (correlated + uncorrelated Gaussian)
+    affine_action_noise_range: tuple = (0.0, 0.3)
+    affine_cube_pose_noise_range: tuple = (0.0, 0.3)
+    affine_dof_pos_noise_range: tuple = (0.0, 0.3)
+
+    # Random pose injection probability range (per episode)
+    random_pose_injection_prob_range: tuple = (0.0, 0.3)
+
+    # RNA blending weight static DR range
+    rna_alpha_range: tuple = (0.0, 0.3)
 
 
 @dataclass
