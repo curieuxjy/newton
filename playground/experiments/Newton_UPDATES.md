@@ -5,6 +5,290 @@
 
 ---
 
+## 2026-02-25 업데이트
+
+### 커밋 범위
+`e318436..0680eb07` (main branch merge)
+
+### 주요 변경 사항
+
+#### 1. ⚠️⚠️ `key` → `label` 대규모 이름 변경 + 계층적 라벨 (#1592, #1632, #1700)
+**커밋**: `b8b3e0ab`, `446b60da`
+
+65개 파일, 1305줄 변경. 모든 엔티티의 `key` 속성이 `label`로 이름 변경됨.
+
+**Model 속성 변경**:
+| Old | New |
+|-----|-----|
+| `model.body_key` | `model.body_label` |
+| `model.joint_key` | `model.joint_label` |
+| `model.shape_key` | `model.shape_label` |
+| `model.articulation_key` | `model.articulation_label` |
+| `model.equality_constraint_key` | `model.equality_constraint_label` |
+| `model.constraint_mimic_key` | `model.constraint_mimic_label` |
+
+**ModelBuilder 메서드 파라미터 변경**:
+```python
+# Old
+builder.add_body(key="my_body")
+builder.add_link(key="my_link")
+builder.add_joint_revolute(key="my_joint")
+
+# New
+builder.add_body(label="my_body")
+builder.add_link(label="my_link")
+builder.add_joint_revolute(label="my_joint")
+```
+
+**새 기능: 계층적 라벨 (`label_prefix`)**:
+```python
+scene = ModelBuilder()
+scene.add_builder(left_arm_builder, label_prefix="left")
+scene.add_builder(right_arm_builder, label_prefix="right")
+# → model.body_label = ["left/shoulder", "right/shoulder"]
+```
+
+**영향받는 playground 파일**:
+- `franka_allegro/example_franka_allegro.py`: `builder.body_key`, `builder.articulation_key` 사용 → `body_label`, `articulation_label`로 변경 필요
+- `allegro_cube_ppo/visualize.py`: `hand_builder.shape_key` 사용 → `shape_label`로 변경 필요
+- `franka_allegro_grasp/env.py`: `single_env_builder.body_key`, `single_env_builder.articulation_key` 사용 → 변경 필요
+
+#### 2. ⚠️⚠️ Sensor API 전면 표준화 (#1665)
+**커밋**: `cac2abde`
+
+모든 센서의 메서드 이름, 파라미터, 라벨 매칭이 통합됨.
+
+**a) 메서드 이름 통합**:
+| Sensor | Old | New |
+|--------|-----|-----|
+| `SensorContact` | `.eval(contacts)` | `.update(contacts)` |
+| `SensorRaycast` | `.eval(state)` | `.update(state)` |
+| `SensorTiledCamera` | `.render(state, ...)` | `.update(state, ...)` |
+| `SensorTiledCamera` | `.update_from_state(state)` | `.sync_transforms(state)` |
+| `SensorFrameTransform` | `.update(model, state)` | `.update(state)` (model 불필요) |
+
+**b) `MatchKind` 이동**:
+```python
+# Old
+from newton.sensors import MatchKind
+
+# New
+from newton.sensors import SensorContact
+kind = SensorContact.MatchKind.SHAPE
+```
+
+**c) 라벨 매칭 통합 (fnmatch 패턴)**:
+```python
+# Old (regex + custom match_fn)
+SensorContact(model, sensing_obj_shapes=".*link3.*",
+              match_fn=lambda s, p: re.match(p, s))
+
+# New (fnmatch 와일드카드)
+SensorContact(model, sensing_obj_shapes="*link3*")
+```
+
+**d) SensorTiledCamera.render() → .update() 시그니처 변경**:
+```python
+# Old
+sensor.render(state, camera_transforms, camera_rays, color_image, depth_image)
+
+# New (keyword-only output params)
+sensor.update(state, camera_transforms, camera_rays,
+              color_image=color_image, depth_image=depth_image)
+```
+
+**e) 키워드 전용 파라미터 강제**: 모든 센서 생성자에서 `*` 마커 사용.
+
+**영향받는 playground 파일**:
+- `franka_allegro_grasp/env.py`:
+  - `SensorContact(..., match_fn=...)` → fnmatch 패턴으로 변경 필요 (regex → `"*link3*"`)
+  - `self.depth_sensor.render(...)` → `.update(...)` 변경 필요
+- `franka_allegro_grasp/view_depth.py`, `franka_allegro_grasp/visualize.py`: sensor API 확인 필요
+
+#### 3. ⚠️⚠️ Newton Actuators 통합 (#1342)
+**커밋**: `28b79e3d`
+
+**새 핵심 의존성**: `newton-actuators` 패키지가 core dependency로 추가됨.
+
+**새 액추에이터 클래스**:
+- `ActuatorPD` - PD 제어기
+- `ActuatorPID` - PID 제어기
+- `ActuatorDelayedPD` - 시간 지연 PD 제어기
+
+**새 ModelBuilder API**:
+```python
+builder.add_actuator(
+    actuator_class=ActuatorPD,
+    input_indices=[0, 1, 2],  # DOF 인덱스
+    output_indices=None,       # None이면 input_indices 사용
+    kp=100.0, kd=10.0, max_force=50.0,
+)
+```
+
+**새 Model 속성**:
+- `model.actuators` - 액추에이터 인스턴스 리스트
+- `model.joint_act` - DOF별 feedforward actuation 입력 배열
+
+**ArticulationView 확장**:
+```python
+view.get_actuator_parameter(actuator, 'kp')
+view.set_actuator_parameter(actuator, 'kp', values, mask=None)
+```
+
+**영향**: 새 기능 추가. 기존 코드에 영향 없음. `uv sync` 필요 (새 의존성).
+
+#### 4. ⚠️ `shape_thickness`/`shape_contact_margin` → `shape_margin`/`shape_gap` 이름 변경 (#1732)
+**커밋**: `a6069e84`
+
+52개 파일 변경. 충돌 감지 파라미터 이름 변경 및 의미 명확화.
+
+| Old | New | 의미 |
+|-----|-----|------|
+| `shape_thickness` | `shape_margin` | 표면 오프셋 [m], 쌍별 합산 |
+| `shape_contact_margin` | `shape_gap` | 추가 감지 임계값 [m], 쌍별 합산 |
+| `rigid_contact_margin` | `rigid_gap` | Builder 기본 gap 값 |
+
+**ShapeConfig 변경**:
+```python
+# Old
+ShapeConfig(thickness=0.0, contact_margin=None)
+
+# New
+ShapeConfig(margin=0.0, gap=None)
+```
+
+**영향**: playground에서 `shape_thickness`/`shape_contact_margin`을 직접 사용하지 않으므로 영향 없음.
+
+#### 5. ⚠️ `ensure_nonstatic_links` 옵션 완전 제거 (#1682)
+**커밋**: `dc060127`
+
+2026-02-19 업데이트에서 기본값이 `False`로 변경되었던 `ensure_nonstatic_links` 파라미터가 이제 완전히 제거됨.
+
+```python
+# Old (삭제됨)
+builder.add_urdf(..., ensure_nonstatic_links=True, static_link_mass=1e-2)
+builder.add_mjcf(..., ensure_nonstatic_links=True)
+
+# New
+# 파라미터 자체가 없음. 질량 0 링크는 항상 유지.
+```
+
+**영향**: `ensure_nonstatic_links`를 사용하는 코드는 파라미터 제거 필요. playground에서 사용하지 않으므로 직접 영향 없음.
+
+#### 6. ⚠️ SolverMuJoCo kwargs 정리 (#1766)
+**커밋**: `1a8162d1`
+
+**제거된 `SolverMuJoCo.__init__()` 파라미터**:
+- `mjw_model`, `mjw_data` - 사전 빌드된 MuJoCo 모델/데이터
+- `default_actuator_gear` - 기본 액추에이터 기어비
+- `actuator_gears` - 개별 액추에이터 기어 설정
+
+**제거된 내부 메서드 파라미터** (`_convert_to_mjc()`):
+- `default_actuator_args`, `default_actuator_gear`, `actuator_gears`
+- `actuated_axes`, `mesh_maxhullvert`
+
+**영향**: 이 파라미터들을 사용하지 않는 playground 코드는 영향 없음.
+
+#### 7. ⚠️ Solver 내부 함수 private화 (#1683)
+**커밋**: `daa115ed`
+
+Solver 내부 함수들이 `_` 접두사로 private화됨.
+
+| Old | New |
+|-----|-----|
+| `mujoco_warp_step()` | `_mujoco_warp_step()` |
+| `update_newton_state()` | `_update_newton_state()` |
+| `apply_mjc_control()` | `_apply_mjc_control()` |
+| `update_model_properties()` | `_update_model_properties()` |
+| (기타 10여 개 함수) | (모두 `_` 접두사 추가) |
+
+**영향**: Solver 내부 함수를 직접 호출하지 않는 한 영향 없음.
+
+#### 8. ⚠️ Python 3.12 요구 (#1702)
+**커밋**: `35657fc1`
+
+`.python-version`이 `3.11` → `3.12`로 변경됨. 개발 환경에 Python 3.12 필요.
+
+#### 9. ⚠️ tkinter 의존성 제거 → 비동기 파일 다이얼로그 (#1676)
+**커밋**: `3e9bf0c6`
+
+```python
+# Old (동기, blocking)
+file_path = ui.open_load_file_dialog(filetypes=[...])
+
+# New (비동기, non-blocking)
+ui.open_load_file_dialog(title="...")
+file_path = ui.consume_file_dialog_result()  # 나중에 폴링
+```
+
+**영향**: Viewer 파일 다이얼로그 API 사용 코드 수정 필요. playground에서 직접 사용하지 않으므로 영향 없음.
+
+#### 10. Spatial Tendon 지원 (#1687)
+**커밋**: `ab4bf376`
+
+MuJoCo solver에서 spatial tendon (wrap path) 지원 추가.
+
+**새 커스텀 속성**:
+- `tendon_type` [int32]: fixed(0) vs spatial(1)
+- `tendon_wrap_adr/num` [int32]: wrap path 인덱스/카운트
+- `tendon_wrap_type/shape/sidesite/prm`: wrap 요소 속성
+
+**영향**: 새 기능 추가. 기존 코드에 영향 없음.
+
+#### 11. `qfrc_actuator` 노출 (#1698)
+**커밋**: `8de01550`
+
+MuJoCo solver에서 액추에이터 힘을 일반화 좌표로 조회 가능.
+
+```python
+builder.request_state_attributes("mujoco:qfrc_actuator")
+# solver step 후:
+forces = state.mujoco.qfrc_actuator  # [N, N·m]
+```
+
+**영향**: 새 기능 추가. 기존 코드에 영향 없음.
+
+#### 12. SDF 헬퍼 함수 public API 노출 (#1684)
+**커밋**: `9bb39817`
+
+`newton.geometry`에 SDF 헬퍼 함수 7개 추가:
+- `sdf_sphere()`, `sdf_box()`, `sdf_capsule()`, `sdf_cylinder()`, `sdf_cone()`, `sdf_plane()`, `sdf_mesh()`
+- 각 gradient 함수도 함께 노출
+
+**영향**: 새 기능 추가. 기존 코드에 영향 없음.
+
+#### 13. MJCF 파서 개선
+- **`inheritrange` 지원** (#1727, `25551ada`): position 액추에이터의 `inheritrange` 속성 파싱
+- **`biastype` 암시적 기본값 수정** (#1678, `1135e423`): position/velocity 단축키의 `biastype`/`gaintype` 기본값 정확하게 설정
+- **`dampratio` 지원** (#1722, `6256e035`): position/velocity 액추에이터의 `dampratio` 속성 파싱
+- **`contype=conaffinity=0` 존중** (#1703, `12ff805c`): `collision_group=0` 설정으로 올바르게 처리
+- **USD Schema gap/margin 파싱** (#1690, `283248d1`): Newton/PhysX/MuJoCo 스키마에서 gap/margin 파싱
+
+#### 14. 의존성 업데이트
+
+| 패키지 | Old | New |
+|--------|-----|-----|
+| `warp-lang` | `1.12.0.dev20260217` | `>=1.11.0` (lock: `1.12.0rc1`) |
+| `newton-actuators` | (없음) | core dependency 추가 |
+| `newton-usd-schemas` | `0.1.0rc2` | `>=0.1.0rc3` |
+| Python | 3.11 | **3.12** |
+
+#### 15. 기타 변경
+- **`RenderShapeType` 제거** (#1748, `e50ac84b`): `GeoType` 직접 사용
+- **ViewerViser 개선** (#1764, #1750, #1742): `log_lines()` 수정, Jupyter URL 개선
+- **VBD 데모 수정** (#1740, `ee89060c`)
+- **ArticulationView crash 수정** (#1726, `5a003b10`): fixed-joint-only 아티큘레이션 처리
+- **Fixed joint collapse 개선** (#1608, `95086653`): 비연결 서브트리(orphan body) 처리
+- **Warp 컴파일 시간 최적화** (#1618, `b905ad12`): geometry 모듈 `module="unique"` 사용
+- **Hydroelastic contacts 메모리 절감** (#1609, `a4cdb98c`)
+- **Viewer 충돌 shape 토글 수정** (#1715, `92c8ad3e`)
+- **Quaternion 변환 수정** (#1694, `ce6f39d7`): body inertia 커널의 xyzw→wxyz 변환
+- **MJCF include meshdir/texturedir 수정** (#1685, `9e684543`)
+- **Multi-world particle BVH 수정** (#1641, `052dae99`)
+- **MJCF fromto capsule/cylinder 방향 수정** (#1741, `87d427bd`)
+
+---
+
 ## 2026-02-19 업데이트
 
 ### 커밋 범위
@@ -570,6 +854,22 @@ git diff HEAD~N..HEAD -- path/to/file
 
 ## Playground 호환성 체크리스트
 
+### 2026-02-25 업데이트 항목 (긴급)
+
+- [x] **`body_key` → `body_label` 이름 변경** ✅ 수정 완료
+  - `franka_allegro/example_franka_allegro.py`: `builder.body_key` → `builder.body_label`, `builder.articulation_key` → `builder.articulation_label`
+  - `allegro_cube_ppo/visualize.py`: `hand_builder.shape_key` → `hand_builder.shape_label`
+  - `franka_allegro_grasp/env.py`: `single_env_builder.body_key` → `body_label`, `articulation_key` → `articulation_label`
+  - `franka_allegro/README.md`: `articulation_key` → `articulation_label`
+- [x] **SensorContact API 변경** ✅ 수정 완료
+  - `franka_allegro_grasp/env.py`: `match_fn=lambda ...` 제거, regex `".*link3.*"` → fnmatch `"*link3*"`, `import re` 제거
+- [x] **SensorTiledCamera `.render()` → `.update()`** ✅ 수정 완료
+  - `franka_allegro_grasp/env.py`: `self.depth_sensor.render(...)` → `.update(...)`
+- [ ] **`newton-actuators` 의존성 추가** (`uv sync` 필요)
+- [ ] **Python 3.12 업그레이드**
+- [ ] `shape_thickness` → `shape_margin`, `shape_contact_margin` → `shape_gap` (playground 직접 사용 없음)
+- [ ] `ensure_nonstatic_links` 파라미터 완전 제거 (playground 직접 사용 없음)
+
 ### 2026-02-19 업데이트 항목
 
 - [ ] `create_collision_pipeline` 제거 → `model.contacts()` + `model.collide(state, contacts)` 마이그레이션
@@ -578,7 +878,6 @@ git diff HEAD~N..HEAD -- path/to/file
 - [ ] `ShapeConfig.mu` 기본값 0.5 → 1.0 확인 (명시적 설정 코드는 영향 없음)
 - [ ] MuJoCo 3.5.0 의존성 업데이트 (`uv sync`)
 - [ ] `ignore_inertial_definitions` 기본값 True → False 확인 (URDF/MJCF 임포트)
-- [ ] `ensure_nonstatic_links` 기본값 True → False 확인 (질량 0 링크)
 - [ ] `base_joint` 문자열 인자 → dict 변환 확인
 - [ ] `create_*_mesh()` → `Mesh.create_*()` 마이그레이션 (사용하는 코드가 있다면)
 - [ ] `RecorderModelAndState` → `newton.viewer.ViewerFile` 마이그레이션 (사용하는 코드가 있다면)

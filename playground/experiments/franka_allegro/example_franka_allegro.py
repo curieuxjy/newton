@@ -97,7 +97,7 @@ class Example:
 
         # Find end effector body (fr3_link8)
         ee_body_idx = -1
-        for i, key in enumerate(builder.body_key):
+        for i, key in enumerate(builder.body_label):
             if "fr3_link8" in key:
                 ee_body_idx = i
                 print(f"[INFO] Found end effector body: {key} (index {i})")
@@ -149,7 +149,7 @@ class Example:
         for j in range(joint_offset, builder.joint_count):
             builder.joint_articulation[j] = 0
         builder.articulation_start = [0]
-        builder.articulation_key = ["franka_allegro"]
+        builder.articulation_label = ["franka_allegro"]
         builder.articulation_world = [0]
 
         # Set Allegro joint parameters (higher stiffness for stability)

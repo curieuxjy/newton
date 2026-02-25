@@ -7,7 +7,6 @@ Reference: DEXTRAH (NVlabs/DEXTRAH) - dextrah_kuka_allegro_env.py
 """
 
 import math
-import re
 from typing import Any
 
 import numpy as np
@@ -227,7 +226,7 @@ class FrankaAllegroGraspEnv:
 
         # Find end effector body
         self.ee_body_idx = -1
-        for i, key in enumerate(single_env_builder.body_key):
+        for i, key in enumerate(single_env_builder.body_label):
             if "fr3_link8" in key:
                 self.ee_body_idx = i
                 break
@@ -271,7 +270,7 @@ class FrankaAllegroGraspEnv:
         for j in range(allegro_joint_offset, single_env_builder.joint_count):
             single_env_builder.joint_articulation[j] = 0
         single_env_builder.articulation_start = [0]
-        single_env_builder.articulation_key = ["franka_allegro"]
+        single_env_builder.articulation_label = ["franka_allegro"]
         single_env_builder.articulation_world = [0]
 
         # Set Allegro joint parameters
@@ -461,9 +460,8 @@ class FrankaAllegroGraspEnv:
         try:
             self.finger_contact_sensor = SensorContact(
                 self.model,
-                sensing_obj_shapes=".*link3.*",  # Fingertip links
-                counterpart_shapes=".*cube.*",   # Cube
-                match_fn=lambda string, pat: re.match(pat, string, re.IGNORECASE),
+                sensing_obj_shapes="*link3*",  # Fingertip links (fnmatch pattern)
+                counterpart_shapes="*cube*",   # Cube (fnmatch pattern)
                 include_total=True,
                 verbose=False,
             )
@@ -949,7 +947,7 @@ class FrankaAllegroGraspEnv:
         self.camera_transforms = wp.array([transforms_row], dtype=wp.transformf, device=self.device)
 
         # Render depth
-        self.depth_sensor.render(
+        self.depth_sensor.update(
             state=self.state_0,
             camera_transforms=self.camera_transforms,
             camera_rays=self.camera_rays,

@@ -88,7 +88,7 @@ for j in range(joint_offset, builder.joint_count):
 
 # 3. Articulation 메타데이터 업데이트
 builder.articulation_start = [0]
-builder.articulation_key = ["franka_allegro"]
+builder.articulation_label = ["franka_allegro"]
 ```
 
 ## Solver 설정

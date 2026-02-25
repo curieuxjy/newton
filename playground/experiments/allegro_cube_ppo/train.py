@@ -408,7 +408,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Train Allegro Hand Cube Rotation with PPO")
     parser.add_argument("--num-envs", type=int, default=8281, help="Number of parallel environments")
-    parser.add_argument("--total-timesteps", type=int, default=100_000_000, help="Total training timesteps")
+    parser.add_argument("--total-timesteps", type=int, default=100_000_000_000, help="Total training timesteps")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda or cpu)")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints", help="Checkpoint directory")

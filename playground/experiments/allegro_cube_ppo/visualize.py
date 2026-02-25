@@ -113,15 +113,15 @@ class VisualizeExample:
         # Show/hide collision shapes
         if not self.show_collision:
             # Hide collision shapes for cleaner visualization
-            for i, key in enumerate(hand_builder.shape_key):
+            for i, key in enumerate(hand_builder.shape_label):
                 if re.match(".*collision.*", key, re.IGNORECASE):
                     hand_builder.shape_flags[i] &= ~ShapeFlags.VISIBLE
         else:
             # Make sure collision shapes are visible
-            for i, key in enumerate(hand_builder.shape_key):
+            for i, key in enumerate(hand_builder.shape_label):
                 if re.match(".*collision.*", key, re.IGNORECASE):
                     hand_builder.shape_flags[i] |= ShapeFlags.VISIBLE
-            print(f"[INFO] Collision shapes visible: {len(hand_builder.shape_key)} shapes")
+            print(f"[INFO] Collision shapes visible: {len(hand_builder.shape_label)} shapes")
 
         # Set joint control (lower stiffness for more compliant motion)
         for i in range(self.num_hand_dofs):
