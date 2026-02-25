@@ -81,7 +81,7 @@ class Example:
                 p=wp.vec3(0.0, 0.0, self.cube_height),
                 q=wp.quat_identity(),
             ),
-            key="cube",
+            label="cube",
         )
         cube_cfg = newton.ModelBuilder.ShapeConfig()
         cube_cfg.density = 0.0  # Static body (infinite mass)
@@ -110,7 +110,7 @@ class Example:
                 p=wp.vec3(self.sphere_start_x, 0.0, self.sphere_height),
                 q=wp.quat_identity(),
             ),
-            key="sphere",
+            label="sphere",
         )
         sphere_cfg = newton.ModelBuilder.ShapeConfig()
         sphere_cfg.density = 0.0  # Kinematic body (not affected by gravity)
@@ -183,7 +183,11 @@ class Example:
             )
 
         # Add ground plane
-        builder.add_ground_plane()
+        ground_cfg = newton.ModelBuilder.ShapeConfig()
+        ground_cfg.ke = 1.0e5  # Contact stiffness
+        ground_cfg.kd = 1.0e-4  # Contact damping
+        ground_cfg.mu = 0.3  #
+        builder.add_ground_plane(cfg=ground_cfg)
 
         # Color the mesh for VBD solver (include bending constraints)
         builder.color(include_bending=True)

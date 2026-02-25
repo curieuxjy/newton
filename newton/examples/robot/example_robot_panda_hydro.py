@@ -81,7 +81,7 @@ class Example:
             sdf_max_resolution=64,
             is_hydroelastic=True,
             sdf_narrow_band_range=(-0.01, 0.01),
-            contact_margin=0.01,
+            gap=0.01,
             mu_torsional=0.0,
             mu_rolling=0.0,
         )
@@ -109,11 +109,14 @@ class Example:
         )
         builder.default_shape_cfg = shape_cfg
 
+        def find_body(name):
+            return next(i for i, lbl in enumerate(builder.body_label) if lbl.endswith(f"/{name}"))
+
         # Disable SDF collisions on all panda links except the fingers and hand
         finger_body_indices = {
-            builder.body_key.index("fr3_leftfinger"),
-            builder.body_key.index("fr3_rightfinger"),
-            builder.body_key.index("fr3_hand"),
+            find_body("fr3_leftfinger"),
+            find_body("fr3_rightfinger"),
+            find_body("fr3_hand"),
         }
         non_finger_shape_indices = []
         for shape_idx, body_idx in enumerate(builder.shape_body):
@@ -129,7 +132,7 @@ class Example:
                     mesh.build_sdf(
                         max_resolution=hydro_mesh_sdf_max_resolution,
                         narrow_band_range=shape_cfg.sdf_narrow_band_range,
-                        margin=shape_cfg.contact_margin if shape_cfg.contact_margin is not None else 0.05,
+                        margin=shape_cfg.gap if shape_cfg.gap is not None else 0.05,
                     )
                 builder.shape_flags[shape_idx] |= newton.ShapeFlags.HYDROELASTIC
             elif body_idx not in finger_body_indices:
@@ -162,8 +165,8 @@ class Example:
 
         # Add gripper pads
         if self.scene in [SceneType.PEN, SceneType.CUBE]:
-            left_finger_idx = builder.body_key.index("fr3_leftfinger")
-            right_finger_idx = builder.body_key.index("fr3_rightfinger")
+            left_finger_idx = find_body("fr3_leftfinger")
+            right_finger_idx = find_body("fr3_rightfinger")
 
             pad_asset_path = newton.utils.download_asset("manipulation_objects/pad")
             pad_stage = Usd.Stage.Open(str(pad_asset_path / "model.usda"))
@@ -179,7 +182,7 @@ class Example:
             pad_mesh.build_sdf(
                 max_resolution=hydro_mesh_sdf_max_resolution,
                 narrow_band_range=shape_cfg.sdf_narrow_band_range,
-                margin=shape_cfg.contact_margin if shape_cfg.contact_margin is not None else 0.05,
+                margin=shape_cfg.gap if shape_cfg.gap is not None else 0.05,
             )
             pad_xform = wp.transform(
                 wp.vec3(0.0, 0.005, 0.045),
@@ -203,7 +206,7 @@ class Example:
         table_mesh.build_sdf(
             max_resolution=hydro_mesh_sdf_max_resolution,
             narrow_band_range=shape_cfg.sdf_narrow_band_range,
-            margin=shape_cfg.contact_margin if shape_cfg.contact_margin is not None else 0.05,
+            margin=shape_cfg.gap if shape_cfg.gap is not None else 0.05,
         )
         builder.add_shape_mesh(
             body=-1,
@@ -225,16 +228,16 @@ class Example:
             )
             pen_cfg = copy.deepcopy(shape_cfg)
             pen_cfg.sdf_max_resolution = hydro_mesh_sdf_max_resolution
-            self.object_body_local = builder.add_body(xform=object_xform, key="object")
+            self.object_body_local = builder.add_body(xform=object_xform, label="object")
             builder.add_shape_capsule(body=self.object_body_local, radius=radius, half_height=length / 2, cfg=pen_cfg)
             self.grasping_offset = [-0.03, 0.0, 0.13]
-            self.place_offset = -0.015  # Gripper reaches 1.5cm further into cup
+            self.place_offset = -0.0
 
         elif self.scene == SceneType.CUBE:
             size = 0.04
             self.object_pos = [0.0, -0.5, 2 * box_size + 0.5 * size]
             object_xform = wp.transform(wp.vec3(self.object_pos), wp.quat_identity())
-            self.object_body_local = builder.add_body(xform=object_xform, key="object")
+            self.object_body_local = builder.add_body(xform=object_xform, label="object")
             builder.add_shape_box(body=self.object_body_local, hx=size / 2, hy=size / 2, hz=size / 2)
             self.grasping_offset = [0.03, 0.0, 0.14]
             self.place_offset = 0.02
@@ -253,13 +256,13 @@ class Example:
             cup_mesh.build_sdf(
                 max_resolution=hydro_mesh_sdf_max_resolution,
                 narrow_band_range=shape_cfg.sdf_narrow_band_range,
-                margin=shape_cfg.contact_margin if shape_cfg.contact_margin is not None else 0.05,
+                margin=shape_cfg.gap if shape_cfg.gap is not None else 0.05,
             )
             cup_xform = wp.transform(
                 wp.vec3(self.cup_pos),
                 wp.quat_identity(),
             )
-            cup_body = builder.add_body(key="cup", xform=cup_xform)
+            cup_body = builder.add_body(label="cup", xform=cup_xform)
             builder.add_shape_mesh(body=cup_body, mesh=cup_mesh, cfg=mesh_shape_cfg)
 
         # build model for IK
@@ -492,7 +495,7 @@ class Example:
         ]
 
         if self.put_in_cup:
-            loose_pos = 0.74
+            loose_pos = 0.72
             wps = []
             cup_pos_higher = wp.vec3([self.cup_pos[0] + self.place_offset, self.cup_pos[1], self.z_rest])
             cup_pos_lower = wp.vec3([self.cup_pos[0] + self.place_offset, self.cup_pos[1], self.z_rest - 0.1])

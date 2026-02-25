@@ -192,7 +192,7 @@ class Example:
         stretch_damping = 0.0
 
         builder = newton.ModelBuilder()
-        builder.rigid_contact_margin = 0.05
+        builder.rigid_gap = 0.05
 
         # Register solver-specific custom attributes (Dahl plasticity parameters live on the Model)
         newton.solvers.SolverVBD.register_custom_attributes(builder)
@@ -235,7 +235,7 @@ class Example:
                 bend_damping=bend_damping,
                 stretch_stiffness=stretch_stiffness,
                 stretch_damping=stretch_damping,
-                key=f"bundle_cable_{i}",
+                label=f"bundle_cable_{i}",
             )
 
         # Create moving obstacles (capsules arranged along X axis)

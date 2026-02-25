@@ -682,14 +682,14 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     writer_func: Any,
     contact_reduction_funcs: ContactReductionFunctions | None = None,
 ):
-    @wp.kernel(enable_backward=False)
+    @wp.kernel(enable_backward=False, module="unique")
     def mesh_sdf_collision_kernel(
         shape_data: wp.array(dtype=wp.vec4),
         shape_transform: wp.array(dtype=wp.transform),
         shape_source: wp.array(dtype=wp.uint64),
         sdf_table: wp.array(dtype=SDFData),
         shape_sdf_index: wp.array(dtype=wp.int32),
-        shape_contact_margin: wp.array(dtype=float),
+        shape_gap: wp.array(dtype=float),
         _shape_collision_aabb_lower: wp.array(dtype=wp.vec3),  # Unused but kept for API compatibility
         _shape_collision_aabb_upper: wp.array(dtype=wp.vec3),  # Unused but kept for API compatibility
         _shape_voxel_resolution: wp.array(dtype=wp.vec3i),  # Unused but kept for API compatibility
@@ -726,7 +726,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
             pair = shape_pairs_mesh_mesh[pair_idx]
 
             # Sum margins for contact detection (needed for all modes)
-            margin = shape_contact_margin[pair[0]] + shape_contact_margin[pair[1]]
+            margin = shape_gap[pair[0]] + shape_gap[pair[1]]
 
             # Test both directions using smart indexing:
             # mode 0: pair[0] triangles vs pair[1] SDF
@@ -866,8 +866,8 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                             contact_data.contact_distance = dist
                             contact_data.radius_eff_a = 0.0
                             contact_data.radius_eff_b = 0.0
-                            contact_data.thickness_a = shape_data[pair[0]][3]
-                            contact_data.thickness_b = shape_data[pair[1]][3]
+                            contact_data.margin_a = shape_data[pair[0]][3]
+                            contact_data.margin_b = shape_data[pair[1]][3]
                             contact_data.shape_a = pair[0]
                             contact_data.shape_b = pair[1]
                             contact_data.margin = margin
@@ -893,14 +893,14 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
     get_smem_slots_plus_1 = contact_reduction_funcs.get_smem_slots_plus_1
     get_smem_slots_contacts = contact_reduction_funcs.get_smem_slots_contacts
 
-    @wp.kernel(enable_backward=False)
+    @wp.kernel(enable_backward=False, module="unique")
     def mesh_sdf_collision_reduce_kernel(
         shape_data: wp.array(dtype=wp.vec4),
         shape_transform: wp.array(dtype=wp.transform),
         shape_source: wp.array(dtype=wp.uint64),
         sdf_table: wp.array(dtype=SDFData),
         shape_sdf_index: wp.array(dtype=wp.int32),
-        shape_contact_margin: wp.array(dtype=float),
+        shape_gap: wp.array(dtype=float),
         shape_collision_aabb_lower: wp.array(dtype=wp.vec3),
         shape_collision_aabb_upper: wp.array(dtype=wp.vec3),
         shape_voxel_resolution: wp.array(dtype=wp.vec3i),
@@ -917,7 +917,7 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
             pair = shape_pairs_mesh_mesh[pair_idx]
 
             # Sum margins for contact detection (needed for all modes)
-            margin = shape_contact_margin[pair[0]] + shape_contact_margin[pair[1]]
+            margin = shape_gap[pair[0]] + shape_gap[pair[1]]
 
             # Initialize (shared memory) buffers for contact reduction
             empty_marker = wp.static(-MAXVAL)
@@ -1147,8 +1147,8 @@ def create_narrow_phase_process_mesh_mesh_contacts_kernel(
                 contact_data.contact_distance = contact.depth
                 contact_data.radius_eff_a = 0.0
                 contact_data.radius_eff_b = 0.0
-                contact_data.thickness_a = shape_data[pair[0]][3]
-                contact_data.thickness_b = shape_data[pair[1]][3]
+                contact_data.margin_a = shape_data[pair[0]][3]
+                contact_data.margin_b = shape_data[pair[1]][3]
                 contact_data.shape_a = pair[0]
                 contact_data.shape_b = pair[1]
                 contact_data.margin = margin

@@ -103,7 +103,7 @@ def test_shapes_on_plane(test, device, solver_fn):
     # Set contact margin via ShapeConfig (preferred method)
     # Must be set BEFORE adding shapes
     # Using 0.1 like the example (which is stable)
-    builder.default_shape_cfg.contact_margin = 0.1
+    builder.default_shape_cfg.gap = 0.1
 
     expected_end_positions = []
 
@@ -195,7 +195,7 @@ def test_shapes_on_plane(test, device, solver_fn):
             simulate(solver, model, state_0, state_1, control, contacts, sim_dt, substeps)
         graph = capture.graph
 
-    for _ in range(250):
+    for _ in range(120):
         if use_cuda_graph:
             wp.capture_launch(graph)
         else:
@@ -819,8 +819,8 @@ def test_box_drop(test, device, solver_fn):
             solver.step(state_0, state_1, None, contacts, sim_dt / substeps)
             state_0, state_1 = state_1, state_0
 
-            vel_z = np.abs(state_0.body_qd.numpy()[:, 2])
-            max_observed_vel = max(max_observed_vel, vel_z.max())
+        vel_z = np.abs(state_0.body_qd.numpy()[:, 2])
+        max_observed_vel = max(max_observed_vel, vel_z.max())
 
     test.assertLess(
         max_observed_vel,

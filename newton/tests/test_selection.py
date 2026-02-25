@@ -37,7 +37,7 @@ class TestSelection(unittest.TestCase):
         builder = newton.ModelBuilder()
         body = builder.add_link()
         joint = builder.add_joint_free(child=body)
-        builder.add_articulation([joint], key="my_articulation")
+        builder.add_articulation([joint], label="my_articulation")
         model = builder.finalize()
         control = model.control()
         selection = ArticulationView(model, pattern="my_articulation", exclude_joint_types=[newton.JointType.FREE])
@@ -46,6 +46,26 @@ class TestSelection(unittest.TestCase):
         self.assertEqual(selection.get_dof_positions(model).shape, (1, 1, 0))
         self.assertEqual(selection.get_dof_velocities(model).shape, (1, 1, 0))
         self.assertEqual(selection.get_dof_forces(control).shape, (1, 1, 0))
+
+    def test_fixed_joint_only_articulation(self):
+        """Regression test for issue #920: ArticulationView with only fixed joints."""
+        builder = newton.ModelBuilder()
+        parent = builder.add_link()
+        child = builder.add_link()
+        j0 = builder.add_joint_fixed(parent=-1, child=parent)
+        j1 = builder.add_joint_fixed(parent=parent, child=child)
+        builder.add_articulation([j0, j1], label="fixed_only")
+        model = builder.finalize()
+        state = model.state()
+        control = model.control()
+        view = ArticulationView(model, pattern="fixed_only")
+        self.assertEqual(view.count, 1)
+        self.assertEqual(view.joint_dof_count, 0)
+        self.assertEqual(view.joint_coord_count, 0)
+        self.assertEqual(view.get_root_transforms(model).shape, (1, 1))
+        self.assertEqual(view.get_dof_positions(state).shape, (1, 1, 0))
+        self.assertEqual(view.get_dof_velocities(state).shape, (1, 1, 0))
+        self.assertEqual(view.get_dof_forces(control).shape, (1, 1, 0))
 
     def _test_selection_shapes(self, floating: bool):
         # load articulation
@@ -87,7 +107,7 @@ class TestSelection(unittest.TestCase):
         self.assertEqual(single_ant_view.get_attribute("joint_type", single_ant_model).shape, (1, 1, J))
         self.assertEqual(single_ant_view.get_attribute("joint_dof_dim", single_ant_model).shape, (1, 1, J, 2))
         self.assertEqual(single_ant_view.get_attribute("joint_limit_ke", single_ant_model).shape, (1, 1, D))
-        self.assertEqual(single_ant_view.get_attribute("shape_thickness", single_ant_model).shape, (1, 1, S))
+        self.assertEqual(single_ant_view.get_attribute("shape_margin", single_ant_model).shape, (1, 1, S))
 
         W = 10  # num worlds
 
@@ -122,7 +142,7 @@ class TestSelection(unittest.TestCase):
             single_ant_per_world_view.get_attribute("joint_limit_ke", single_ant_per_world_model).shape, (W, 1, D)
         )
         self.assertEqual(
-            single_ant_per_world_view.get_attribute("shape_thickness", single_ant_per_world_model).shape, (W, 1, S)
+            single_ant_per_world_view.get_attribute("shape_margin", single_ant_per_world_model).shape, (W, 1, S)
         )
 
         A = 3  # num articulations per world
@@ -161,7 +181,7 @@ class TestSelection(unittest.TestCase):
             multi_ant_per_world_view.get_attribute("joint_limit_ke", multi_ant_per_world_model).shape, (W, A, D)
         )
         self.assertEqual(
-            multi_ant_per_world_view.get_attribute("shape_thickness", multi_ant_per_world_model).shape, (W, A, S)
+            multi_ant_per_world_view.get_attribute("shape_margin", multi_ant_per_world_model).shape, (W, A, S)
         )
 
     def test_selection_shapes_floating_base(self):
@@ -173,42 +193,42 @@ class TestSelection(unittest.TestCase):
     def test_selection_shape_values_noncontiguous(self):
         """Test that shape attribute values are correct when shape selection is non-contiguous."""
         # Build a 3-link chain: base -> link1 -> link2
-        # Each link has one shape with a distinct thickness value
+        # Each link has one shape with a distinct margin value
         robot = newton.ModelBuilder()
 
-        thicknesses = [0.001, 0.002, 0.003]
+        margins = [0.001, 0.002, 0.003]
 
-        base = robot.add_link(xform=wp.transform([0, 0, 0], wp.quat_identity()), mass=1.0, key="base")
+        base = robot.add_link(xform=wp.transform([0, 0, 0], wp.quat_identity()), mass=1.0, label="base")
         robot.add_shape_box(
             base,
             hx=0.1,
             hy=0.1,
             hz=0.1,
-            cfg=newton.ModelBuilder.ShapeConfig(thickness=thicknesses[0]),
-            key="shape_base",
+            cfg=newton.ModelBuilder.ShapeConfig(margin=margins[0]),
+            label="shape_base",
         )
 
-        link1 = robot.add_link(xform=wp.transform([0, 0, 0.5], wp.quat_identity()), mass=0.5, key="link1")
+        link1 = robot.add_link(xform=wp.transform([0, 0, 0.5], wp.quat_identity()), mass=0.5, label="link1")
         robot.add_shape_capsule(
             link1,
             radius=0.05,
             half_height=0.2,
-            cfg=newton.ModelBuilder.ShapeConfig(thickness=thicknesses[1]),
-            key="shape_link1",
+            cfg=newton.ModelBuilder.ShapeConfig(margin=margins[1]),
+            label="shape_link1",
         )
 
-        link2 = robot.add_link(xform=wp.transform([0, 0, 1.0], wp.quat_identity()), mass=0.3, key="link2")
+        link2 = robot.add_link(xform=wp.transform([0, 0, 1.0], wp.quat_identity()), mass=0.3, label="link2")
         robot.add_shape_sphere(
             link2,
             radius=0.05,
-            cfg=newton.ModelBuilder.ShapeConfig(thickness=thicknesses[2]),
-            key="shape_link2",
+            cfg=newton.ModelBuilder.ShapeConfig(margin=margins[2]),
+            label="shape_link2",
         )
 
         j0 = robot.add_joint_free(child=base)
         j1 = robot.add_joint_revolute(parent=base, child=link1, axis=[0, 1, 0])
         j2 = robot.add_joint_revolute(parent=link1, child=link2, axis=[0, 1, 0])
-        robot.add_articulation([j0, j1, j2], key="robot")
+        robot.add_articulation([j0, j1, j2], label="robot")
 
         W = 3
         scene = newton.ModelBuilder()
@@ -222,17 +242,17 @@ class TestSelection(unittest.TestCase):
         self.assertFalse(view.shapes_contiguous, "Expected non-contiguous shape selection")
         self.assertEqual(view.shape_count, 2)
 
-        # read shape_thickness through ArticulationView and check values
-        vals = view.get_attribute("shape_thickness", model)
+        # read shape_margin through ArticulationView and check values
+        vals = view.get_attribute("shape_margin", model)
         self.assertEqual(vals.shape, (W, 1, 2))
         vals_np = vals.numpy()
 
-        expected = [thicknesses[0], thicknesses[2]]  # base and link2 (link1 excluded)
+        expected = [margins[0], margins[2]]  # base and link2 (link1 excluded)
         for w in range(W):
-            for s, expected_thickness in enumerate(expected):
+            for s, expected_margin in enumerate(expected):
                 self.assertAlmostEqual(
                     float(vals_np[w, 0, s]),
-                    expected_thickness,
+                    expected_margin,
                     places=6,
                     msg=f"world={w}, shape={s}",
                 )
@@ -329,11 +349,11 @@ class TestSelection(unittest.TestCase):
             single_world_builder.add_builder(single_articuation_builder)
 
         # Customise the articulation keys in single_world_builder
-        single_world_builder.articulation_key[1] = "art1"
+        single_world_builder.articulation_label[1] = "art1"
         if use_multiple_artics_per_view:
-            single_world_builder.articulation_key[0] = "art1"
+            single_world_builder.articulation_label[0] = "art1"
         else:
-            single_world_builder.articulation_key[0] = "art0"
+            single_world_builder.articulation_label[0] = "art0"
 
         # Create 3 worlds with two articulations per world and 3 joints per articulation.
         builder = newton.ModelBuilder()
@@ -732,11 +752,11 @@ class TestSelection(unittest.TestCase):
             single_world_builder.add_builder(single_articulation_builder)
 
         # Customise the articulation keys in single_world_builder
-        single_world_builder.articulation_key[0] = "art0"
+        single_world_builder.articulation_label[0] = "art0"
         if use_multiple_artics_per_view:
-            single_world_builder.articulation_key[1] = "art0"
+            single_world_builder.articulation_label[1] = "art0"
         else:
-            single_world_builder.articulation_key[1] = "art1"
+            single_world_builder.articulation_label[1] = "art1"
 
         # Create 3 worlds with 2 articulations per world and 4 links per articulation.
         builder = newton.ModelBuilder()
