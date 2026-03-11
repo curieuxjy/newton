@@ -9,7 +9,7 @@ import warp as wp
 
 import newton
 import newton.examples
-from newton import ActuatorMode
+from newton import JointTargetMode
 
 
 class Example:
@@ -159,7 +159,7 @@ class Example:
             builder.joint_target_kd[i] = 20.0   # Increased from 5
             builder.joint_effort_limit[i] = 20.0
             builder.joint_armature[i] = 0.05    # Increased from 0.01
-            builder.joint_act_mode[i] = int(ActuatorMode.POSITION)
+            builder.joint_act_mode[i] = int(JointTargetMode.POSITION)
 
         # Set initial Allegro pose to midpoints of joint limits
         allegro_lower = np.array(builder.joint_limit_lower[allegro_dof_start:allegro_dof_start + self.allegro_dof_count])

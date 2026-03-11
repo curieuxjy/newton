@@ -43,7 +43,7 @@ class Example:
             child_xform=wp.transform(p=wp.vec3(-1.0, 0.0, 0.0), q=wp.quat_identity()),
         )
 
-        builder.add_articulation([j0], key="my_pendulum")
+        builder.add_articulation([j0], label="my_pendulum")
 
         # 바닥 추가
         builder.add_ground_plane()

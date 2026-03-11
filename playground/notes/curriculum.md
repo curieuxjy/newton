@@ -66,7 +66,7 @@ uv run -m newton.examples robot_ur10
 **핵심 개념:**
 - `ModelBuilder.add_usd()` - USD 파일 로드
 - `ArticulationView` - 다중 월드에서 로봇 일괄 접근
-- `ActuatorMode.POSITION` - 위치 제어
+- `JointTargetMode.POSITION` - 위치 제어
 - `.replicate()` - 월드 복제
 
 **실습:** `num_envs` 값을 바꿔보며 성능 차이 관찰

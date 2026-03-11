@@ -5,6 +5,191 @@
 
 ---
 
+## 2026-03-11 업데이트
+
+### 커밋 범위
+`0680eb07..8c909e42` (main branch merge)
+
+### 주요 변경 사항
+
+#### 1. ⚠️⚠️ `ActuatorMode` → `JointTargetMode` 이름 변경 (#1749)
+**커밋**: `fced0442` (API Refactor v2)
+
+`ActuatorMode` enum이 `JointTargetMode`로 이름 변경되고, `BroadPhaseInstance`, `BroadPhaseMode` export가 제거됨.
+
+```python
+# Old
+from newton import ActuatorMode
+builder.joint_act_mode[i] = int(ActuatorMode.POSITION)
+
+# New
+from newton import JointTargetMode
+builder.joint_act_mode[i] = int(JointTargetMode.POSITION)
+```
+
+**영향받는 playground 파일** (모두 수정 완료 ✅):
+- `franka_allegro_grasp/env.py`: import + 2개소
+- `franka_allegro/example_franka_allegro.py`: import + 1개소
+- `load_allegro_official.py`: import + 1개소
+- `allegro_cube_ppo/env.py`: import + 1개소
+- `allegro_cube_ppo/visualize.py`: import + 1개소
+- `notes/curriculum.md`: 1개소
+
+#### 2. ⚠️⚠️ `SensorTiledCamera.Options` → `SensorTiledCamera.Config` (#1767)
+**커밋**: `cecaa3b9`
+
+Warp Raytrace 통합으로 `Options` 클래스가 `Config`로, 생성자 파라미터 `options=` → `config=`로 변경됨.
+
+```python
+# Old
+sensor = SensorTiledCamera(model, options=SensorTiledCamera.Options(default_light=True))
+
+# New
+sensor = SensorTiledCamera(model, config=SensorTiledCamera.Config(default_light=True))
+```
+
+**영향받는 playground 파일** (수정 완료 ✅):
+- `franka_allegro_grasp/env.py`: `Options(...)` → `Config(...)`, `options=` → `config=`
+
+#### 3. ⚠️⚠️ `SensorContact.update()` 시그니처 변경 (#1759)
+**커밋**: `f999d593`
+
+`SensorContact.update()` 메서드에 `state` 파라미터가 추가됨. `MatchKind` → `ObjectType` 이름 변경.
+
+```python
+# Old
+sensor.update(contacts)
+SensorContact.MatchKind.MATCH_ANY
+
+# New
+sensor.update(state, contacts)
+SensorContact.ObjectType.TOTAL
+```
+
+**영향**: playground에서 `SensorContact.update()`를 직접 호출하는 곳 없음 (env.py에서는 contact sensor를 boolean 접촉 검출에만 사용). 영향 없음.
+
+#### 4. ⚠️⚠️ Solver `step()` 반환값 제거 (#1968)
+**커밋**: `774d3e56`
+
+모든 Solver의 `step()` 메서드가 더 이상 `State`를 반환하지 않음 (`None` 반환).
+
+```python
+# Old
+state_out = solver.step(state_in, state_out, control, contacts, dt)
+
+# New
+solver.step(state_in, state_out, control, contacts, dt)
+# state_out은 in-place로 수정됨; 반환값 없음
+```
+
+**영향**: playground 코드에서 반환값을 사용하지 않으므로 **영향 없음**. 모든 파일이 이미 `solver.step(...)` 호출 후 `state_0, state_1 = state_1, state_0` 패턴 사용 중.
+
+#### 5. ⚠️ 기본 Joint Armature 변경: 0.01 → 0 (#1782)
+**커밋**: `821d4daa`
+
+`add_link()` 메서드의 `armature` 기본값이 `0.01` → `0.0`으로 변경됨.
+
+```python
+# Old
+builder.add_link(...)  # armature=0.01 암시적
+
+# New
+builder.add_link(...)  # armature=0.0 암시적
+# 이전 동작 유지하려면: builder.add_link(..., armature=0.01)
+```
+
+**영향**: playground 코드에서 `joint_armature`를 명시적으로 설정하므로 직접 영향 없음.
+- `franka_allegro_grasp/env.py`: config에서 armature 값 명시
+- `franka_allegro/example_franka_allegro.py`: `armature=0.05` 명시
+
+#### 6. ⚠️ Kinematic Links 지원 추가 (#1884)
+**커밋**: `e68bb783`
+
+`add_link()`에 `is_kinematic` 파라미터 추가. `custom_attributes` 파라미터 위치 변경.
+
+```python
+# Old
+builder.add_link(xform, mass=1.0, label="link", custom_attributes={...})
+
+# New (custom_attributes가 is_kinematic 뒤로 이동)
+builder.add_link(xform, mass=1.0, label="link", is_kinematic=False, custom_attributes={...})
+```
+
+**영향**: playground에서 `custom_attributes`를 위치 인자로 사용하지 않으므로 영향 없음.
+
+#### 7. ⚠️ Math 함수 이동: `newton.utils` → `newton.math` (#1717)
+**커밋**: `513711f3`
+
+quaternion/transform 유틸리티 함수들이 `newton.utils`에서 `newton.math`로 이동.
+
+```python
+# Old
+from newton.utils import transform_twist, quat_from_euler
+
+# New
+from newton.math import transform_twist, quat_from_euler
+```
+
+**영향**: playground에서 이 함수들을 import하지 않으므로 영향 없음.
+
+#### 8. ⚠️ `SensorTiledCamera.ClearData` public 노출 (#1985)
+**커밋**: `4b5a6948`
+
+`ClearData` 클래스가 public API로 노출됨. 기존 코드에 영향 없음 (새 기능 추가).
+
+#### 9. Kamino Solver 추가 (#1915)
+**커밋**: `3326d8ee`
+
+새로운 `SolverKamino` (Beta 1) 추가. 기존 solver에 영향 없음.
+
+```python
+from newton.solvers import SolverKamino
+solver = SolverKamino(model, config)
+```
+
+#### 10. 기타 변경
+
+- **Warp >= 1.12.0 필수** (#1993, `2be8c0d8`): `uv sync` 시 자동 업데이트
+- **newton.usd public API 노출** (#1848, `7fdab859`): `newton.usd` 모듈 공개
+- **TetMesh 클래스 추가** (#1790, `0ddb36ee`): 사면체 메시 변형체 지원
+- **Shader Options 추가** (#1969, `2b541a24`): viewer shader 커스터마이제이션
+- **Gaussian Splats 지원** (#1882, `7d9cd1b4`): 3D 가우시안 스플랫 렌더링
+- **USD color/texture 읽기** (#1980, `56fd7f12`): `usd.utils.get_mesh()`에 색상/텍스처 로딩
+- **SensorContact 초기화 최적화** (#2008, `aee222b2`): 다중 월드 성능 개선
+- **Multi-GPU 디바이스 스코핑 수정** (#1972, `9ae44d32`)
+- **Prismatic joints GL viewer 표시** (#2038, `d52d2a11`)
+- **Loop closure + collapse fixed joints 수정** (#2026, `b5034756`)
+- **Fixed base articulation USD 임포트 수정** (#2018, `3f240ad0`)
+- **Kinematic body flag USD 파싱** (#2005, `336614c7`)
+- **VBD solver kinematic body 지원** (#1974, `c1a196f2`)
+- **Allegro hand 예제에 명시적 armature 추가** (#1916, `0dd7962d`)
+- **예제 prefix-first 이름 규칙 적용** (#1802, `7e69cf8b`)
+- **MuJoCo margin/gap 변환 수정** (#1785, `779ae6b4`)
+- **CUDA SDF 컨텍스트 손상 수정** (#1792, `0ba0b61e`)
+- **max velocity 파싱 수정** (#1936, `38df7904`)
+
+#### 11. 의존성 업데이트
+
+| 패키지 | Old | New |
+|--------|-----|-----|
+| `warp-lang` | `>=1.11.0` | `>=1.12.0` |
+| `newton-usd-schemas` | `>=0.1.0rc3` | `0.1.0` |
+| `imgui_bundle` | - | 버그 수정 (>=1.92.6 호환) |
+
+---
+
+### Playground 호환성 체크리스트 (2026-03-11)
+
+- [x] **`ActuatorMode` → `JointTargetMode` 이름 변경** ✅ 6개 파일 수정 완료
+- [x] **`SensorTiledCamera.Options` → `.Config`** ✅ 수정 완료
+- [ ] **`SensorContact.update(state, contacts)` 시그니처 변경** (playground에서 직접 호출 없음, 영향 없음)
+- [ ] **Solver `step()` 반환값 제거** (playground에서 반환값 미사용, 영향 없음)
+- [ ] **기본 armature 0.01 → 0** (playground에서 명시적 설정, 영향 없음)
+- [ ] **Math 함수 이동** (playground에서 미사용, 영향 없음)
+- [ ] **Warp >= 1.12.0 업데이트** (`uv sync` 필요)
+
+---
+
 ## 2026-02-25 업데이트
 
 ### 커밋 범위

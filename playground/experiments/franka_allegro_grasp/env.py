@@ -14,7 +14,7 @@ import torch
 import warp as wp
 
 import newton
-from newton import ActuatorMode, Contacts
+from newton import JointTargetMode, Contacts
 from newton.sensors import SensorContact, SensorTiledCamera
 
 from .config import EnvConfig
@@ -217,7 +217,7 @@ class FrankaAllegroGraspEnv:
             single_env_builder.joint_target_kd[i] = self.config.franka_damping
             single_env_builder.joint_effort_limit[i] = self.config.franka_effort_limit
             single_env_builder.joint_armature[i] = self.config.franka_armature
-            single_env_builder.joint_act_mode[i] = int(ActuatorMode.POSITION)
+            single_env_builder.joint_act_mode[i] = int(JointTargetMode.POSITION)
 
         # Initial Franka pose - arm extended forward
         franka_init_q = [0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.785]
@@ -279,7 +279,7 @@ class FrankaAllegroGraspEnv:
             single_env_builder.joint_target_kd[i] = self.config.hand_damping
             single_env_builder.joint_effort_limit[i] = self.config.hand_effort_limit
             single_env_builder.joint_armature[i] = self.config.hand_armature
-            single_env_builder.joint_act_mode[i] = int(ActuatorMode.POSITION)
+            single_env_builder.joint_act_mode[i] = int(JointTargetMode.POSITION)
 
         # Initial Allegro pose (slightly open)
         allegro_init_q = [0.0, 0.3, 0.3, 0.3] * 4  # 4 fingers
@@ -333,7 +333,7 @@ class FrankaAllegroGraspEnv:
         )
         cube_body_idx = single_env_builder.add_body(
             xform=cube_xform,
-            key="cube",
+            label="cube",
         )
         single_env_builder.add_shape_box(
             body=cube_body_idx,
@@ -428,7 +428,7 @@ class FrankaAllegroGraspEnv:
         # New API: width/height/num_cameras moved from constructor to create_*_output methods
         self.depth_sensor = SensorTiledCamera(
             model=self.model,
-            options=SensorTiledCamera.Options(
+            config=SensorTiledCamera.Config(
                 default_light=True,
                 colors_per_shape=True,
             ),
