@@ -59,7 +59,7 @@ def test_sand_cube_on_plane(test, device):
     state_0: newton.State = model.state()
     state_1: newton.State = model.state()
 
-    options = SolverImplicitMPM.Options()
+    options = SolverImplicitMPM.Config()
     options.grid_type = "dense"  # use dense grid as sparse grid is GPU-only
     options.voxel_size = voxel_size
 
@@ -83,7 +83,7 @@ def test_sand_cube_on_plane(test, device):
     assert np.all(bb_max < 2 * N * voxel_size)
 
     # Checks that contact impulses are consistent
-    impulses, impulse_positions, _collider_ids = solver.collect_collider_impulses(state_0)
+    impulses, impulse_positions, _collider_ids = solver._collect_collider_impulses(state_0)
 
     impulses = impulses.numpy()
     impulse_positions = impulse_positions.numpy()
@@ -162,7 +162,7 @@ def test_finite_difference_collider_velocity(test, device):
         state_0 = model.state()
         state_1 = model.state()
 
-        options = SolverImplicitMPM.Options()
+        options = SolverImplicitMPM.Config()
         options.voxel_size = voxel_size
         options.grid_type = "dense"
         options.collider_velocity_mode = velocity_mode

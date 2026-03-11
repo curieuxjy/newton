@@ -17,7 +17,7 @@ import contextlib
 import os
 import warnings
 from collections import defaultdict
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import warp as wp
@@ -114,6 +114,15 @@ def compute_shape_radius(geo_type: int, scale: Vec3, src: Mesh | Heightfield | N
             return np.sqrt(half_x**2 + half_y**2 + half_z**2)
         else:
             return np.linalg.norm(scale)
+    elif geo_type == GeoType.GAUSSIAN:
+        if src is not None:
+            lower, upper = src.compute_aabb()
+            scale_arr = np.abs(np.asarray(scale, dtype=np.float32))
+            vmax = np.maximum(np.abs(lower), np.abs(upper)) * scale_arr
+            if hasattr(src, "scales") and len(src.scales) > 0:
+                vmax = vmax + np.max(np.abs(src.scales), axis=0) * scale_arr
+            return float(np.linalg.norm(vmax))
+        return 10.0
     else:
         return 10.0
 
@@ -430,7 +439,13 @@ def silence_stdio():
         devnull.close()
 
 
-def remesh_ftetwild(vertices, faces, optimize=False, edge_length_fac=0.05, verbose=False):
+def remesh_ftetwild(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    optimize: bool = False,
+    edge_length_fac: float = 0.05,
+    verbose: bool = False,
+):
     """Remesh a 3D triangular surface mesh using "Fast Tetrahedral Meshing in the Wild" (fTetWild).
 
     This is useful for improving the quality of the mesh, and for ensuring that the mesh is
@@ -497,7 +512,7 @@ def remesh_ftetwild(vertices, faces, optimize=False, edge_length_fac=0.05, verbo
     return new_vertices, new_faces
 
 
-def remesh_alphashape(vertices, alpha: float = 3.0):
+def remesh_alphashape(vertices: np.ndarray, alpha: float = 3.0):
     """Remesh a 3D triangular surface mesh using the alpha shape algorithm.
 
     Args:
@@ -515,7 +530,13 @@ def remesh_alphashape(vertices, alpha: float = 3.0):
     return np.array(alpha_shape.vertices), np.array(alpha_shape.faces, dtype=np.int32)
 
 
-def remesh_quadratic(vertices, faces, target_reduction=0.5, target_count=None, **kwargs):
+def remesh_quadratic(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    target_reduction: float = 0.5,
+    target_count: int | None = None,
+    **kwargs: Any,
+):
     """Remesh a 3D triangular surface mesh using fast quadratic mesh simplification.
 
     https://github.com/pyvista/fast-simplification
@@ -534,7 +555,7 @@ def remesh_quadratic(vertices, faces, target_reduction=0.5, target_count=None, *
     return simplify(vertices, faces, target_reduction=target_reduction, target_count=target_count, **kwargs)
 
 
-def remesh_convex_hull(vertices, maxhullvert: int = 0):
+def remesh_convex_hull(vertices: np.ndarray, maxhullvert: int = 0):
     """Compute the convex hull of a set of 3D points and return the vertices and faces of the convex hull mesh.
 
     Uses ``scipy.spatial.ConvexHull`` to compute the convex hull.
@@ -582,7 +603,11 @@ RemeshingMethod = Literal["ftetwild", "alphashape", "quadratic", "convex_hull", 
 
 
 def remesh(
-    vertices, faces, method: RemeshingMethod = "quadratic", visualize=False, **remeshing_kwargs
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    method: RemeshingMethod = "quadratic",
+    visualize: bool = False,
+    **remeshing_kwargs: Any,
 ) -> tuple[nparray, nparray]:
     """
     Remeshes a 3D triangular surface mesh using the specified method.
@@ -630,19 +655,19 @@ def remesh_mesh(
     method: RemeshingMethod = "quadratic",
     recompute_inertia: bool = False,
     inplace: bool = False,
-    **remeshing_kwargs,
+    **remeshing_kwargs: Any,
 ) -> Mesh:
     """
     Remeshes a Mesh object using the specified remeshing method.
 
     Args:
-        mesh (Mesh): The mesh to be remeshed.
-        method (RemeshingMethod, optional): The remeshing method to use.
+        mesh: The mesh to be remeshed.
+        method: The remeshing method to use.
             One of "ftetwild", "quadratic", "convex_hull", "alphashape", or "poisson".
             Defaults to "quadratic".
-        recompute_inertia (bool, optional): If True, recompute the mass, center of mass,
+        recompute_inertia: If True, recompute the mass, center of mass,
             and inertia tensor of the mesh after remeshing. Defaults to False.
-        inplace (bool, optional): If True, modify the mesh in place. If False,
+        inplace: If True, modify the mesh in place. If False,
             return a new mesh instance with the remeshed geometry. Defaults to False.
         **remeshing_kwargs: Additional keyword arguments passed to the remeshing function.
 
@@ -656,7 +681,7 @@ def remesh_mesh(
         mesh.vertices = vertices
         mesh.indices = indices.flatten()
         if recompute_inertia:
-            mesh.mass, mesh.com, mesh.I, _ = compute_inertia_mesh(1.0, vertices, indices, is_solid=mesh.is_solid)
+            mesh.mass, mesh.com, mesh.inertia, _ = compute_inertia_mesh(1.0, vertices, indices, is_solid=mesh.is_solid)
     else:
         return mesh.copy(vertices=vertices, indices=indices, recompute_inertia=recompute_inertia)
     return mesh
@@ -705,7 +730,12 @@ def scan_with_total(
         total: Single-element output array that will contain the sum of all counts.
     """
     wp.utils.array_scan(counts, prefix_sums, inclusive=False)
-    wp.launch(get_total_kernel, dim=[1], inputs=[counts, prefix_sums, num_elements, counts.shape[0], total])
+    wp.launch(
+        get_total_kernel,
+        dim=[1],
+        inputs=[counts, prefix_sums, num_elements, counts.shape[0], total],
+        device=counts.device,
+    )
 
 
 __all__ = ["compute_shape_radius", "load_mesh", "visualize_meshes"]

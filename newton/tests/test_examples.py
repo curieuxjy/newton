@@ -81,9 +81,9 @@ def add_example_test(
 ):
     """Registers a Newton example to run on ``devices`` as a TestCase."""
 
-    # verify the module exists
-    file_exists = os.path.exists(f"newton/examples/{name.replace('.', '/')}.py")
-    if not file_exists:
+    # verify the module exists (use package-relative path so this works from any CWD)
+    _examples_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
+    if not os.path.exists(os.path.join(_examples_dir, f"{name.replace('.', '/')}.py")):
         raise ValueError(f"Example {name} does not exist")
 
     if test_options is None:
@@ -343,7 +343,7 @@ add_example_test(
 )
 add_example_test(
     TestClothExamples,
-    name="cloth.example_rolling_cloth",
+    name="cloth.example_cloth_rollers",
     devices=cuda_test_devices,
     test_options={"num-frames": 200},
     use_viewer=True,
@@ -418,7 +418,7 @@ add_example_test(
     TestRobotExamples,
     name="robot.example_robot_panda_hydro",
     devices=cuda_test_devices,
-    test_options={"usd_required": True, "num-frames": 600},
+    test_options={"usd_required": True, "num-frames": 720},
     use_viewer=True,
 )
 
@@ -513,16 +513,8 @@ add_example_test(TestIKExamples, name="ik.example_ik_custom", devices=cuda_test_
 
 add_example_test(
     TestIKExamples,
-    name="ik.example_ik_benchmark",
-    devices=test_devices,
-    test_options_cpu={"batch_sizes": [1, 10]},
-    use_viewer=True,
-)
-
-add_example_test(
-    TestIKExamples,
     name="ik.example_ik_cube_stacking",
-    test_options_cuda={"world-count": 16, "cube-count": 2, "num-frames": 1400},  # "cube-count": 3, "num-frames": 2000
+    test_options_cuda={"world-count": 16, "num-frames": 2000},
     devices=cuda_test_devices,
     use_viewer=True,
 )
@@ -699,14 +691,21 @@ add_example_test(
     TestContactsExamples,
     name="contacts.example_nut_bolt_sdf",
     devices=cuda_test_devices,
-    test_options={"num-frames": 120, "world-count": 1, "scene": "nut_bolt"},
+    test_options={"num-frames": 120, "world-count": 1},
     use_viewer=True,
 )
 add_example_test(
     TestContactsExamples,
     name="contacts.example_nut_bolt_hydro",
     devices=cuda_test_devices,
-    test_options={"num-frames": 120, "world-count": 1, "scene": "nut_bolt"},
+    test_options={"num-frames": 120, "world-count": 1},
+    use_viewer=True,
+)
+add_example_test(
+    TestContactsExamples,
+    name="contacts.example_brick_stacking",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 1200},
     use_viewer=True,
 )
 
@@ -717,14 +716,14 @@ class TestMultiphysicsExamples(unittest.TestCase):
 
 add_example_test(
     TestMultiphysicsExamples,
-    name="multiphysics.example_falling_gift",
+    name="multiphysics.example_softbody_gift",
     devices=cuda_test_devices,
     test_options={"num-frames": 200},
     use_viewer=True,
 )
 add_example_test(
     TestMultiphysicsExamples,
-    name="multiphysics.example_poker_cards_stacking",
+    name="cloth.example_cloth_poker_cards",
     devices=cuda_test_devices,
     test_options={"num-frames": 30},
     use_viewer=True,

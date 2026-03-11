@@ -27,6 +27,7 @@ from ..geometry.collision_core import compute_tight_aabb_from_support
 from ..geometry.contact_data import ContactData
 from ..geometry.kernels import create_soft_contacts
 from ..geometry.narrow_phase import NarrowPhase
+from ..geometry.sdf_hydroelastic import HydroelasticSDF
 from ..geometry.support_function import (
     GenericShapeData,
     SupportMapDataProvider,
@@ -281,7 +282,7 @@ def _estimate_rigid_contact_max(model: Model) -> int:
     MESH_CPP = 40
     MAX_NEIGHBORS_PER_SHAPE = 20
 
-    mesh_mask = shape_types == int(GeoType.MESH)
+    mesh_mask = (shape_types == int(GeoType.MESH)) | (shape_types == int(GeoType.HFIELD))
     plane_mask = shape_types == int(GeoType.PLANE)
     non_plane_mask = ~plane_mask
     num_meshes = int(np.count_nonzero(mesh_mask))
@@ -352,8 +353,6 @@ def _estimate_rigid_contact_max(model: Model) -> int:
 
 
 BROAD_PHASE_MODES = ("nxn", "sap", "explicit")
-BroadPhaseMode = Literal["nxn", "sap", "explicit"]
-BroadPhaseInstance = BroadPhaseAllPairs | BroadPhaseSAP | BroadPhaseExplicit
 
 
 def _normalize_broad_phase_mode(mode: str) -> str:
@@ -363,7 +362,7 @@ def _normalize_broad_phase_mode(mode: str) -> str:
     return mode_str
 
 
-def _infer_broad_phase_mode_from_instance(broad_phase: BroadPhaseInstance) -> str:
+def _infer_broad_phase_mode_from_instance(broad_phase: BroadPhaseAllPairs | BroadPhaseSAP | BroadPhaseExplicit) -> str:
     if isinstance(broad_phase, BroadPhaseAllPairs):
         return "nxn"
     if isinstance(broad_phase, BroadPhaseSAP):
@@ -395,42 +394,56 @@ class CollisionPipeline:
         *,
         reduce_contacts: bool = True,
         rigid_contact_max: int | None = None,
+        max_triangle_pairs: int = 1000000,
+        max_heightfield_cell_pairs: int = 1000000,
         shape_pairs_filtered: wp.array(dtype=wp.vec2i) | None = None,
         soft_contact_max: int | None = None,
         soft_contact_margin: float = 0.01,
         requires_grad: bool | None = None,
-        broad_phase: BroadPhaseMode | BroadPhaseInstance | None = None,
+        broad_phase: Literal["nxn", "sap", "explicit"]
+        | BroadPhaseAllPairs
+        | BroadPhaseSAP
+        | BroadPhaseExplicit
+        | None = None,
         narrow_phase: NarrowPhase | None = None,
-        sdf_hydroelastic_config: NarrowPhase.HydroelasticSDF.Config | None = None,
+        sdf_hydroelastic_config: HydroelasticSDF.Config | None = None,
     ):
         """
         Initialize the CollisionPipeline (expert API).
 
         Args:
-            model (Model): The simulation model.
-            reduce_contacts (bool, optional): Whether to reduce contacts for mesh-mesh collisions. Defaults to True.
-            rigid_contact_max (int | None, optional): Maximum number of rigid contacts to allocate.
+            model: The simulation model.
+            reduce_contacts: Whether to reduce contacts for mesh-mesh collisions. Defaults to True.
+            rigid_contact_max: Maximum number of rigid contacts to allocate.
                 Resolution order:
                 - If provided, use this value.
                 - Else if ``model.rigid_contact_max > 0``, use the model value.
                 - Else estimate automatically from model shape and pair metadata.
-            soft_contact_max (int | None, optional): Maximum number of soft contacts to allocate.
+            max_triangle_pairs:
+                Maximum number of mesh-triangle pairs allocated by narrow phase.
+                Increase this when scenes with large/complex meshes report
+                triangle-pair overflow warnings.
+            max_heightfield_cell_pairs:
+                Maximum number of heightfield cell pairs allocated by narrow phase.
+                Increase this when scenes with large/complex heightfields report
+                heightfield-cell-pair overflow warnings.
+            soft_contact_max: Maximum number of soft contacts to allocate.
                 If None, computed as shape_count * particle_count.
-            soft_contact_margin (float, optional): Margin for soft contact generation. Defaults to 0.01.
-            requires_grad (bool | None, optional): Whether to enable gradient computation. If None, uses model.requires_grad.
-            broad_phase (BroadPhaseMode | BroadPhaseAllPairs | BroadPhaseSAP | BroadPhaseExplicit | None, optional):
+            soft_contact_margin: Margin for soft contact generation. Defaults to 0.01.
+            requires_grad: Whether to enable gradient computation. If None, uses model.requires_grad.
+            broad_phase:
                 Either a broad phase mode string ("explicit", "nxn", "sap") or
                 a prebuilt broad phase instance for expert usage.
-            narrow_phase (NarrowPhase | None, optional): Optional prebuilt narrow phase instance. Must be
+            narrow_phase: Optional prebuilt narrow phase instance. Must be
                 provided together with a broad phase instance for expert usage.
-            shape_pairs_filtered (wp.array | None, optional): Precomputed shape pairs for EXPLICIT mode.
+            shape_pairs_filtered: Precomputed shape pairs for EXPLICIT mode.
                 When broad_phase is "explicit", uses model.shape_contact_pairs if not provided. For
                 "nxn"/"sap" modes, ignored.
-            sdf_hydroelastic_config (NarrowPhase.HydroelasticSDF.Config | None, optional): Configuration for
+            sdf_hydroelastic_config: Configuration for
                 hydroelastic collision handling. Defaults to None.
         """
         mode_from_broad_phase: str | None = None
-        broad_phase_instance: BroadPhaseInstance | None = None
+        broad_phase_instance: BroadPhaseAllPairs | BroadPhaseSAP | BroadPhaseExplicit | None = None
         if broad_phase is not None:
             if isinstance(broad_phase, str):
                 mode_from_broad_phase = _normalize_broad_phase_mode(broad_phase)
@@ -449,6 +462,10 @@ class CollisionPipeline:
             else:
                 rigid_contact_max = _estimate_rigid_contact_max(model)
         self._rigid_contact_max = rigid_contact_max
+        if max_triangle_pairs <= 0:
+            raise ValueError("max_triangle_pairs must be > 0")
+        if max_heightfield_cell_pairs <= 0:
+            raise ValueError("max_heightfield_cell_pairs must be > 0")
         # Keep model-level default in sync with the resolved pipeline capacity.
         # This avoids divergence between model- and contacts-based users (e.g. VBD init).
         model.rigid_contact_max = rigid_contact_max
@@ -546,26 +563,29 @@ class CollisionPipeline:
                 raise ValueError(f"Unsupported broad phase mode: {self.broad_phase_mode}")
 
             # Initialize SDF hydroelastic (returns None if no hydroelastic shape pairs in the model)
-            hydroelastic_sdf = NarrowPhase.HydroelasticSDF._from_model(
+            hydroelastic_sdf = HydroelasticSDF._from_model(
                 model,
                 config=sdf_hydroelastic_config,
                 writer_func=write_contact,
             )
 
-            # Detect if any mesh or heightfield shapes are present to optimize kernel launches
+            # Detect shape classes to optimize narrow-phase kernel launches.
+            # Keep mesh and heightfield flags independent: heightfield-only scenes
+            # should not trigger mesh-only kernel setup/launches.
             has_meshes = False
             has_heightfields = False
             if hasattr(model, "shape_type") and model.shape_type is not None:
                 shape_types = model.shape_type.numpy()
-                has_meshes = bool((shape_types == int(GeoType.MESH)).any())
                 has_heightfields = bool((shape_types == int(GeoType.HFIELD)).any())
+                has_meshes = bool((shape_types == int(GeoType.MESH)).any())
 
             # Initialize narrow phase with pre-allocated buffers
             # max_triangle_pairs is a conservative estimate for mesh collision triangle pairs
             # Pass write_contact as custom writer to write directly to final Contacts format
             self.narrow_phase = NarrowPhase(
                 max_candidate_pairs=self.shape_pairs_max,
-                max_triangle_pairs=1000000,
+                max_triangle_pairs=max_triangle_pairs,
+                max_heightfield_cell_pairs=max_heightfield_cell_pairs,
                 reduce_contacts=self.reduce_contacts,
                 device=device,
                 shape_aabb_lower=shape_aabb_lower,
@@ -619,10 +639,10 @@ class CollisionPipeline:
 
     def contacts(self) -> Contacts:
         """
-        Allocate and return a new :class:`Contacts` object for this pipeline.
+        Allocate and return a new :class:`newton.Contacts` object for this pipeline.
 
         Returns:
-            Contacts: A newly allocated contacts buffer sized for this pipeline.
+            A newly allocated contacts buffer sized for this pipeline.
         """
         contacts = Contacts(
             self.rigid_contact_max,
@@ -829,6 +849,8 @@ class CollisionPipeline:
                     self.soft_contact_max,
                     model.shape_count,
                     model.shape_flags,
+                    model.shape_heightfield_data,
+                    model.heightfield_elevation_data,
                 ],
                 outputs=[
                     contacts.soft_contact_count,
@@ -841,27 +863,3 @@ class CollisionPipeline:
                 ],
                 device=self.device,
             )
-
-    def get_hydro_contact_surface(self):
-        """Get hydroelastic contact surface data for visualization, if available.
-
-        Returns:
-            HydroelasticContactSurfaceData if hydroelastic_sdf is configured, None otherwise.
-        """
-        if self.hydroelastic_sdf is not None:
-            return self.hydroelastic_sdf.get_hydro_contact_surface()
-        return None
-
-    def set_output_contact_surface(self, enabled: bool) -> None:
-        """Enable or disable contact surface visualization.
-
-        Note: When ``output_contact_surface=True`` in the config, the kernel always
-        writes debug surface data. This method is provided for API compatibility but
-        the actual display is controlled by the viewer's ``show_hydro_contact_surface`` flag.
-
-        Args:
-            enabled: If True, visualization is enabled (viewer will display the data).
-                     If False, visualization is disabled (viewer will hide the data).
-        """
-        if self.hydroelastic_sdf is not None:
-            self.hydroelastic_sdf.set_output_contact_surface(enabled)

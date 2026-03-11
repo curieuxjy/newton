@@ -17,6 +17,7 @@ env:
   AWS_SECURITY_GROUP_IDS: sg-07807c44e7f2a368a
   AWS_ROLE_ARN: arn:aws:iam::968945269301:role/newton-physics-newton-ec2-github-runner-role
   AWS_ROLE_DURATION: 1800
+  PYTHONFAULTHANDLER: "1" # Dump tracebacks on fatal signals (SIGSEGV, SIGABRT, etc.)
 
 on:
   schedule:
@@ -134,7 +135,7 @@ jobs:
         run: uv lock -P warp-lang --prerelease allow
 
       - name: Run Tests
-        run: uv run --extra dev --extra torch-cu12 -m newton.tests --junit-report-xml rspec.xml
+        run: uv run --extra dev --extra torch-cu13 -m newton.tests --junit-report-xml rspec.xml
 
       - name: Test Summary
         if: ${{ !cancelled() }}

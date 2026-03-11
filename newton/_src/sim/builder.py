@@ -21,7 +21,7 @@ import copy
 import ctypes
 import math
 import warnings
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
@@ -29,23 +29,24 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import warp as wp
 
-from ..core.spatial import quat_between_vectors_robust
 from ..core.types import (
     MAXVAL,
     Axis,
     AxisType,
     Devicelike,
+    Mat22,
     Mat33,
     Quat,
-    Sequence,
     Transform,
     Vec3,
     Vec4,
+    Vec6,
     axis_to_vec3,
     flag_to_int,
     nparray,
 )
 from ..geometry import (
+    Gaussian,
     GeoType,
     Mesh,
     ParticleFlags,
@@ -55,10 +56,18 @@ from ..geometry import (
     transform_inertia,
 )
 from ..geometry.inertia import validate_and_correct_inertia_kernel, verify_and_correct_inertia
+from ..geometry.types import Heightfield
 from ..geometry.utils import RemeshingMethod, compute_inertia_obb, remesh_mesh
+from ..math import quat_between_vectors_robust
 from ..usd.schema_resolver import SchemaResolver
 from ..utils import compute_world_offsets
 from ..utils.mesh import MeshAdjacency
+from .enums import (
+    BodyFlags,
+    EqType,
+    JointTargetMode,
+    JointType,
+)
 from .graph_coloring import (
     ColoringAlgorithm,
     color_graph,
@@ -66,16 +75,17 @@ from .graph_coloring import (
     combine_independent_particle_coloring,
     construct_particle_graph,
 )
-from .joints import (
-    ActuatorMode,
-    EqType,
-    JointType,
-)
 from .model import Model
 
 if TYPE_CHECKING:
     from newton_actuators import Actuator
     from pxr import Usd
+
+    from ..geometry.types import TetMesh
+
+    UsdStage = Usd.Stage
+else:
+    UsdStage = Any
 
 
 class ModelBuilder:
@@ -84,7 +94,7 @@ class ModelBuilder:
     Use the ModelBuilder to construct a simulation scene. The ModelBuilder
     represents the scene using standard Python data structures like lists,
     which are convenient but unsuitable for efficient simulation.
-    Call :meth:`finalize` to construct a simulation-ready Model.
+    Call :meth:`finalize <ModelBuilder.finalize>` to construct a simulation-ready Model.
 
     Example
     -------
@@ -127,24 +137,37 @@ class ModelBuilder:
     - Index -1: Global entities shared across all worlds (e.g., ground plane)
     - Index 0, 1, 2, ...: World-specific entities
 
-    There are two ways to assign world indices:
+    See :doc:`Worlds </concepts/worlds>` for a full overview of world semantics,
+    layout, and supported workflows.
 
-    1. **Direct entity creation**: Entities inherit the builder's `current_world` value::
+    There are two supported workflows for assigning world indices:
+
+    1. **Using begin_world()/end_world()**: Entities added outside any world
+       context, before the first :meth:`begin_world` or after the matching
+       :meth:`end_world`, are assigned to the global world (index ``-1``).
+       :class:`ModelBuilder` manages :attr:`current_world` while a world context is
+       active::
 
            builder = ModelBuilder()
-           builder.current_world = -1  # Following entities will be global
-           builder.add_ground_plane()
-           builder.current_world = 0  # Following entities will be in world 0
-           builder.add_body(...)
+           builder.add_ground_plane()  # global (world -1)
 
-    2. **Using add_world()**: ALL entities from the sub-builder are assigned to a new world::
+           builder.begin_world(label="robot_0")
+           builder.add_body(...)  # world 0
+           builder.end_world()
+
+    2. **Using add_world()/replicate()**: All entities from the sub-builder are
+       assigned to a new world::
 
            robot = ModelBuilder()
            robot.add_body(...)  # World assignments here will be overridden
 
            main = ModelBuilder()
            main.add_world(robot)  # All robot entities -> world 0
-           main.add_world(robot)  # All robot entities -> world 1
+           main.replicate(robot, world_count=2)  # Add more worlds from the same source
+
+    :attr:`current_world` is builder-managed, read-only state. Use
+    :meth:`begin_world`, :meth:`end_world`, :meth:`add_world`, or
+    :meth:`replicate` to manage world assignment.
 
     Note:
         It is strongly recommended to use the ModelBuilder to construct a simulation rather
@@ -378,11 +401,11 @@ class ModelBuilder:
             target_vel: float = 0.0,
             target_ke: float = 0.0,
             target_kd: float = 0.0,
-            armature: float = 1e-2,
+            armature: float = 0.0,
             effort_limit: float = 1e6,
             velocity_limit: float = 1e6,
             friction: float = 0.0,
-            actuator_mode: ActuatorMode | None = None,
+            actuator_mode: JointTargetMode | None = None,
         ):
             self.axis = wp.normalize(axis_to_vec3(axis))
             """The 3D joint axis in the joint parent anchor frame."""
@@ -405,7 +428,7 @@ class ModelBuilder:
             self.target_kd = target_kd
             """The derivative gain of the target drive PD controller. Defaults to 0.0."""
             self.armature = armature
-            """Artificial inertia added around the joint axis. Defaults to 1e-2."""
+            """Artificial inertia added around the joint axis [kg·m² or kg]. Defaults to 0."""
             self.effort_limit = effort_limit
             """Maximum effort (force or torque) the joint axis can exert. Defaults to 1e6."""
             self.velocity_limit = velocity_limit
@@ -413,7 +436,7 @@ class ModelBuilder:
             self.friction = friction
             """Friction coefficient for the joint axis. Defaults to 0.0."""
             self.actuator_mode = actuator_mode
-            """Actuator mode for this DOF. Determines which actuators are installed (see :class:`ActuatorMode`).
+            """Actuator mode for this DOF. Determines which actuators are installed (see :class:`JointTargetMode`).
             If None, the mode is inferred from gains and targets."""
 
             if self.target_pos > self.limit_upper or self.target_pos < self.limit_lower:
@@ -461,7 +484,8 @@ class ModelBuilder:
               Uses dict-based storage where keys are entity indices, allowing sparse assignment.
             - A string for custom frequencies using the full frequency key (e.g., ``"mujoco:pair"``).
               Uses list-based storage for sequential data appended via :meth:`add_custom_values`. All attributes
-              sharing the same custom frequency must have the same count, validated at finalize time."""
+              sharing the same custom frequency must have the same count, validated by
+              :meth:`finalize <ModelBuilder.finalize>`."""
 
         assignment: Model.AttributeAssignment = Model.AttributeAssignment.MODEL
         """Assignment category (see :class:`Model.AttributeAssignment`), defaults to :attr:`Model.AttributeAssignment.MODEL`"""
@@ -470,14 +494,15 @@ class ModelBuilder:
         """Namespace for the attribute. If None, the attribute is added directly to the assigned object without a namespace."""
 
         references: str | None = None
-        """For attributes containing entity indices, specifies how values are transformed during add_world/add_builder merging.
+        """For attributes containing entity indices, specifies how values are transformed during add_builder/add_world/replicate merging.
 
         Built-in entity types (values are offset by entity count):
             - ``"body"``, ``"shape"``, ``"joint"``, ``"joint_dof"``, ``"joint_coord"``, ``"articulation"``, ``"equality_constraint"``,
               ``"constraint_mimic"``, ``"particle"``, ``"edge"``, ``"triangle"``, ``"tetrahedron"``, ``"spring"``
 
         Special handling:
-            - ``"world"``: Values are replaced with ``current_world`` (not offset)
+            - ``"world"``: Values are replaced with the builder-managed
+              :attr:`ModelBuilder.current_world` context (not offset)
 
         Custom frequencies (values are offset by that frequency's count):
             - Any custom frequency string, e.g., ``"mujoco:pair"``
@@ -718,12 +743,13 @@ class ModelBuilder:
         Initializes a new ModelBuilder instance for constructing simulation models.
 
         Args:
-            up_axis (AxisType, optional): The axis to use as the "up" direction in the simulation.
+            up_axis: The axis to use as the "up" direction in the simulation.
                 Defaults to Axis.Z.
-            gravity (float, optional): The magnitude of gravity to apply along the up axis.
+            gravity: The magnitude of gravity to apply along the up axis.
                 Defaults to -9.81.
         """
-        self.world_count = 0
+        self.world_count: int = 0
+        """Number of worlds accumulated for :attr:`Model.world_count`."""
 
         # region defaults
         self.default_shape_cfg = ModelBuilder.ShapeConfig()
@@ -763,6 +789,18 @@ class ModelBuilder:
         self.default_edge_kd = 0.0
         """Default edge-bending damping."""
 
+        self.default_tet_k_mu = 1.0e3
+        """Default first Lame parameter [Pa] for tetrahedral elements."""
+
+        self.default_tet_k_lambda = 1.0e3
+        """Default second Lame parameter [Pa] for tetrahedral elements."""
+
+        self.default_tet_k_damp = 0.0
+        """Default damping stiffness for tetrahedral elements."""
+
+        self.default_tet_density = 1.0
+        """Default density [kg/m^3] for tetrahedral soft bodies."""
+
         self.default_body_armature = 0.0
         """Default body armature value used when body armature is not provided."""
         # endregion
@@ -793,216 +831,358 @@ class ModelBuilder:
         # endregion
 
         # particles
-        self.particle_q = []
-        self.particle_qd = []
-        self.particle_mass = []
-        self.particle_radius = []
-        self.particle_flags = []
-        self.particle_max_velocity = 1e5
-        self.particle_color_groups: list[nparray] = []
-        self.particle_world = []  # world index for each particle
+        self.particle_q: list[Vec3] = []
+        """Particle positions [m] accumulated for :attr:`Model.particle_q`."""
+        self.particle_qd: list[Vec3] = []
+        """Particle velocities [m/s] accumulated for :attr:`Model.particle_qd`."""
+        self.particle_mass: list[float] = []
+        """Particle masses [kg] accumulated for :attr:`Model.particle_mass`."""
+        self.particle_radius: list[float] = []
+        """Particle radii [m] accumulated for :attr:`Model.particle_radius`."""
+        self.particle_flags: list[int | ParticleFlags] = []
+        """Particle flags accumulated for :attr:`Model.particle_flags`."""
+        self.particle_max_velocity: float = 1e5
+        """Maximum particle velocity [m/s] propagated to :attr:`Model.particle_max_velocity`."""
+        self.particle_color_groups: list[Any] = []
+        """Particle color groups accumulated for :attr:`Model.particle_color_groups`."""
+        self.particle_world: list[int] = []
+        """World indices accumulated for :attr:`Model.particle_world`."""
 
         # shapes (each shape has an entry in these arrays)
-        self.shape_label = []  # shape labels
-        # transform from shape to body
-        self.shape_transform = []
-        # maps from shape index to body index
-        self.shape_body = []
-        self.shape_flags = []
-        self.shape_type = []
-        self.shape_scale = []
-        self.shape_source = []
-        self.shape_is_solid = []
-        self.shape_margin = []
-        self.shape_material_ke = []
-        self.shape_material_kd = []
-        self.shape_material_kf = []
-        self.shape_material_ka = []
-        self.shape_material_mu = []
-        self.shape_material_restitution = []
-        self.shape_material_mu_torsional = []
-        self.shape_material_mu_rolling = []
-        self.shape_material_kh = []
-        self.shape_gap = []
-        # collision groups within collisions are handled
-        self.shape_collision_group = []
-        # radius to use for broadphase collision checking
-        self.shape_collision_radius = []
-        # world index for each shape
-        self.shape_world = []
-        # SDF parameters per shape
-        self.shape_sdf_narrow_band_range = []
-        self.shape_sdf_target_voxel_size = []
-        self.shape_sdf_max_resolution = []
+        self.shape_label: list[str] = []
+        """Shape labels accumulated for :attr:`Model.shape_label`."""
+        self.shape_transform: list[Transform] = []
+        """Shape-to-body transforms accumulated for :attr:`Model.shape_transform`."""
+        self.shape_body: list[int] = []
+        """Body indices accumulated for :attr:`Model.shape_body`."""
+        self.shape_flags: list[int] = []
+        """Shape flags accumulated for :attr:`Model.shape_flags`."""
+        self.shape_type: list[int] = []
+        """Geometry type ids accumulated for :attr:`Model.shape_type`."""
+        self.shape_scale: list[Vec3] = []
+        """Shape scales accumulated for :attr:`Model.shape_scale`."""
+        self.shape_source: list[Any] = []
+        """Source geometry objects accumulated for :attr:`Model.shape_source`."""
+        self.shape_is_solid: list[bool] = []
+        """Solid-vs-hollow flags accumulated for :attr:`Model.shape_is_solid`."""
+        self.shape_margin: list[float] = []
+        """Shape margins [m] accumulated for :attr:`Model.shape_margin`."""
+        self.shape_material_ke: list[float] = []
+        """Contact stiffness values [N/m] accumulated for :attr:`Model.shape_material_ke`."""
+        self.shape_material_kd: list[float] = []
+        """Contact damping values accumulated for :attr:`Model.shape_material_kd`."""
+        self.shape_material_kf: list[float] = []
+        """Friction stiffness values accumulated for :attr:`Model.shape_material_kf`."""
+        self.shape_material_ka: list[float] = []
+        """Adhesion distances [m] accumulated for :attr:`Model.shape_material_ka`."""
+        self.shape_material_mu: list[float] = []
+        """Friction coefficients accumulated for :attr:`Model.shape_material_mu`."""
+        self.shape_material_restitution: list[float] = []
+        """Restitution coefficients accumulated for :attr:`Model.shape_material_restitution`."""
+        self.shape_material_mu_torsional: list[float] = []
+        """Torsional friction coefficients accumulated for :attr:`Model.shape_material_mu_torsional`."""
+        self.shape_material_mu_rolling: list[float] = []
+        """Rolling friction coefficients accumulated for :attr:`Model.shape_material_mu_rolling`."""
+        self.shape_material_kh: list[float] = []
+        """Hydroelastic stiffness values accumulated for :attr:`Model.shape_material_kh`."""
+        self.shape_gap: list[float] = []
+        """Contact gaps [m] accumulated for :attr:`Model.shape_gap`."""
+        self.shape_collision_group: list[int] = []
+        """Collision groups accumulated for :attr:`Model.shape_collision_group`."""
+        self.shape_collision_radius: list[float] = []
+        """Broadphase collision radii [m] accumulated for :attr:`Model.shape_collision_radius`."""
+        self.shape_world: list[int] = []
+        """World indices accumulated for :attr:`Model.shape_world`."""
+        self.shape_sdf_narrow_band_range: list[tuple[float, float]] = []
+        """Per-shape SDF narrow-band ranges retained until :meth:`finalize <ModelBuilder.finalize>` generates
+        SDF data."""
+        self.shape_sdf_target_voxel_size: list[float | None] = []
+        """Per-shape target SDF voxel sizes retained until :meth:`finalize <ModelBuilder.finalize>`."""
+        self.shape_sdf_max_resolution: list[int | None] = []
+        """Per-shape SDF maximum resolutions retained until :meth:`finalize <ModelBuilder.finalize>`."""
 
         # Mesh SDF storage (volumes kept for reference counting, SDFData array created at finalize)
 
-        # filtering to ignore certain collision pairs
         self.shape_collision_filter_pairs: list[tuple[int, int]] = []
+        """Shape collision filter pairs accumulated for :attr:`Model.shape_collision_filter_pairs`."""
 
         self._requested_contact_attributes: set[str] = set()
+        """Optional contact attributes requested via :meth:`request_contact_attributes`."""
         self._requested_state_attributes: set[str] = set()
+        """Optional state attributes requested via :meth:`request_state_attributes`."""
 
         # springs
-        self.spring_indices = []
-        self.spring_rest_length = []
-        self.spring_stiffness = []
-        self.spring_damping = []
-        self.spring_control = []
+        self.spring_indices: list[int] = []
+        """Spring particle index pairs accumulated for :attr:`Model.spring_indices`."""
+        self.spring_rest_length: list[float] = []
+        """Spring rest lengths [m] accumulated for :attr:`Model.spring_rest_length`."""
+        self.spring_stiffness: list[float] = []
+        """Spring stiffness values [N/m] accumulated for :attr:`Model.spring_stiffness`."""
+        self.spring_damping: list[float] = []
+        """Spring damping values accumulated for :attr:`Model.spring_damping`."""
+        self.spring_control: list[float] = []
+        """Spring control activations accumulated for :attr:`Model.spring_control`."""
 
         # triangles
-        self.tri_indices = []
-        self.tri_poses = []
-        self.tri_activations = []
-        self.tri_materials = []
-        self.tri_areas = []
+        self.tri_indices: list[tuple[int, int, int]] = []
+        """Triangle connectivity accumulated for :attr:`Model.tri_indices`."""
+        self.tri_poses: list[Mat22] = []
+        """Triangle rest-pose 2x2 matrices accumulated for :attr:`Model.tri_poses`."""
+        self.tri_activations: list[float] = []
+        """Triangle activations accumulated for :attr:`Model.tri_activations`."""
+        self.tri_materials: list[tuple[float, float, float, float, float]] = []
+        """Triangle material rows accumulated for :attr:`Model.tri_materials`."""
+        self.tri_areas: list[float] = []
+        """Triangle rest areas [m^2] accumulated for :attr:`Model.tri_areas`."""
 
         # edges (bending)
-        self.edge_indices = []
-        self.edge_rest_angle = []
-        self.edge_rest_length = []
-        self.edge_bending_properties = []
+        self.edge_indices: list[tuple[int, int, int, int]] = []
+        """Bending-edge connectivity accumulated for :attr:`Model.edge_indices`."""
+        self.edge_rest_angle: list[float] = []
+        """Edge rest angles [rad] accumulated for :attr:`Model.edge_rest_angle`."""
+        self.edge_rest_length: list[float] = []
+        """Edge rest lengths [m] accumulated for :attr:`Model.edge_rest_length`."""
+        self.edge_bending_properties: list[tuple[float, float]] = []
+        """Bending stiffness/damping rows accumulated for :attr:`Model.edge_bending_properties`."""
 
         # tetrahedra
-        self.tet_indices = []
-        self.tet_poses = []
-        self.tet_activations = []
-        self.tet_materials = []
+        self.tet_indices: list[tuple[int, int, int, int]] = []
+        """Tetrahedral connectivity accumulated for :attr:`Model.tet_indices`."""
+        self.tet_poses: list[Mat33] = []
+        """Tetrahedral rest-pose 3x3 matrices accumulated for :attr:`Model.tet_poses`."""
+        self.tet_activations: list[float] = []
+        """Tetrahedral activations accumulated for :attr:`Model.tet_activations`."""
+        self.tet_materials: list[tuple[float, float, float]] = []
+        """Tetrahedral material rows accumulated for :attr:`Model.tet_materials`."""
 
         # muscles
-        self.muscle_start = []
-        self.muscle_params = []
-        self.muscle_activations = []
-        self.muscle_bodies = []
-        self.muscle_points = []
+        self.muscle_start: list[int] = []
+        """Muscle waypoint start indices accumulated for :attr:`Model.muscle_start`."""
+        self.muscle_params: list[tuple[float, float, float, float, float]] = []
+        """Muscle parameter rows accumulated for :attr:`Model.muscle_params`."""
+        self.muscle_activations: list[float] = []
+        """Muscle activations accumulated for :attr:`Model.muscle_activations`."""
+        self.muscle_bodies: list[int] = []
+        """Muscle waypoint body indices accumulated for :attr:`Model.muscle_bodies`."""
+        self.muscle_points: list[Vec3] = []
+        """Muscle waypoint local offsets accumulated for :attr:`Model.muscle_points`."""
 
         # rigid bodies
-        self.body_mass = []
-        self.body_inertia = []
-        self.body_inv_mass = []
-        self.body_inv_inertia = []
-        self.body_com = []
-        self.body_q = []
-        self.body_qd = []
-        self.body_label = []
-        self.body_lock_inertia = []
-        self.body_shapes = {-1: []}  # mapping from body to shapes
-        self.body_world = []  # world index for each body
-        self.body_color_groups: list[nparray] = []
+        self.body_mass: list[float] = []
+        """Body masses [kg] accumulated for :attr:`Model.body_mass`."""
+        self.body_inertia: list[Mat33] = []
+        """Body inertia tensors accumulated for :attr:`Model.body_inertia`."""
+        self.body_inv_mass: list[float] = []
+        """Inverse body masses accumulated for :attr:`Model.body_inv_mass`."""
+        self.body_inv_inertia: list[Mat33] = []
+        """Inverse body inertia tensors accumulated for :attr:`Model.body_inv_inertia`."""
+        self.body_com: list[Vec3] = []
+        """Body centers of mass [m] accumulated for :attr:`Model.body_com`."""
+        self.body_q: list[Transform] = []
+        """Body poses accumulated for :attr:`Model.body_q`."""
+        self.body_qd: list[Vec6] = []
+        """Body spatial velocities accumulated for :attr:`Model.body_qd`."""
+        self.body_label: list[str] = []
+        """Body labels accumulated for :attr:`Model.body_label`."""
+        self.body_lock_inertia: list[bool] = []
+        """Per-body inertia-lock flags retained while composing bodies in the builder."""
+        self.body_flags: list[int] = []
+        """Body flags accumulated for :attr:`Model.body_flags`."""
+        self.body_shapes: dict[int, list[int]] = {-1: []}
+        """Mapping from body index to attached shape indices, finalized into :attr:`Model.body_shapes`."""
+        self.body_world: list[int] = []
+        """World indices accumulated for :attr:`Model.body_world`."""
+        self.body_color_groups: list[Any] = []
+        """Rigid-body color groups accumulated for :attr:`Model.body_color_groups`."""
 
         # rigid joints
-        self.joint_parent = []  # index of the parent body                      (constant)
-        self.joint_parents = {}  # mapping from child body to parent bodies
-        self.joint_children = {}  # mapping from parent body to child bodies
-        self.joint_child = []  # index of the child body                       (constant)
-        self.joint_axis = []  # joint axis in joint parent anchor frame        (constant)
-        self.joint_X_p = []  # frame of joint in parent                      (constant)
-        self.joint_X_c = []  # frame of child com (in child coordinates)     (constant)
-        self.joint_q = []
-        self.joint_qd = []
-        self.joint_cts = []
-        self.joint_f = []
-        self.joint_act = []
+        self.joint_parent: list[int] = []
+        """Parent body indices accumulated for :attr:`Model.joint_parent`."""
+        self.joint_parents: dict[int, list[int]] = {}
+        """Mapping from child body index to parent body indices used while composing articulations."""
+        self.joint_children: dict[int, list[int]] = {}
+        """Mapping from parent body index to child body indices used while composing articulations."""
+        self.joint_child: list[int] = []
+        """Child body indices accumulated for :attr:`Model.joint_child`."""
+        self.joint_axis: list[Vec3] = []
+        """Joint axes accumulated for :attr:`Model.joint_axis`."""
+        self.joint_X_p: list[Transform] = []
+        """Parent-frame joint transforms accumulated for :attr:`Model.joint_X_p`."""
+        self.joint_X_c: list[Transform] = []
+        """Child-frame joint transforms accumulated for :attr:`Model.joint_X_c`."""
+        self.joint_q: list[float] = []
+        """Joint coordinates accumulated for :attr:`Model.joint_q`."""
+        self.joint_qd: list[float] = []
+        """Joint velocities accumulated for :attr:`Model.joint_qd`."""
+        self.joint_cts: list[float] = []
+        """Per-joint constraint placeholders used to derive finalized joint-constraint counts."""
+        self.joint_f: list[float] = []
+        """Joint forces accumulated for :attr:`Model.joint_f`."""
+        self.joint_act: list[float] = []
+        """Joint actuation inputs accumulated for :attr:`Model.joint_act`."""
 
-        self.joint_type = []
-        self.joint_label = []
-        self.joint_armature = []
-        self.joint_act_mode = []  # Actuator mode per DOF (ActuatorMode.NONE=0, POSITION=1, VELOCITY=2, POSITION_VELOCITY=3, EFFORT=4)
-        self.joint_target_ke = []
-        self.joint_target_kd = []
-        self.joint_limit_lower = []
-        self.joint_limit_upper = []
-        self.joint_limit_ke = []
-        self.joint_limit_kd = []
-        self.joint_target_pos = []
-        self.joint_target_vel = []
-        self.joint_effort_limit = []
-        self.joint_velocity_limit = []
-        self.joint_friction = []
+        self.joint_type: list[int] = []
+        """Joint type ids accumulated for :attr:`Model.joint_type`."""
+        self.joint_label: list[str] = []
+        """Joint labels accumulated for :attr:`Model.joint_label`."""
+        self.joint_armature: list[float] = []
+        """Joint armature values accumulated for :attr:`Model.joint_armature`."""
+        self.joint_target_mode: list[int] = []
+        """Joint target modes accumulated for :attr:`Model.joint_target_mode`."""
+        self.joint_target_ke: list[float] = []
+        """Joint target stiffness values accumulated for :attr:`Model.joint_target_ke`."""
+        self.joint_target_kd: list[float] = []
+        """Joint target damping values accumulated for :attr:`Model.joint_target_kd`."""
+        self.joint_limit_lower: list[float] = []
+        """Lower joint limits accumulated for :attr:`Model.joint_limit_lower`."""
+        self.joint_limit_upper: list[float] = []
+        """Upper joint limits accumulated for :attr:`Model.joint_limit_upper`."""
+        self.joint_limit_ke: list[float] = []
+        """Joint limit stiffness values accumulated for :attr:`Model.joint_limit_ke`."""
+        self.joint_limit_kd: list[float] = []
+        """Joint limit damping values accumulated for :attr:`Model.joint_limit_kd`."""
+        self.joint_target_pos: list[float] = []
+        """Joint position targets accumulated for :attr:`Model.joint_target_pos`."""
+        self.joint_target_vel: list[float] = []
+        """Joint velocity targets accumulated for :attr:`Model.joint_target_vel`."""
+        self.joint_effort_limit: list[float] = []
+        """Joint effort limits accumulated for :attr:`Model.joint_effort_limit`."""
+        self.joint_velocity_limit: list[float] = []
+        """Joint velocity limits accumulated for :attr:`Model.joint_velocity_limit`."""
+        self.joint_friction: list[float] = []
+        """Joint friction values accumulated for :attr:`Model.joint_friction`."""
 
-        self.joint_twist_lower = []
-        self.joint_twist_upper = []
+        self.joint_twist_lower: list[float] = []
+        """Lower twist limits accumulated for :attr:`Model.joint_twist_lower`."""
+        self.joint_twist_upper: list[float] = []
+        """Upper twist limits accumulated for :attr:`Model.joint_twist_upper`."""
 
-        self.joint_enabled = []
+        self.joint_enabled: list[bool] = []
+        """Joint enabled flags accumulated for :attr:`Model.joint_enabled`."""
 
-        self.joint_q_start = []
-        self.joint_qd_start = []
-        self.joint_cts_start = []
-        self.joint_dof_dim = []
-        self.joint_world = []  # world index for each joint
-        self.joint_articulation = []  # articulation index for each joint, -1 if not in any articulation
+        self.joint_q_start: list[int] = []
+        """Joint coordinate start indices accumulated for :attr:`Model.joint_q_start`."""
+        self.joint_qd_start: list[int] = []
+        """Joint DoF start indices accumulated for :attr:`Model.joint_qd_start`."""
+        self.joint_cts_start: list[int] = []
+        """Joint-constraint start indices retained while building per-joint constraint data."""
+        self.joint_dof_dim: list[tuple[int, int]] = []
+        """Per-joint linear/angular DoF dimensions accumulated for :attr:`Model.joint_dof_dim`."""
+        self.joint_world: list[int] = []
+        """World indices accumulated for :attr:`Model.joint_world`."""
+        self.joint_articulation: list[int] = []
+        """Articulation indices accumulated for :attr:`Model.joint_articulation`."""
 
-        self.articulation_start = []
-        self.articulation_label = []
-        self.articulation_world = []  # world index for each articulation
+        self.articulation_start: list[int] = []
+        """Articulation start indices accumulated for :attr:`Model.articulation_start`."""
+        self.articulation_label: list[str] = []
+        """Articulation labels accumulated for :attr:`Model.articulation_label`."""
+        self.articulation_world: list[int] = []
+        """World indices accumulated for :attr:`Model.articulation_world`."""
 
-        self.joint_dof_count = 0
-        self.joint_coord_count = 0
-        self.joint_constraint_count = 0
+        self.joint_dof_count: int = 0
+        """Total joint DoF count propagated to :attr:`Model.joint_dof_count`."""
+        self.joint_coord_count: int = 0
+        """Total joint coordinate count propagated to :attr:`Model.joint_coord_count`."""
+        self.joint_constraint_count: int = 0
+        """Total joint constraint count propagated to :attr:`Model.joint_constraint_count`."""
 
-        # current world index for entities being added to this builder.
-        # set to -1 to create global entities shared across all worlds.
-        self.current_world = -1
+        self._current_world: int = -1
+        """Internal world context backing the read-only :attr:`current_world` property."""
 
         self.up_axis: Axis = Axis.from_any(up_axis)
+        """Up axis used when expanding scalar gravity into per-world gravity vectors."""
         self.gravity: float = gravity
+        """Gravity acceleration [m/s^2] applied along :attr:`up_axis` for newly added worlds."""
 
-        # Per-world gravity vectors, populated when worlds are created via begin_world()
-        # Each entry is a tuple (gx, gy, gz) representing the gravity vector for that world
-        self.world_gravity: list[tuple[float, float, float]] = []
+        self.world_gravity: list[Vec3] = []
+        """Per-world gravity vectors retained until :meth:`finalize <ModelBuilder.finalize>` populates
+        :attr:`Model.gravity`."""
 
-        # contacts to be generated within the given distance margin to be generated at
-        # every simulation substep (can be 0 if only one PBD solver iteration is used)
-        self.rigid_gap = 0.1
+        self.rigid_gap: float = 0.1
+        """Default rigid contact gap [m] applied when adding a shape whose
+        :attr:`ShapeConfig.gap` is ``None``. The resolved per-shape values are later
+        propagated to :attr:`Model.shape_gap`."""
 
-        # number of rigid contact points to allocate in the model during self.finalize() per world
-        # if setting is None, the number of worst-case number of contacts will be calculated in self.finalize()
-        self.num_rigid_contacts_per_world = None
+        self.num_rigid_contacts_per_world: int | None = None
+        """Optional per-world rigid-contact allocation budget used to set :attr:`Model.rigid_contact_max`."""
 
         # equality constraints
-        self.equality_constraint_type = []
-        self.equality_constraint_body1 = []
-        self.equality_constraint_body2 = []
-        self.equality_constraint_anchor = []
-        self.equality_constraint_relpose = []
-        self.equality_constraint_torquescale = []
-        self.equality_constraint_joint1 = []
-        self.equality_constraint_joint2 = []
-        self.equality_constraint_polycoef = []
-        self.equality_constraint_label = []
-        self.equality_constraint_enabled = []
-        self.equality_constraint_world = []
+        self.equality_constraint_type: list[EqType] = []
+        """Equality constraint types accumulated for :attr:`Model.equality_constraint_type`."""
+        self.equality_constraint_body1: list[int] = []
+        """First body indices accumulated for :attr:`Model.equality_constraint_body1`."""
+        self.equality_constraint_body2: list[int] = []
+        """Second body indices accumulated for :attr:`Model.equality_constraint_body2`."""
+        self.equality_constraint_anchor: list[Vec3] = []
+        """Equality constraint anchors accumulated for :attr:`Model.equality_constraint_anchor`."""
+        self.equality_constraint_relpose: list[Transform] = []
+        """Relative poses accumulated for :attr:`Model.equality_constraint_relpose`."""
+        self.equality_constraint_torquescale: list[float] = []
+        """Torque scales accumulated for :attr:`Model.equality_constraint_torquescale`."""
+        self.equality_constraint_joint1: list[int] = []
+        """First joint indices accumulated for :attr:`Model.equality_constraint_joint1`."""
+        self.equality_constraint_joint2: list[int] = []
+        """Second joint indices accumulated for :attr:`Model.equality_constraint_joint2`."""
+        self.equality_constraint_polycoef: list[list[float]] = []
+        """Polynomial coefficient rows accumulated for :attr:`Model.equality_constraint_polycoef`."""
+        self.equality_constraint_label: list[str] = []
+        """Equality constraint labels accumulated for :attr:`Model.equality_constraint_label`."""
+        self.equality_constraint_enabled: list[bool] = []
+        """Equality constraint enabled flags accumulated for :attr:`Model.equality_constraint_enabled`."""
+        self.equality_constraint_world: list[int] = []
+        """World indices accumulated for :attr:`Model.equality_constraint_world`."""
 
         # mimic constraints
-        self.constraint_mimic_joint0 = []
-        self.constraint_mimic_joint1 = []
-        self.constraint_mimic_coef0 = []
-        self.constraint_mimic_coef1 = []
-        self.constraint_mimic_enabled = []
-        self.constraint_mimic_label = []
-        self.constraint_mimic_world = []
+        self.constraint_mimic_joint0: list[int] = []
+        """Follower joint indices accumulated for :attr:`Model.constraint_mimic_joint0`."""
+        self.constraint_mimic_joint1: list[int] = []
+        """Leader joint indices accumulated for :attr:`Model.constraint_mimic_joint1`."""
+        self.constraint_mimic_coef0: list[float] = []
+        """Offset coefficients accumulated for :attr:`Model.constraint_mimic_coef0`."""
+        self.constraint_mimic_coef1: list[float] = []
+        """Scale coefficients accumulated for :attr:`Model.constraint_mimic_coef1`."""
+        self.constraint_mimic_enabled: list[bool] = []
+        """Enabled flags accumulated for :attr:`Model.constraint_mimic_enabled`."""
+        self.constraint_mimic_label: list[str] = []
+        """Mimic constraint labels accumulated for :attr:`Model.constraint_mimic_label`."""
+        self.constraint_mimic_world: list[int] = []
+        """World indices accumulated for :attr:`Model.constraint_mimic_world`."""
 
         # per-world entity start indices
-        self.particle_world_start = []
-        self.body_world_start = []
-        self.shape_world_start = []
-        self.joint_world_start = []
-        self.articulation_world_start = []
-        self.equality_constraint_world_start = []
-        self.joint_dof_world_start = []
-        self.joint_coord_world_start = []
-        self.joint_constraint_world_start = []
+        self.particle_world_start: list[int] = []
+        """Per-world particle starts accumulated for :attr:`Model.particle_world_start`."""
+        self.body_world_start: list[int] = []
+        """Per-world body starts accumulated for :attr:`Model.body_world_start`."""
+        self.shape_world_start: list[int] = []
+        """Per-world shape starts accumulated for :attr:`Model.shape_world_start`."""
+        self.joint_world_start: list[int] = []
+        """Per-world joint starts accumulated for :attr:`Model.joint_world_start`."""
+        self.articulation_world_start: list[int] = []
+        """Per-world articulation starts accumulated for :attr:`Model.articulation_world_start`."""
+        self.equality_constraint_world_start: list[int] = []
+        """Per-world equality-constraint starts accumulated for :attr:`Model.equality_constraint_world_start`."""
+        self.joint_dof_world_start: list[int] = []
+        """Per-world joint DoF starts accumulated for :attr:`Model.joint_dof_world_start`."""
+        self.joint_coord_world_start: list[int] = []
+        """Per-world joint-coordinate starts accumulated for :attr:`Model.joint_coord_world_start`."""
+        self.joint_constraint_world_start: list[int] = []
+        """Per-world joint-constraint starts accumulated for :attr:`Model.joint_constraint_world_start`."""
 
         # Custom attributes (user-defined per-frequency arrays)
         self.custom_attributes: dict[str, ModelBuilder.CustomAttribute] = {}
+        """Registered custom attributes to materialize during :meth:`finalize <ModelBuilder.finalize>`."""
         # Registered custom frequencies (must be registered before adding attributes with that frequency)
         self.custom_frequencies: dict[str, ModelBuilder.CustomFrequency] = {}
+        """Registered custom string frequencies keyed by ``namespace:name`` or bare name."""
         # Incrementally maintained counts for custom string frequencies
         self._custom_frequency_counts: dict[str, int] = {}
+        """Running counts for custom string frequencies used to size custom attribute arrays."""
 
         # Actuator entries (accumulated during add_actuator calls)
         # Key is (actuator_class, scalar_params_tuple) to separate instances with different scalar params
-        self.actuator_entries: dict[tuple[type, tuple], ActuatorEntry] = {}
+        self.actuator_entries: dict[tuple[type[Actuator], tuple[Any, ...]], ModelBuilder.ActuatorEntry] = {}
+        """Actuator entry groups accumulated from :meth:`add_actuator`, keyed by class and scalar parameters."""
 
     def add_shape_collision_filter_pair(self, shape_a: int, shape_b: int) -> None:
         """Add a collision filter pair in canonical order.
@@ -1146,7 +1326,7 @@ class ModelBuilder:
             frequencies: The frequencies to get custom attributes for.
 
         Returns:
-            A list of custom attributes.
+            Custom attributes matching the requested frequencies.
         """
         return [attr for attr in self.custom_attributes.values() if attr.frequency in frequencies]
 
@@ -1169,7 +1349,7 @@ class ModelBuilder:
                 attribute key (e.g., ``"mujoco:pair_geom1"`` or just ``"my_attr"`` if no namespace).
 
         Returns:
-            Dict mapping attribute keys to the index where each value was added.
+            A mapping from attribute keys to the index where each value was added.
             If all attributes had the same count before the call, all indices will be equal.
 
         Raises:
@@ -1238,7 +1418,7 @@ class ModelBuilder:
                 Each row is forwarded to :meth:`add_custom_values`.
 
         Returns:
-            List of index maps returned by :meth:`add_custom_values` for each row.
+            Index maps returned by :meth:`add_custom_values` for each row.
         """
         out: list[dict[str, int]] = []
         for row in entries:
@@ -1323,7 +1503,8 @@ class ModelBuilder:
         For joints with zero DOFs (e.g., fixed joints), JOINT_DOF attributes are silently skipped
         regardless of the value passed.
 
-        When using dict format, unspecified indices will be filled with the attribute's default value during finalization.
+        When using dict format, unspecified indices will be filled with the attribute's default value by
+        :meth:`finalize <ModelBuilder.finalize>`.
 
         Args:
             joint_index: Index of the joint
@@ -1461,14 +1642,14 @@ class ModelBuilder:
         actuator_class: type[Actuator],
         input_indices: list[int],
         output_indices: list[int] | None = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         """Add an external actuator, independent of any ``UsdPhysics`` joint drives.
 
         External actuators (e.g. :class:`newton_actuators.ActuatorPD`) apply
         forces computed outside the physics engine. Multiple calls with the same
         *actuator_class* and identical scalar parameters are accumulated into one
-        entry; the actuator instance is created during :meth:`finalize`.
+        entry; the actuator instance is created during :meth:`finalize <ModelBuilder.finalize>`.
 
         Args:
             actuator_class: The actuator class (must derive from
@@ -1520,7 +1701,12 @@ class ModelBuilder:
         entry.output_indices.append(output_indices)
         entry.args.append(array_params)
 
-    def _stack_args_to_arrays(self, args_list: list[dict], device=None, requires_grad: bool = False) -> dict:
+    def _stack_args_to_arrays(
+        self,
+        args_list: list[dict[str, Any]],
+        device: Devicelike | None = None,
+        requires_grad: bool = False,
+    ) -> dict[str, wp.array]:
         """Convert list of per-index arg dicts into dict of warp arrays.
 
         Args:
@@ -1529,7 +1715,7 @@ class ModelBuilder:
             requires_grad: Whether the arrays require gradients.
 
         Returns:
-            Dict mapping param names to warp arrays.
+            Mapping from parameter names to warp arrays.
         """
         if not args_list:
             return {}
@@ -1542,7 +1728,7 @@ class ModelBuilder:
         return result
 
     @staticmethod
-    def _build_index_array(indices: list[list[int]], device) -> wp.array:
+    def _build_index_array(indices: list[list[int]], device: Devicelike) -> wp.array:
         """Build a warp array from nested index lists.
 
         If all inner lists have length 1, creates a 1D array (N,).
@@ -1553,7 +1739,7 @@ class ModelBuilder:
             device: Device for the warp array.
 
         Returns:
-            wp.array with shape (N,) or (N, M).
+            Array with shape ``(N,)`` or ``(N, M)``.
 
         Raises:
             ValueError: If inner lists have inconsistent lengths (for 2D case).
@@ -1588,14 +1774,14 @@ class ModelBuilder:
         - collision_group = 0
 
         Returns:
-            ShapeConfig: A new configuration suitable for creating sites.
+            A new configuration suitable for creating sites.
         """
         cfg = self.ShapeConfig()
         cfg.mark_as_site()
         return cfg
 
     @property
-    def up_vector(self) -> Vec3:
+    def up_vector(self) -> tuple[float, float, float]:
         """
         Returns the 3D unit vector corresponding to the current up axis (read-only).
 
@@ -1603,15 +1789,37 @@ class ModelBuilder:
         For example, if ``up_axis`` is ``Axis.Z``, this returns ``(0, 0, 1)``.
 
         Returns:
-            Vec3: The 3D up vector corresponding to the current up axis.
+            The 3D up vector corresponding to the current up axis.
         """
-        return axis_to_vec3(self.up_axis)
+        return self.up_axis.to_vector()
 
     @up_vector.setter
     def up_vector(self, _):
         raise AttributeError(
             "The 'up_vector' property is read-only and cannot be set. Instead, use 'up_axis' to set the up axis."
         )
+
+    @property
+    def current_world(self) -> int:
+        """Returns the builder-managed world context for subsequently added entities.
+
+        A value of ``-1`` means newly added entities are global. Use
+        :meth:`begin_world`, :meth:`end_world`, :meth:`add_world`, or
+        :meth:`replicate` to manage world assignment.
+
+        Returns:
+            The current world index for newly added entities.
+        """
+        return self._current_world
+
+    @current_world.setter
+    def current_world(self, _):
+        message = (
+            "The 'current_world' property is read-only and cannot be set. "
+            + "Use 'begin_world()', 'end_world()', 'add_world()', or "
+            + "'replicate()' to manage worlds."
+        )
+        raise AttributeError(message)
 
     # region counts
     @property
@@ -1705,9 +1913,9 @@ class ModelBuilder:
             stability by keeping all worlds at the origin in the physics simulation.
 
         Args:
-            builder (ModelBuilder): The builder to replicate. All entities from this builder will be copied.
-            world_count (int): The number of worlds to create.
-            spacing (tuple[float, float, float], optional): The spacing between each copy along each axis.
+            builder: The builder to replicate. All entities from this builder will be copied.
+            world_count: The number of worlds to create.
+            spacing: The spacing between each copy along each axis.
                 For example, (5.0, 5.0, 0.0) arranges copies in a 2D grid in the XY plane.
                 Defaults to (0.0, 0.0, 0.0).
         """
@@ -1803,6 +2011,9 @@ class ModelBuilder:
                 )
             child_to_parent[child] = parent
 
+        # Validate that only root bodies (parent == -1) can be kinematic
+        self._validate_kinematic_articulation_joints(joints)
+
         # Store the articulation using the first joint's index as the start
         articulation_idx = self.articulation_count
         self.articulation_start.append(sorted_joints[0])
@@ -1842,14 +2053,23 @@ class ModelBuilder:
         collapse_fixed_joints: bool = False,
         mesh_maxhullvert: int | None = None,
         force_position_velocity_actuation: bool = False,
+        override_root_xform: bool = False,
     ):
         """
         Parses a URDF file and adds the bodies and joints to the given ModelBuilder.
 
         Args:
-            source (str): The filename of the URDF file to parse, or the URDF XML string content.
-            xform (Transform): The transform to apply to the root body. If None, the transform is set to identity.
-            floating (bool or None): Controls the base joint type for the root body.
+            source: The filename of the URDF file to parse, or the URDF XML string content.
+            xform: The transform to apply to the root body. If None, the transform is set to identity.
+            override_root_xform: If ``True``, the articulation root's world-space
+                transform is replaced by ``xform`` instead of being composed with it,
+                preserving only the internal structure (relative body positions). Useful
+                for cloning articulations at explicit positions. When a ``base_joint`` is
+                specified, ``xform`` is applied as the full parent transform (including
+                rotation) rather than splitting position/rotation. Not intended for
+                sources containing multiple articulations, as all roots would be placed
+                at the same ``xform``. Defaults to ``False``.
+            floating: Controls the base joint type for the root body.
 
                 - ``None`` (default): Uses format-specific default (creates a FIXED joint for URDF).
                 - ``True``: Creates a FREE joint with 6 DOF (3 translation + 3 rotation). Only valid when
@@ -1857,13 +2077,13 @@ class ModelBuilder:
                 - ``False``: Creates a FIXED joint (0 DOF).
 
                 Cannot be specified together with ``base_joint``.
-            base_joint (dict): Custom joint specification for connecting the root body to the world
+            base_joint: Custom joint specification for connecting the root body to the world
                 (or to ``parent_body`` if specified). This parameter enables hierarchical composition with
                 custom mobility. Dictionary with joint parameters as accepted by
                 :meth:`ModelBuilder.add_joint` (e.g., joint type, axes, limits, stiffness).
 
                 Cannot be specified together with ``floating``.
-            parent_body (int): Parent body index for hierarchical composition. If specified, attaches the
+            parent_body: Parent body index for hierarchical composition. If specified, attaches the
                 imported root body to this existing body, making them part of the same kinematic articulation.
                 The connection type is determined by ``floating`` or ``base_joint``. If ``-1`` (default),
                 the root connects to the world frame. **Restriction**: Only the most recently added
@@ -1914,23 +2134,23 @@ class ModelBuilder:
                         - ``body_idx``
                         - ❌ Error: FREE joints require world frame
 
-            scale (float): The scaling factor to apply to the imported mechanism.
-            hide_visuals (bool): If True, hide visual shapes.
-            parse_visuals_as_colliders (bool): If True, the geometry defined under the `<visual>` tags is used for collision handling instead of the `<collision>` geometries.
-            up_axis (AxisType): The up axis of the URDF. This is used to transform the URDF to the builder's up axis. It also determines the up axis of capsules and cylinders in the URDF. The default is Z.
-            force_show_colliders (bool): If True, the collision shapes are always shown, even if there are visual shapes.
-            enable_self_collisions (bool): If True, self-collisions are enabled.
-            ignore_inertial_definitions (bool): If True, the inertial parameters defined in the URDF are ignored and the inertia is calculated from the shape geometry.
-            joint_ordering (str): The ordering of the joints in the simulation. Can be either "bfs" or "dfs" for breadth-first or depth-first search, or ``None`` to keep joints in the order in which they appear in the URDF. Default is "dfs".
-            bodies_follow_joint_ordering (bool): If True, the bodies are added to the builder in the same order as the joints (parent then child body). Otherwise, bodies are added in the order they appear in the URDF. Default is True.
-            collapse_fixed_joints (bool): If True, fixed joints are removed and the respective bodies are merged.
-            mesh_maxhullvert (int): Maximum vertices for convex hull approximation of meshes.
-            force_position_velocity_actuation (bool): If True and both position (stiffness) and velocity
-                (damping) gains are non-zero, joints use :attr:`~newton.ActuatorMode.POSITION_VELOCITY` actuation mode.
-                If False (default), actuator modes are inferred per joint via :func:`newton.ActuatorMode.from_gains`:
-                :attr:`~newton.ActuatorMode.POSITION` if stiffness > 0, :attr:`~newton.ActuatorMode.VELOCITY` if only
-                damping > 0, :attr:`~newton.ActuatorMode.EFFORT` if a drive is present but both gains are zero
-                (direct torque control), or :attr:`~newton.ActuatorMode.NONE` if no drive/actuation is applied.
+            scale: The scaling factor to apply to the imported mechanism.
+            hide_visuals: If True, hide visual shapes.
+            parse_visuals_as_colliders: If True, the geometry defined under the `<visual>` tags is used for collision handling instead of the `<collision>` geometries.
+            up_axis: The up axis of the URDF. This is used to transform the URDF to the builder's up axis. It also determines the up axis of capsules and cylinders in the URDF. The default is Z.
+            force_show_colliders: If True, the collision shapes are always shown, even if there are visual shapes.
+            enable_self_collisions: If True, self-collisions are enabled.
+            ignore_inertial_definitions: If True, the inertial parameters defined in the URDF are ignored and the inertia is calculated from the shape geometry.
+            joint_ordering: The ordering of the joints in the simulation. Can be either "bfs" or "dfs" for breadth-first or depth-first search, or ``None`` to keep joints in the order in which they appear in the URDF. Default is "dfs".
+            bodies_follow_joint_ordering: If True, the bodies are added to the builder in the same order as the joints (parent then child body). Otherwise, bodies are added in the order they appear in the URDF. Default is True.
+            collapse_fixed_joints: If True, fixed joints are removed and the respective bodies are merged.
+            mesh_maxhullvert: Maximum vertices for convex hull approximation of meshes.
+            force_position_velocity_actuation: If True and both position (stiffness) and velocity
+                (damping) gains are non-zero, joints use :attr:`~newton.JointTargetMode.POSITION_VELOCITY` actuation mode.
+                If False (default), actuator modes are inferred per joint via :func:`newton.JointTargetMode.from_gains`:
+                :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
+                damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
+                (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
         """
         from ..utils.import_urdf import parse_urdf  # noqa: PLC0415
 
@@ -1953,11 +2173,12 @@ class ModelBuilder:
             collapse_fixed_joints=collapse_fixed_joints,
             mesh_maxhullvert=mesh_maxhullvert,
             force_position_velocity_actuation=force_position_velocity_actuation,
+            override_root_xform=override_root_xform,
         )
 
     def add_usd(
         self,
-        source,
+        source: str | UsdStage,
         *,
         xform: Transform | None = None,
         floating: bool | None = None,
@@ -1983,6 +2204,7 @@ class ModelBuilder:
         mesh_maxhullvert: int | None = None,
         schema_resolvers: list[SchemaResolver] | None = None,
         force_position_velocity_actuation: bool = False,
+        override_root_xform: bool = False,
     ) -> dict[str, Any]:
         """Parses a Universal Scene Description (USD) stage containing UsdPhysics schema definitions for rigid-body articulations and adds the bodies, shapes and joints to the given ModelBuilder.
 
@@ -1991,9 +2213,15 @@ class ModelBuilder:
         See :ref:`usd_parsing` for more information.
 
         Args:
-            source (str | pxr.Usd.Stage): The file path to the USD file, or an existing USD stage instance.
-            xform (Transform): The transform to apply to the entire scene.
-            floating (bool or None): Controls the base joint type for the root body (bodies not connected as
+            source: The file path to the USD file, or an existing USD stage instance.
+            xform: The transform to apply to the entire scene.
+            override_root_xform: If ``True``, the articulation root's world-space
+                transform is replaced by ``xform`` instead of being composed with it,
+                preserving only the internal structure (relative body positions). Useful
+                for cloning articulations at explicit positions. Not intended for sources
+                containing multiple articulations, as all roots would be placed at the
+                same ``xform``. Defaults to ``False``.
+            floating: Controls the base joint type for the root body (bodies not connected as
                 a child to any joint).
 
                 - ``None`` (default): Uses format-specific default (creates a FREE joint for USD bodies without joints).
@@ -2002,13 +2230,13 @@ class ModelBuilder:
                 - ``False``: Creates a FIXED joint (0 DOF).
 
                 Cannot be specified together with ``base_joint``.
-            base_joint (dict): Custom joint specification for connecting the root body to the world
+            base_joint: Custom joint specification for connecting the root body to the world
                 (or to ``parent_body`` if specified). This parameter enables hierarchical composition with
                 custom mobility. Dictionary with joint parameters as accepted by
                 :meth:`ModelBuilder.add_joint` (e.g., joint type, axes, limits, stiffness).
 
                 Cannot be specified together with ``floating``.
-            parent_body (int): Parent body index for hierarchical composition. If specified, attaches the
+            parent_body: Parent body index for hierarchical composition. If specified, attaches the
                 imported root body to this existing body, making them part of the same kinematic articulation.
                 The connection type is determined by ``floating`` or ``base_joint``. If ``-1`` (default),
                 the root connects to the world frame. **Restriction**: Only the most recently added
@@ -2059,46 +2287,52 @@ class ModelBuilder:
                         - ``body_idx``
                         - ❌ Error: FREE joints require world frame
 
-            only_load_enabled_rigid_bodies (bool): If True, only rigid bodies which do not have `physics:rigidBodyEnabled` set to False are loaded.
-            only_load_enabled_joints (bool): If True, only joints which do not have `physics:jointEnabled` set to False are loaded.
-            joint_drive_gains_scaling (float): The default scaling of the PD control gains (stiffness and damping), if not set in the PhysicsScene with as "newton:joint_drive_gains_scaling".
-            verbose (bool): If True, print additional information about the parsed USD file. Default is False.
-            ignore_paths (List[str]): A list of regular expressions matching prim paths to ignore.
-            collapse_fixed_joints (bool): If True, fixed joints are removed and the respective bodies are merged. Only considered if not set on the PhysicsScene as "newton:collapse_fixed_joints".
-            enable_self_collisions (bool): Default for whether self-collisions are enabled for all shapes within an articulation. Resolved via the schema resolver from ``newton:selfCollisionEnabled`` (NewtonArticulationRootAPI) or ``physxArticulation:enabledSelfCollisions``; if neither is authored, this value takes precedence.
-            apply_up_axis_from_stage (bool): If True, the up axis of the stage will be used to set :attr:`newton.ModelBuilder.up_axis`. Otherwise, the stage will be rotated such that its up axis aligns with the builder's up axis. Default is False.
-            root_path (str): The USD path to import, defaults to "/".
-            joint_ordering (str): The ordering of the joints in the simulation. Can be either "bfs" or "dfs" for breadth-first or depth-first search, or ``None`` to keep joints in the order in which they appear in the USD. Default is "dfs".
-            bodies_follow_joint_ordering (bool): If True, the bodies are added to the builder in the same order as the joints (parent then child body). Otherwise, bodies are added in the order they appear in the USD. Default is True.
-            skip_mesh_approximation (bool): If True, mesh approximation is skipped. Otherwise, meshes are approximated according to the ``physics:approximation`` attribute defined on the UsdPhysicsMeshCollisionAPI (if it is defined). Default is False.
-            load_sites (bool): If True, sites (prims with MjcSiteAPI) are loaded as non-colliding reference points. If False, sites are ignored. Default is True.
-            load_visual_shapes (bool): If True, non-physics visual geometry is loaded. If False, visual-only shapes are ignored (sites are still controlled by ``load_sites``). Default is True.
-            hide_collision_shapes (bool): If True, collision shapes are hidden. Default is False.
-            force_show_colliders (bool): If True, collision shapes get the VISIBLE flag
+            only_load_enabled_rigid_bodies: If True, only rigid bodies which do not have `physics:rigidBodyEnabled` set to False are loaded.
+            only_load_enabled_joints: If True, only joints which do not have `physics:jointEnabled` set to False are loaded.
+            joint_drive_gains_scaling: The default scaling of the PD control gains (stiffness and damping), if not set in the PhysicsScene with as "newton:joint_drive_gains_scaling".
+            verbose: If True, print additional information about the parsed USD file. Default is False.
+            ignore_paths: A list of regular expressions matching prim paths to ignore.
+            collapse_fixed_joints: If True, fixed joints are removed and the respective bodies are merged. Only considered if not set on the PhysicsScene as "newton:collapse_fixed_joints".
+            enable_self_collisions: Default for whether self-collisions are enabled for all shapes within an articulation. Resolved via the schema resolver from ``newton:selfCollisionEnabled`` (NewtonArticulationRootAPI) or ``physxArticulation:enabledSelfCollisions``; if neither is authored, this value takes precedence.
+            apply_up_axis_from_stage: If True, the up axis of the stage will be used to set :attr:`newton.ModelBuilder.up_axis`. Otherwise, the stage will be rotated such that its up axis aligns with the builder's up axis. Default is False.
+            root_path: The USD path to import, defaults to "/".
+            joint_ordering: The ordering of the joints in the simulation. Can be either "bfs" or "dfs" for breadth-first or depth-first search, or ``None`` to keep joints in the order in which they appear in the USD. Default is "dfs".
+            bodies_follow_joint_ordering: If True, the bodies are added to the builder in the same order as the joints (parent then child body). Otherwise, bodies are added in the order they appear in the USD. Default is True.
+            skip_mesh_approximation: If True, mesh approximation is skipped. Otherwise, meshes are approximated according to the ``physics:approximation`` attribute defined on the UsdPhysicsMeshCollisionAPI (if it is defined). Default is False.
+            load_sites: If True, sites (prims with MjcSiteAPI) are loaded as non-colliding reference points. If False, sites are ignored. Default is True.
+            load_visual_shapes: If True, non-physics visual geometry is loaded. If False, visual-only shapes are ignored (sites are still controlled by ``load_sites``). Default is True.
+            hide_collision_shapes: If True, collision shapes on bodies that already
+                have visual-only geometry are hidden. Collision shapes on bodies
+                without visual-only geometry remain visible as a rendering fallback.
+                Mesh colliders with authored PBR material data (texture,
+                roughness, or metallic) also remain visible so collision-only
+                render meshes are not lost.
+                Default is False.
+            force_show_colliders: If True, collision shapes get the VISIBLE flag
                 regardless of whether visual shapes exist on the same body. Note that
-                ``hide_collision_shapes=True`` still takes precedence and will suppress
-                the VISIBLE flag even when this option is set. Default is False.
-            parse_mujoco_options (bool): Whether MuJoCo solver options from the PhysicsScene should be parsed. If False, solver options are not loaded and custom attributes retain their default values. Default is True.
-            mesh_maxhullvert (int): Maximum vertices for convex hull approximation of meshes. Note that an authored ``newton:maxHullVertices`` attribute on any shape with a ``NewtonMeshCollisionAPI`` will take priority over this value.
-            schema_resolvers (list[SchemaResolver]): Resolver instances in priority order. Default is to only parse Newton-specific attributes.
+                ``hide_collision_shapes=True`` still suppresses the VISIBLE flag for
+                colliders on bodies with visual-only geometry. Default is False.
+            parse_mujoco_options: Whether MuJoCo solver options from the PhysicsScene should be parsed. If False, solver options are not loaded and custom attributes retain their default values. Default is True.
+            mesh_maxhullvert: Maximum vertices for convex hull approximation of meshes. Note that an authored ``newton:maxHullVertices`` attribute on any shape with a ``NewtonMeshCollisionAPI`` will take priority over this value.
+            schema_resolvers: Resolver instances in priority order. Default is to only parse Newton-specific attributes.
                 Schema resolvers collect per-prim "solver-specific" attributes, see :ref:`schema_resolvers` for more information.
                 These include namespaced attributes such as ``newton:*``, ``physx*``
                 (e.g., ``physxScene:*``, ``physxRigidBody:*``, ``physxSDFMeshCollision:*``), and ``mjc:*`` that
                 are authored in the USD but not strictly required to build the simulation. This is useful for
                 inspection, experimentation, or custom pipelines that read these values via
-                :attr:`newton.usd.SchemaResolverManager.schema_attrs`.
+                ``result["schema_attrs"]`` returned from :func:`parse_usd`.
 
                 .. note::
                     Using the ``schema_resolvers`` argument is an experimental feature that may be removed or changed significantly in the future.
-            force_position_velocity_actuation (bool): If True and both stiffness (kp) and damping (kd)
-                are non-zero, joints use :attr:`~newton.ActuatorMode.POSITION_VELOCITY` actuation mode.
-                If False (default), actuator modes are inferred per joint via :func:`newton.ActuatorMode.from_gains`:
-                :attr:`~newton.ActuatorMode.POSITION` if stiffness > 0, :attr:`~newton.ActuatorMode.VELOCITY` if only
-                damping > 0, :attr:`~newton.ActuatorMode.EFFORT` if a drive is present but both gains are zero
-                (direct torque control), or :attr:`~newton.ActuatorMode.NONE` if no drive/actuation is applied.
+            force_position_velocity_actuation: If True and both stiffness (kp) and damping (kd)
+                are non-zero, joints use :attr:`~newton.JointTargetMode.POSITION_VELOCITY` actuation mode.
+                If False (default), actuator modes are inferred per joint via :func:`newton.JointTargetMode.from_gains`:
+                :attr:`~newton.JointTargetMode.POSITION` if stiffness > 0, :attr:`~newton.JointTargetMode.VELOCITY` if only
+                damping > 0, :attr:`~newton.JointTargetMode.EFFORT` if a drive is present but both gains are zero
+                (direct torque control), or :attr:`~newton.JointTargetMode.NONE` if no drive/actuation is applied.
 
         Returns:
-            dict: Dictionary with the following entries:
+            The returned mapping has the following entries:
 
             .. list-table::
                 :widths: 25 75
@@ -2167,6 +2401,7 @@ class ModelBuilder:
             mesh_maxhullvert=mesh_maxhullvert,
             schema_resolvers=schema_resolvers,
             force_position_velocity_actuation=force_position_velocity_actuation,
+            override_root_xform=override_root_xform,
         )
 
     def add_mjcf(
@@ -2201,15 +2436,22 @@ class ModelBuilder:
         mesh_maxhullvert: int | None = None,
         ctrl_direct: bool = False,
         path_resolver: Callable[[str | None, str], str] | None = None,
+        override_root_xform: bool = False,
     ):
         """
         Parses MuJoCo XML (MJCF) file and adds the bodies and joints to the given ModelBuilder.
         MuJoCo-specific custom attributes are registered on the builder automatically.
 
         Args:
-            source (str): The filename of the MuJoCo file to parse, or the MJCF XML string content.
-            xform (Transform): The transform to apply to the imported mechanism.
-            floating (bool or None): Controls the base joint type for the root body.
+            source: The filename of the MuJoCo file to parse, or the MJCF XML string content.
+            xform: The transform to apply to the imported mechanism.
+            override_root_xform: If ``True``, the articulation root's world-space
+                transform is replaced by ``xform`` instead of being composed with it,
+                preserving only the internal structure (relative body positions). Useful
+                for cloning articulations at explicit positions. Not intended for sources
+                containing multiple articulations, as all roots would be placed at the
+                same ``xform``. Defaults to ``False``.
+            floating: Controls the base joint type for the root body.
 
                 - ``None`` (default): Uses format-specific default (honors ``<freejoint>`` tags in MJCF,
                   otherwise creates a FIXED joint).
@@ -2218,13 +2460,13 @@ class ModelBuilder:
                 - ``False``: Creates a FIXED joint (0 DOF).
 
                 Cannot be specified together with ``base_joint``.
-            base_joint (dict): Custom joint specification for connecting the root body to the world
+            base_joint: Custom joint specification for connecting the root body to the world
                 (or to ``parent_body`` if specified). This parameter enables hierarchical composition with
                 custom mobility. Dictionary with joint parameters as accepted by
                 :meth:`ModelBuilder.add_joint` (e.g., joint type, axes, limits, stiffness).
 
                 Cannot be specified together with ``floating``.
-            parent_body (int): Parent body index for hierarchical composition. If specified, attaches the
+            parent_body: Parent body index for hierarchical composition. If specified, attaches the
                 imported root body to this existing body, making them part of the same kinematic articulation.
                 The connection type is determined by ``floating`` or ``base_joint``. If ``-1`` (default),
                 the root connects to the world frame. **Restriction**: Only the most recently added
@@ -2275,34 +2517,34 @@ class ModelBuilder:
                         - ``body_idx``
                         - ❌ Error: FREE joints require world frame
 
-            armature_scale (float): Scaling factor to apply to the MJCF-defined joint armature values.
-            scale (float): The scaling factor to apply to the imported mechanism.
-            hide_visuals (bool): If True, hide visual shapes after loading them (affects visibility, not loading).
-            parse_visuals_as_colliders (bool): If True, the geometry defined under the `visual_classes` tags is used for collision handling instead of the `collider_classes` geometries.
-            parse_meshes (bool): Whether geometries of type `"mesh"` should be parsed. If False, geometries of type `"mesh"` are ignored.
-            parse_sites (bool): Whether sites (non-colliding reference points) should be parsed. If False, sites are ignored.
-            parse_visuals (bool): Whether visual geometries (non-collision shapes) should be loaded. If False, visual shapes are not loaded (different from `hide_visuals` which loads but hides them). Default is True.
-            parse_mujoco_options (bool): Whether solver options from the MJCF `<option>` tag should be parsed. If False, solver options are not loaded and custom attributes retain their default values. Default is True.
-            up_axis (AxisType): The up axis of the MuJoCo scene. The default is Z up.
-            ignore_names (Sequence[str]): A list of regular expressions. Bodies and joints with a name matching one of the regular expressions will be ignored.
-            ignore_classes (Sequence[str]): A list of regular expressions. Bodies and joints with a class matching one of the regular expressions will be ignored.
-            visual_classes (Sequence[str]): A list of regular expressions. Visual geometries with a class matching one of the regular expressions will be parsed.
-            collider_classes (Sequence[str]): A list of regular expressions. Collision geometries with a class matching one of the regular expressions will be parsed.
+            armature_scale: Scaling factor to apply to the MJCF-defined joint armature values.
+            scale: The scaling factor to apply to the imported mechanism.
+            hide_visuals: If True, hide visual shapes after loading them (affects visibility, not loading).
+            parse_visuals_as_colliders: If True, the geometry defined under the `visual_classes` tags is used for collision handling instead of the `collider_classes` geometries.
+            parse_meshes: Whether geometries of type `"mesh"` should be parsed. If False, geometries of type `"mesh"` are ignored.
+            parse_sites: Whether sites (non-colliding reference points) should be parsed. If False, sites are ignored.
+            parse_visuals: Whether visual geometries (non-collision shapes) should be loaded. If False, visual shapes are not loaded (different from `hide_visuals` which loads but hides them). Default is True.
+            parse_mujoco_options: Whether solver options from the MJCF `<option>` tag should be parsed. If False, solver options are not loaded and custom attributes retain their default values. Default is True.
+            up_axis: The up axis of the MuJoCo scene. The default is Z up.
+            ignore_names: A list of regular expressions. Bodies and joints with a name matching one of the regular expressions will be ignored.
+            ignore_classes: A list of regular expressions. Bodies and joints with a class matching one of the regular expressions will be ignored.
+            visual_classes: A list of regular expressions. Visual geometries with a class matching one of the regular expressions will be parsed.
+            collider_classes: A list of regular expressions. Collision geometries with a class matching one of the regular expressions will be parsed.
             no_class_as_colliders: If True, geometries without a class are parsed as collision geometries. If False, geometries without a class are parsed as visual geometries.
-            force_show_colliders (bool): If True, the collision shapes are always shown, even if there are visual shapes.
-            enable_self_collisions (bool): If True, self-collisions are enabled.
-            ignore_inertial_definitions (bool): If True, the inertial parameters defined in the MJCF are ignored and the inertia is calculated from the shape geometry.
-            collapse_fixed_joints (bool): If True, fixed joints are removed and the respective bodies are merged.
-            verbose (bool): If True, print additional information about parsing the MJCF.
-            skip_equality_constraints (bool): Whether <equality> tags should be parsed. If True, equality constraints are ignored.
-            convert_3d_hinge_to_ball_joints (bool): If True, series of three hinge joints are converted to a single ball joint. Default is False.
-            mesh_maxhullvert (int): Maximum vertices for convex hull approximation of meshes.
-            ctrl_direct (bool): If True, all actuators use :attr:`~newton.solvers.SolverMuJoCo.CtrlSource.CTRL_DIRECT` mode
+            force_show_colliders: If True, the collision shapes are always shown, even if there are visual shapes.
+            enable_self_collisions: If True, self-collisions are enabled.
+            ignore_inertial_definitions: If True, the inertial parameters defined in the MJCF are ignored and the inertia is calculated from the shape geometry.
+            collapse_fixed_joints: If True, fixed joints are removed and the respective bodies are merged.
+            verbose: If True, print additional information about parsing the MJCF.
+            skip_equality_constraints: Whether <equality> tags should be parsed. If True, equality constraints are ignored.
+            convert_3d_hinge_to_ball_joints: If True, series of three hinge joints are converted to a single ball joint. Default is False.
+            mesh_maxhullvert: Maximum vertices for convex hull approximation of meshes.
+            ctrl_direct: If True, all actuators use :attr:`~newton.solvers.SolverMuJoCo.CtrlSource.CTRL_DIRECT` mode
                 where control comes directly from ``control.mujoco.ctrl`` (MuJoCo-native behavior).
                 See :ref:`custom_attributes` for details on custom attributes. If False (default), position/velocity
                 actuators use :attr:`~newton.solvers.SolverMuJoCo.CtrlSource.JOINT_TARGET` mode where control comes
                 from :attr:`newton.Control.joint_target_pos` and :attr:`newton.Control.joint_target_vel`.
-            path_resolver (Callable): Callback to resolve file paths. Takes (base_dir, file_path) and returns a resolved path. For <include> elements, can return either a file path or XML content directly. For asset elements (mesh, texture, etc.), must return an absolute file path. The default resolver joins paths and returns absolute file paths.
+            path_resolver: Callback to resolve file paths. Takes (base_dir, file_path) and returns a resolved path. For <include> elements, can return either a file path or XML content directly. For asset elements (mesh, texture, etc.), must return an absolute file path. The default resolver joins paths and returns absolute file paths.
         """
         from ..solvers.mujoco.solver_mujoco import SolverMuJoCo  # noqa: PLC0415
         from ..utils.import_mjcf import parse_mjcf  # noqa: PLC0415
@@ -2339,6 +2581,7 @@ class ModelBuilder:
             mesh_maxhullvert=mesh_maxhullvert,
             ctrl_direct=ctrl_direct,
             path_resolver=path_resolver,
+            override_root_xform=override_root_xform,
         )
 
     # endregion
@@ -2361,16 +2604,17 @@ class ModelBuilder:
         calling :meth:`begin_world` again.
 
         Args:
-            label (str | None): Optional unique identifier for this world. If None,
+            label: Optional unique identifier for this world. If None,
                 a default label "world_{index}" will be generated.
-            attributes (dict[str, Any] | None): Optional custom attributes to associate
+            attributes: Optional custom attributes to associate
                 with this world for later use.
-            gravity (Vec3 | None): Optional gravity vector for this world. If None,
+            gravity: Optional gravity vector for this world. If None,
                 the world will use the builder's default gravity (computed from
                 ``self.gravity`` and ``self.up_vector``).
 
         Raises:
-            RuntimeError: If called when already inside a world context (current_world != -1).
+            RuntimeError: If called when already inside a world context
+                (:attr:`current_world` is not ``-1``).
 
         Example::
 
@@ -2398,7 +2642,7 @@ class ModelBuilder:
             )
 
         # Set the current world to the next available world index
-        self.current_world = self.world_count
+        self._current_world = self.world_count
         self.world_count += 1
 
         # Store world metadata if needed (for future use)
@@ -2407,9 +2651,12 @@ class ModelBuilder:
 
         # Initialize this world's gravity
         if gravity is not None:
-            self.world_gravity.append(tuple(gravity))
+            self.world_gravity.append(gravity)
         else:
-            self.world_gravity.append(tuple(g * self.gravity for g in self.up_vector))
+            up_vector = self.up_vector
+            self.world_gravity.append(
+                (up_vector[0] * self.gravity, up_vector[1] * self.gravity, up_vector[2] * self.gravity)
+            )
 
     def end_world(self):
         """End the current world context and return to global scope.
@@ -2418,7 +2665,8 @@ class ModelBuilder:
         to the global world (-1) until :meth:`begin_world` is called again.
 
         Raises:
-            RuntimeError: If called when not in a world context (current_world == -1).
+            RuntimeError: If called when not in a world context
+                (:attr:`current_world` is ``-1``).
 
         Example::
 
@@ -2432,7 +2680,7 @@ class ModelBuilder:
             raise RuntimeError("Cannot end world: not currently in a world context (current_world is already -1).")
 
         # Reset to global world
-        self.current_world = -1
+        self._current_world = -1
 
     def add_world(
         self,
@@ -2448,10 +2696,10 @@ class ModelBuilder:
         of the same scene/robot).
 
         Args:
-            builder (ModelBuilder): The builder containing entities to add as a new world.
-            xform (Transform | None): Optional transform to apply to all root bodies
+            builder: The builder containing entities to add as a new world.
+            xform: Optional transform to apply to all root bodies
                 in the builder. Useful for spacing out worlds visually.
-            label_prefix (str | None): Optional prefix prepended to all entity labels
+            label_prefix: Optional prefix prepended to all entity labels
                 from the source builder. Useful for distinguishing multiple instances
                 of the same model (e.g., ``"left_arm"`` vs ``"right_arm"``).
 
@@ -2488,8 +2736,12 @@ class ModelBuilder:
         """Copies the data from another `ModelBuilder` into this `ModelBuilder`.
 
         All entities from the source builder are added to this builder's current world context
-        (the value of `self.current_world`). Any world assignments that existed in the source
-        builder are overwritten - all entities will be assigned to the current world.
+        (the value of :attr:`current_world`). Any world assignments that existed in the source
+        builder are overwritten - all entities will be assigned to the active world context.
+
+        Use :meth:`begin_world`, :meth:`end_world`, :meth:`add_world`, or
+        :meth:`replicate` to manage world assignment. :attr:`current_world`
+        is read-only and should not be set directly.
 
         Example::
 
@@ -2498,16 +2750,17 @@ class ModelBuilder:
             sub_builder.add_body(...)
             sub_builder.add_shape_box(...)
 
-            # Adds all entities from sub_builder to main_builder's current world (-1 by default)
+            # Adds all entities from sub_builder to main_builder's active
+            # world context (-1 by default)
             main_builder.add_builder(sub_builder)
 
             # With transform and label prefix
             main_builder.add_builder(sub_builder, xform=wp.transform((1, 0, 0)), label_prefix="left")
 
         Args:
-            builder (ModelBuilder): The model builder to copy data from.
-            xform (Transform): Optional offset transform applied to root bodies.
-            label_prefix (str | None): Optional prefix prepended to all entity labels
+            builder: The model builder to copy data from.
+            xform: Optional offset transform applied to root bodies.
+            label_prefix: Optional prefix prepended to all entity labels
                 from the source builder. Labels are joined with ``/``
                 (e.g., ``"left/panda/base_link"``).
         """
@@ -2518,7 +2771,12 @@ class ModelBuilder:
         # Copy gravity from source builder
         if self.current_world >= 0 and self.current_world < len(self.world_gravity):
             # We're in a world context, update this world's gravity vector
-            self.world_gravity[self.current_world] = tuple(g * builder.gravity for g in builder.up_vector)
+            builder_up = builder.up_vector
+            self.world_gravity[self.current_world] = (
+                builder_up[0] * builder.gravity,
+                builder_up[1] * builder.gravity,
+                builder_up[2] * builder.gravity,
+            )
         elif self.current_world < 0:
             # No world context (add_builder called directly), copy scalar gravity
             self.gravity = builder.gravity
@@ -2526,12 +2784,15 @@ class ModelBuilder:
         self._requested_contact_attributes.update(builder._requested_contact_attributes)
         self._requested_state_attributes.update(builder._requested_state_attributes)
 
+        if xform is not None:
+            xform = wp.transform(*xform)
+
         # explicitly resolve the transform multiplication function to avoid
         # repeatedly resolving builtin overloads during shape transformation
         transform_mul_cfunc = wp._src.context.runtime.core.wp_builtin_mul_transformf_transformf
 
         # dispatches two transform multiplies to the native implementation
-        def transform_mul(a, b):
+        def transform_mul(a: wp.transform, b: wp.transform) -> wp.transform:
             out = wp.transform.from_buffer(np.empty(7, dtype=np.float32))
             transform_mul_cfunc(a, b, ctypes.byref(out))
             return out
@@ -2755,6 +3016,7 @@ class ModelBuilder:
             "body_inv_mass",
             "body_com",
             "body_lock_inertia",
+            "body_flags",
             "body_qd",
             "joint_type",
             "joint_enabled",
@@ -2774,7 +3036,7 @@ class ModelBuilder:
             "joint_limit_kd",
             "joint_target_ke",
             "joint_target_kd",
-            "joint_act_mode",
+            "joint_target_mode",
             "joint_effort_limit",
             "joint_velocity_limit",
             "joint_friction",
@@ -3009,8 +3271,9 @@ class ModelBuilder:
         inertia: Mat33 | None = None,
         mass: float = 0.0,
         label: str | None = None,
-        custom_attributes: dict[str, Any] | None = None,
         lock_inertia: bool = False,
+        is_kinematic: bool = False,
+        custom_attributes: dict[str, Any] | None = None,
     ) -> int:
         """Adds a link (rigid body) to the model within an articulation.
 
@@ -3027,16 +3290,15 @@ class ModelBuilder:
             inertia: The 3x3 inertia tensor of the body (specified relative to the center of mass). If None, the inertia tensor is assumed to be zero.
             mass: Mass of the body.
             label: Label of the body (optional).
-            custom_attributes: Dictionary of custom attribute names to values.
             lock_inertia: If True, prevents subsequent shape additions from modifying this body's mass,
                 center of mass, or inertia. This does not affect merging behavior in
                 :meth:`collapse_fixed_joints`, which always accumulates mass and inertia across merged bodies.
+            is_kinematic: If True, the body is kinematic and does not respond to forces.
+                Only root bodies (bodies whose joint parent is ``-1``) may be kinematic.
+            custom_attributes: Dictionary of custom attribute names to values.
 
         Returns:
             The index of the body in the model.
-
-        Note:
-            If the mass is zero then the body is treated as kinematic with no dynamics.
 
         """
 
@@ -3047,7 +3309,7 @@ class ModelBuilder:
         if com is None:
             com = wp.vec3()
         else:
-            com = wp.vec3(*com)
+            com = axis_to_vec3(com)
         if inertia is None:
             inertia = wp.mat33()
         else:
@@ -3063,6 +3325,7 @@ class ModelBuilder:
         self.body_mass.append(mass)
         self.body_com.append(com)
         self.body_lock_inertia.append(lock_inertia)
+        self.body_flags.append(int(BodyFlags.KINEMATIC) if is_kinematic else int(BodyFlags.DYNAMIC))
 
         if mass > 0.0:
             self.body_inv_mass.append(1.0 / mass)
@@ -3098,8 +3361,9 @@ class ModelBuilder:
         inertia: Mat33 | None = None,
         mass: float = 0.0,
         label: str | None = None,
-        custom_attributes: dict[str, Any] | None = None,
         lock_inertia: bool = False,
+        is_kinematic: bool = False,
+        custom_attributes: dict[str, Any] | None = None,
     ) -> int:
         """Adds a stand-alone free-floating rigid body to the model.
 
@@ -3121,16 +3385,14 @@ class ModelBuilder:
             mass: Mass of the body.
             label: Label of the body. When provided, the auto-created free joint and articulation
                 are assigned labels ``{label}_free_joint`` and ``{label}_articulation`` respectively.
-            custom_attributes: Dictionary of custom attribute names to values.
             lock_inertia: If True, prevents subsequent shape additions from modifying this body's mass,
                 center of mass, or inertia. This does not affect merging behavior in
                 :meth:`collapse_fixed_joints`, which always accumulates mass and inertia across merged bodies.
+            is_kinematic: If True, the body is kinematic and does not respond to forces.
+            custom_attributes: Dictionary of custom attribute names to values.
 
         Returns:
             The index of the body in the model.
-
-        Note:
-            If the mass is zero then the body is treated as kinematic with no dynamics.
 
         """
         # Create the link
@@ -3143,6 +3405,7 @@ class ModelBuilder:
             label=label,
             custom_attributes=custom_attributes,
             lock_inertia=lock_inertia,
+            is_kinematic=is_kinematic,
         )
 
         # Add a free joint to make it float
@@ -3177,20 +3440,20 @@ class ModelBuilder:
         Generic method to add any type of joint to this ModelBuilder.
 
         Args:
-            joint_type (JointType): The type of joint to add (see :ref:`Joint types`).
-            parent (int): The index of the parent body (-1 is the world).
-            child (int): The index of the child body.
-            linear_axes (list(:class:`JointDofConfig`)): The linear axes (see :class:`JointDofConfig`) of the joint,
+            joint_type: The type of joint to add (see :ref:`Joint types`).
+            parent: The index of the parent body (-1 is the world).
+            child: The index of the child body.
+            linear_axes: The linear axes (see :class:`JointDofConfig`) of the joint,
                 defined in the joint parent anchor frame.
-            angular_axes (list(:class:`JointDofConfig`)): The angular axes (see :class:`JointDofConfig`) of the joint,
+            angular_axes: The angular axes (see :class:`JointDofConfig`) of the joint,
                 defined in the joint parent anchor frame.
-            label (str): The label of the joint (optional).
-            parent_xform (Transform): The transform from the parent body frame to the joint parent anchor frame.
+            label: The label of the joint (optional).
+            parent_xform: The transform from the parent body frame to the joint parent anchor frame.
                 If None, the identity transform is used.
-            child_xform (Transform): The transform from the child body frame to the joint child anchor frame.
+            child_xform: The transform from the child body frame to the joint child anchor frame.
                 If None, the identity transform is used.
-            collision_filter_parent (bool): Whether to filter collisions between shapes of the parent and child bodies.
-            enabled (bool): Whether the joint is enabled (not considered by :class:`SolverFeatherstone`).
+            collision_filter_parent: Whether to filter collisions between shapes of the parent and child bodies.
+            enabled: Whether the joint is enabled (not considered by :class:`SolverFeatherstone`).
             custom_attributes: Dictionary of custom attribute keys (see :attr:`CustomAttribute.key`) to values. Note that custom attributes with frequency :attr:`Model.AttributeFrequency.JOINT_DOF` or :attr:`Model.AttributeFrequency.JOINT_COORD` can be provided as: (1) lists with length equal to the joint's DOF or coordinate count, (2) dicts mapping DOF/coordinate indices to values, or (3) a single scalar value that is broadcast to all DOFs/coordinates of the joint. For joints with zero DOFs (e.g., fixed joints), JOINT_DOF attributes are silently skipped. Custom attributes with frequency :attr:`Model.AttributeFrequency.JOINT` require a single value to be defined.
 
         Returns:
@@ -3239,8 +3502,8 @@ class ModelBuilder:
         elif child not in self.joint_children[parent]:
             self.joint_children[parent].append(child)
         self.joint_child.append(child)
-        self.joint_X_p.append(wp.transform(parent_xform))
-        self.joint_X_c.append(wp.transform(child_xform))
+        self.joint_X_p.append(parent_xform)
+        self.joint_X_c.append(child_xform)
         self.joint_label.append(label or f"joint_{self.joint_count}")
         self.joint_dof_dim.append((len(linear_axes), len(angular_axes)))
         self.joint_enabled.append(enabled)
@@ -3259,10 +3522,10 @@ class ModelBuilder:
                 # Infer has_drive from whether gains are non-zero: non-zero gains imply a drive exists.
                 # This ensures freejoints (gains=0) get NONE, while joints with gains get appropriate mode.
                 has_drive = dim.target_ke != 0.0 or dim.target_kd != 0.0
-                mode = int(ActuatorMode.from_gains(dim.target_ke, dim.target_kd, has_drive=has_drive))
+                mode = int(JointTargetMode.from_gains(dim.target_ke, dim.target_kd, has_drive=has_drive))
 
             # Store per-DOF actuator properties
-            self.joint_act_mode.append(mode)
+            self.joint_target_mode.append(mode)
             self.joint_target_ke.append(dim.target_ke)
             self.joint_target_kd.append(dim.target_kd)
             self.joint_limit_ke.append(dim.limit_ke)
@@ -3348,7 +3611,7 @@ class ModelBuilder:
         effort_limit: float | None = None,
         velocity_limit: float | None = None,
         friction: float | None = None,
-        actuator_mode: ActuatorMode | None = None,
+        actuator_mode: JointTargetMode | None = None,
         label: str | None = None,
         collision_filter_parent: bool = True,
         enabled: bool = True,
@@ -3360,9 +3623,9 @@ class ModelBuilder:
         Args:
             parent: The index of the parent body.
             child: The index of the child body.
-            parent_xform (Transform): The transform from the parent body frame to the joint parent anchor frame.
-            child_xform (Transform): The transform from the child body frame to the joint child anchor frame.
-            axis (AxisType | Vec3 | JointDofConfig): The axis of rotation in the joint parent anchor frame, which is
+            parent_xform: The transform from the parent body frame to the joint parent anchor frame.
+            child_xform: The transform from the child body frame to the joint child anchor frame.
+            axis: The axis of rotation in the joint parent anchor frame, which is
                 the parent body's local frame transformed by `parent_xform`. It can be a :class:`JointDofConfig` object
                 whose settings will be used instead of the other arguments.
             target_pos: The target position of the joint.
@@ -3441,7 +3704,7 @@ class ModelBuilder:
         effort_limit: float | None = None,
         velocity_limit: float | None = None,
         friction: float | None = None,
-        actuator_mode: ActuatorMode | None = None,
+        actuator_mode: JointTargetMode | None = None,
         label: str | None = None,
         collision_filter_parent: bool = True,
         enabled: bool = True,
@@ -3452,9 +3715,9 @@ class ModelBuilder:
         Args:
             parent: The index of the parent body.
             child: The index of the child body.
-            parent_xform (Transform): The transform from the parent body frame to the joint parent anchor frame.
-            child_xform (Transform): The transform from the child body frame to the joint child anchor frame.
-            axis (AxisType | Vec3 | JointDofConfig): The axis of translation in the joint parent anchor frame, which is
+            parent_xform: The transform from the parent body frame to the joint parent anchor frame.
+            child_xform: The transform from the child body frame to the joint child anchor frame.
+            axis: The axis of translation in the joint parent anchor frame, which is
                 the parent body's local frame transformed by `parent_xform`. It can be a :class:`JointDofConfig` object
                 whose settings will be used instead of the other arguments.
             target_pos: The target position of the joint.
@@ -3525,15 +3788,15 @@ class ModelBuilder:
         collision_filter_parent: bool = True,
         enabled: bool = True,
         custom_attributes: dict[str, Any] | None = None,
-        actuator_mode: ActuatorMode | None = None,
+        actuator_mode: JointTargetMode | None = None,
     ) -> int:
         """Adds a ball (spherical) joint to the model. Its position is defined by a 4D quaternion (xyzw) and its velocity is a 3D vector.
 
         Args:
             parent: The index of the parent body.
             child: The index of the child body.
-            parent_xform (Transform): The transform from the parent body frame to the joint parent anchor frame.
-            child_xform (Transform): The transform from the child body frame to the joint child anchor frame.
+            parent_xform: The transform from the parent body frame to the joint parent anchor frame.
+            child_xform: The transform from the child body frame to the joint child anchor frame.
             armature: Artificial inertia added around the joint axes. If None, the default value from :attr:`default_joint_armature` is used.
             friction: Friction coefficient for the joint axes. If None, the default value from :attr:`default_joint_cfg.friction` is used.
             label: The label of the joint.
@@ -3603,8 +3866,8 @@ class ModelBuilder:
         Args:
             parent: The index of the parent body.
             child: The index of the child body.
-            parent_xform (Transform): The transform of the joint in the parent body's local frame.
-            child_xform (Transform): The transform of the joint in the child body's local frame.
+            parent_xform: The transform of the joint in the parent body's local frame.
+            child_xform: The transform of the joint in the child body's local frame.
             label: The label of the joint.
             collision_filter_parent: Whether to filter collisions between shapes of the parent and child bodies.
             enabled: Whether the joint is enabled.
@@ -3649,8 +3912,8 @@ class ModelBuilder:
 
         Args:
             child: The index of the child body.
-            parent_xform (Transform): The transform of the joint in the parent body's local frame.
-            child_xform (Transform): The transform of the joint in the child body's local frame.
+            parent_xform: The transform of the joint in the parent body's local frame.
+            child_xform: The transform of the joint in the child body's local frame.
             parent: The index of the parent body (-1 by default to use the world frame, e.g. to make the child body and its children a floating-base mechanism).
             label: The label of the joint.
             collision_filter_parent: Whether to filter collisions between shapes of the parent and child bodies.
@@ -3706,8 +3969,8 @@ class ModelBuilder:
         Args:
             parent: The index of the parent body.
             child: The index of the child body.
-            parent_xform (Transform): The transform of the joint in the parent body's local frame.
-            child_xform (Transform): The transform of the joint in the child body's local frame.
+            parent_xform: The transform of the joint in the parent body's local frame.
+            child_xform: The transform of the joint in the child body's local frame.
             min_distance: The minimum distance between the bodies (no limit if negative).
             max_distance: The maximum distance between the bodies (no limit if negative).
             collision_filter_parent: Whether to filter collisions between shapes of the parent and child bodies.
@@ -3769,8 +4032,8 @@ class ModelBuilder:
             linear_axes: A list of linear axes.
             angular_axes: A list of angular axes.
             label: The label of the joint.
-            parent_xform (Transform): The transform from the parent body frame to the joint parent anchor frame.
-            child_xform (Transform): The transform from the child body frame to the joint child anchor frame.
+            parent_xform: The transform from the parent body frame to the joint parent anchor frame.
+            child_xform: The transform from the child body frame to the joint child anchor frame.
             armature: Artificial inertia added around the joint axes. If None, the default value from :attr:`default_joint_armature` is used.
             collision_filter_parent: Whether to filter collisions between shapes of the parent and child bodies.
             enabled: Whether the joint is enabled.
@@ -3830,9 +4093,9 @@ class ModelBuilder:
         Args:
             parent: The index of the parent body.
             child: The index of the child body.
-            parent_xform (Transform): The transform from the parent body frame to the joint parent anchor frame; its
+            parent_xform: The transform from the parent body frame to the joint parent anchor frame; its
                 translation is the attachment point.
-            child_xform (Transform): The transform from the child body frame to the joint child anchor frame; its
+            child_xform: The transform from the child body frame to the joint child anchor frame; its
                 translation is the attachment point.
             stretch_stiffness: Cable stretch stiffness (stored as ``target_ke``) [N/m]. If None, defaults to 1.0e9.
             stretch_damping: Cable stretch damping (stored as ``target_kd``). In :class:`newton.solvers.SolverVBD`
@@ -3880,7 +4143,7 @@ class ModelBuilder:
 
     def add_equality_constraint(
         self,
-        constraint_type: Any,
+        constraint_type: EqType,
         body1: int = -1,
         body2: int = -1,
         anchor: Vec3 | None = None,
@@ -3896,33 +4159,48 @@ class ModelBuilder:
         """Generic method to add any type of equality constraint to this ModelBuilder.
 
         Args:
-            constraint_type (constant): Type of constraint ('connect', 'weld', 'joint')
-            body1 (int): Index of the first body participating in the constraint (-1 for world)
-            body2 (int): Index of the second body participating in the constraint (-1 for world)
-            anchor (Vec3): Anchor point on body1
-            torquescale (float): Scales the angular residual for weld
-            relpose (Transform): Relative pose of body2 for weld. If None, the identity transform is used.
-            joint1 (int): Index of the first joint for joint coupling
-            joint2 (int): Index of the second joint for joint coupling
-            polycoef (list[float]): Polynomial coefficients for joint coupling
-            label (str): Optional constraint label
-            enabled (bool): Whether constraint is active
-            custom_attributes (dict): Custom attributes to set on the constraint
+            constraint_type: Equality constraint type. Use ``EqType.CONNECT`` to
+                pin a point to another body or the world, ``EqType.WELD`` to
+                constrain relative pose, or ``EqType.JOINT`` to couple two joints.
+            body1: Index of the first body participating in the constraint (-1 for world)
+            body2: Index of the second body participating in the constraint (-1 for world)
+            anchor: Anchor point on body1
+            torquescale: Scales the angular residual for weld
+            relpose: Relative pose of body2 for weld. If None, the identity transform is used.
+            joint1: Index of the first joint for joint coupling
+            joint2: Index of the second joint for joint coupling
+            polycoef: Five polynomial coefficients for ``EqType.JOINT`` coupling
+            label: Optional constraint label
+            enabled: Whether constraint is active
+            custom_attributes: Custom attributes to set on the constraint
 
         Returns:
             Constraint index
         """
 
+        if anchor is None:
+            anchor_vec = wp.vec3()
+        else:
+            anchor_vec = axis_to_vec3(anchor)
+        if relpose is None:
+            relpose_tf = wp.transform_identity()
+        else:
+            relpose_tf = wp.transform(*relpose)
+        if torquescale is None:
+            torquescale_value = 1.0 if constraint_type == EqType.WELD else 0.0
+        else:
+            torquescale_value = float(torquescale)
+
         self.equality_constraint_type.append(constraint_type)
         self.equality_constraint_body1.append(body1)
         self.equality_constraint_body2.append(body2)
-        self.equality_constraint_anchor.append(anchor or wp.vec3())
-        self.equality_constraint_torquescale.append(torquescale)
-        self.equality_constraint_relpose.append(relpose or wp.transform_identity())
+        self.equality_constraint_anchor.append(anchor_vec)
+        self.equality_constraint_torquescale.append(torquescale_value)
+        self.equality_constraint_relpose.append(relpose_tf)
         self.equality_constraint_joint1.append(joint1)
         self.equality_constraint_joint2.append(joint2)
         self.equality_constraint_polycoef.append(polycoef or [0.0, 0.0, 0.0, 0.0, 0.0])
-        self.equality_constraint_label.append(label)
+        self.equality_constraint_label.append(label or "")
         self.equality_constraint_enabled.append(enabled)
         self.equality_constraint_world.append(self.current_world)
 
@@ -4025,7 +4303,7 @@ class ModelBuilder:
             body2: Index of the second body participating in the constraint (-1 for world)
             anchor: Coordinates of the weld point relative to body2
             torquescale: Scales the angular residual for weld
-            relpose (Transform): Relative pose of body2 relative to body1. If None, the identity transform is used
+            relpose: Relative pose of body2 relative to body1. If None, the identity transform is used
             label: Optional constraint label
             enabled: Whether constraint is active
             custom_attributes: Custom attributes to set on the constraint
@@ -4092,7 +4370,7 @@ class ModelBuilder:
         self.constraint_mimic_coef0.append(coef0)
         self.constraint_mimic_coef1.append(coef1)
         self.constraint_mimic_enabled.append(enabled)
-        self.constraint_mimic_label.append(label)
+        self.constraint_mimic_label.append(label or "")
         self.constraint_mimic_world.append(self.current_world)
 
         constraint_idx = len(self.constraint_mimic_joint0) - 1
@@ -4111,27 +4389,27 @@ class ModelBuilder:
 
     def plot_articulation(
         self,
-        show_body_labels=True,
-        show_joint_labels=True,
-        show_joint_types=True,
-        plot_shapes=True,
-        show_shape_labels=True,
-        show_shape_types=True,
-        show_legend=True,
-    ):
+        show_body_labels: bool = True,
+        show_joint_labels: bool = True,
+        show_joint_types: bool = True,
+        plot_shapes: bool = True,
+        show_shape_labels: bool = True,
+        show_shape_types: bool = True,
+        show_legend: bool = True,
+    ) -> None:
         """
         Visualizes the model's articulation graph using matplotlib and networkx.
         Uses the spring layout algorithm from networkx to arrange the nodes.
         Bodies are shown as orange squares, shapes are shown as blue circles.
 
         Args:
-            show_body_labels (bool): Whether to show the body labels or indices
-            show_joint_labels (bool): Whether to show the joint labels or indices
-            show_joint_types (bool): Whether to show the joint types
-            plot_shapes (bool): Whether to render the shapes connected to the rigid bodies
-            show_shape_labels (bool): Whether to show the shape labels or indices
-            show_shape_types (bool): Whether to show the shape geometry types
-            show_legend (bool): Whether to show a legend
+            show_body_labels: Whether to show the body labels or indices
+            show_joint_labels: Whether to show the joint labels or indices
+            show_joint_types: Whether to show the joint types
+            plot_shapes: Whether to render the shapes connected to the rigid bodies
+            show_shape_labels: Whether to show the shape labels or indices
+            show_shape_types: Whether to show the shape geometry types
+            show_legend: Whether to show a legend
         """
         import matplotlib.pyplot as plt
         import networkx as nx
@@ -4247,8 +4525,15 @@ class ModelBuilder:
             plt.legend(loc="upper left", fontsize=6)
         plt.show()
 
-    def collapse_fixed_joints(self, verbose=wp.config.verbose):
-        """Removes fixed joints from the model and merges the bodies they connect. This is useful for simplifying the model for faster and more stable simulation."""
+    def collapse_fixed_joints(
+        self, verbose: bool = wp.config.verbose, joints_to_keep: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Removes fixed joints from the model and merges the bodies they connect. This is useful for simplifying the model for faster and more stable simulation.
+
+        Args:
+            verbose: If True, print additional information about the collapsed joints. Defaults to the value of `wp.config.verbose`.
+            joints_to_keep: An optional list of joint labels to be excluded from the collapse process.
+        """
 
         body_data = {}
         body_children = {-1: []}
@@ -4265,8 +4550,9 @@ class ModelBuilder:
                 "inertia": inertia_i,
                 "inv_mass": self.body_inv_mass[i],
                 "inv_inertia": self.body_inv_inertia[i],
-                "com": wp.vec3(*self.body_com[i]),
+                "com": axis_to_vec3(self.body_com[i]),
                 "lock_inertia": self.body_lock_inertia[i],
+                "flags": self.body_flags[i],
                 "label": body_lbl,
                 "original_id": i,
             }
@@ -4316,7 +4602,7 @@ class ModelBuilder:
                 data["axes"].append(
                     {
                         "axis": self.joint_axis[j],
-                        "actuator_mode": self.joint_act_mode[j],
+                        "actuator_mode": self.joint_target_mode[j],
                         "target_ke": self.joint_target_ke[j],
                         "target_kd": self.joint_target_kd[j],
                         "limit_ke": self.joint_limit_ke[j],
@@ -4357,11 +4643,17 @@ class ModelBuilder:
             nonlocal retained_joints
             nonlocal retained_bodies
             nonlocal body_data
+            nonlocal joints_to_keep
 
             joint = joint_data[(parent_body, child_body)]
             # Don't merge fixed joints if the child body is referenced in an equality constraint
             # and would be merged into world (last_dynamic_body == -1)
             should_skip_merge = child_body in bodies_in_constraints and last_dynamic_body == -1
+
+            # Don't merge fixed joints listed in joints_to_keep list
+            if joints_to_keep is None:
+                joints_to_keep = []
+            joint_in_keep_list = joint["label"] in joints_to_keep
 
             if should_skip_merge and joint["type"] == JointType.FIXED:
                 # Skip merging this fixed joint because the body is referenced in an equality constraint
@@ -4373,7 +4665,25 @@ class ModelBuilder:
                         f"{child_lbl} is referenced in an equality constraint and cannot be merged into world"
                     )
 
-            if joint["type"] == JointType.FIXED and not should_skip_merge:
+            if joint_in_keep_list and joint["type"] == JointType.FIXED:
+                # Skip merging this joint if it is listed in the joints_to_keep list
+                parent_lbl = self.body_label[parent_body] if parent_body > -1 else "world"
+                child_lbl = self.body_label[child_body]
+                if verbose:
+                    print(
+                        f"Skipping collapse of joint {joint['label']} between {parent_lbl} and {child_lbl}: "
+                        f"{child_lbl} is listed in joints_to_keep and this fixed joint will be preserved"
+                    )
+                # Warn if the child_body of skipped joint has zero or negative mass
+                if body_data[child_body]["mass"] <= 0:
+                    warnings.warn(
+                        f"Skipped joint {joint['label']} has a child {child_lbl} with zero or negative mass ({body_data[child_body]['mass']}). "
+                        f"This may cause unexpected behavior.",
+                        UserWarning,
+                        stacklevel=3,
+                    )
+
+            if joint["type"] == JointType.FIXED and not should_skip_merge and not joint_in_keep_list:
                 joint_xform = joint["parent_xform"] * wp.transform_inverse(joint["child_xform"])
                 incoming_xform = incoming_xform * joint_xform
                 parent_lbl = self.body_label[parent_body] if parent_body > -1 else "world"
@@ -4393,7 +4703,8 @@ class ModelBuilder:
                 body_merged_parent[child_body] = last_dynamic_body
                 body_merged_transform[child_body] = incoming_xform
                 for shape in self.body_shapes[child_id]:
-                    self.shape_transform[shape] = incoming_xform * self.shape_transform[shape]
+                    shape_tf = self.shape_transform[shape]
+                    self.shape_transform[shape] = incoming_xform * shape_tf
                     if verbose:
                         print(
                             f"  Shape {shape} moved to body {last_dynamic_body_label} with transform {self.shape_transform[shape]}"
@@ -4438,6 +4749,19 @@ class ModelBuilder:
             for child in body_children[child_body]:
                 if not visited[child]:
                     dfs(child_body, child, incoming_xform, last_dynamic_body)
+                elif (child_body, child) in joint_data:
+                    # Loop-closing joint: child was already visited via another path.
+                    # Retain the joint but don't re-process the child body.
+                    loop_joint = joint_data[(child_body, child)]
+                    if loop_joint["type"] != JointType.FIXED:
+                        loop_joint["parent_xform"] = incoming_xform * loop_joint["parent_xform"]
+                        loop_joint["parent"] = last_dynamic_body
+                        if child in body_merged_parent:
+                            # Child was merged into another body — remap child and adjust child_xform
+                            merge_xform = body_merged_transform[child]
+                            loop_joint["child_xform"] = merge_xform * loop_joint["child_xform"]
+                            loop_joint["child"] = body_merged_parent[child]
+                        retained_joints.append(loop_joint)
 
         for body in body_children[-1]:
             if not visited[body]:
@@ -4477,6 +4801,7 @@ class ModelBuilder:
         self.body_inertia.clear()
         self.body_com.clear()
         self.body_lock_inertia.clear()
+        self.body_flags.clear()
         self.body_inv_mass.clear()
         self.body_inv_inertia.clear()
         self.body_world.clear()  # Clear body groups
@@ -4497,6 +4822,7 @@ class ModelBuilder:
             self.body_inertia.append(inertia)
             self.body_com.append(body["com"])
             self.body_lock_inertia.append(body["lock_inertia"])
+            self.body_flags.append(body["flags"])
             if body["inv_mass"] is None:
                 # recompute inverse mass and inertia
                 if m > 0.0:
@@ -4552,7 +4878,7 @@ class ModelBuilder:
         self.joint_X_p.clear()
         self.joint_X_c.clear()
         self.joint_axis.clear()
-        self.joint_act_mode.clear()
+        self.joint_target_mode.clear()
         self.joint_target_ke.clear()
         self.joint_target_kd.clear()
         self.joint_limit_lower.clear()
@@ -4594,7 +4920,7 @@ class ModelBuilder:
                 self.joint_articulation.append(-1)
             for axis in joint["axes"]:
                 self.joint_axis.append(axis["axis"])
-                self.joint_act_mode.append(axis["actuator_mode"])
+                self.joint_target_mode.append(axis["actuator_mode"])
                 self.joint_target_ke.append(axis["target_ke"])
                 self.joint_target_kd.append(axis["target_kd"])
                 self.joint_limit_lower.append(axis["limit_lower"])
@@ -4604,6 +4930,16 @@ class ModelBuilder:
                 self.joint_target_pos.append(axis["target_pos"])
                 self.joint_target_vel.append(axis["target_vel"])
                 self.joint_effort_limit.append(axis["effort_limit"])
+
+        # Update DOF and coordinate counts to match the rebuilt arrays
+        self.joint_dof_count = len(self.joint_qd)
+        self.joint_coord_count = len(self.joint_q)
+
+        # Trim per-DOF arrays that were not cleared/rebuilt above
+        for attr_name in ("joint_velocity_limit", "joint_friction"):
+            arr = getattr(self, attr_name)
+            if len(arr) > self.joint_dof_count:
+                setattr(self, attr_name, arr[: self.joint_dof_count])
 
         # Reset the constraint count based on the retained joints
         self.joint_constraint_count = len(self.joint_cts)
@@ -4633,18 +4969,18 @@ class ModelBuilder:
             if body1_was_merged:
                 merge_xform = body_merged_transform[old_body1]
                 if constraint_type == EqType.CONNECT:
-                    self.equality_constraint_anchor[i] = wp.transform_point(
-                        merge_xform, self.equality_constraint_anchor[i]
-                    )
+                    anchor = axis_to_vec3(self.equality_constraint_anchor[i])
+                    self.equality_constraint_anchor[i] = wp.transform_point(merge_xform, anchor)
                 if constraint_type == EqType.WELD:
-                    self.equality_constraint_relpose[i] = merge_xform * self.equality_constraint_relpose[i]
+                    relpose = self.equality_constraint_relpose[i]
+                    self.equality_constraint_relpose[i] = merge_xform * relpose
 
             if body2_was_merged and constraint_type == EqType.WELD:
                 merge_xform = body_merged_transform[old_body2]
-                self.equality_constraint_anchor[i] = wp.transform_point(merge_xform, self.equality_constraint_anchor[i])
-                self.equality_constraint_relpose[i] = self.equality_constraint_relpose[i] * wp.transform_inverse(
-                    merge_xform
-                )
+                anchor = axis_to_vec3(self.equality_constraint_anchor[i])
+                relpose = self.equality_constraint_relpose[i]
+                self.equality_constraint_anchor[i] = wp.transform_point(merge_xform, anchor)
+                self.equality_constraint_relpose[i] = relpose * wp.transform_inverse(merge_xform)
 
             old_joint1 = self.equality_constraint_joint1[i]
             old_joint2 = self.equality_constraint_joint2[i]
@@ -4759,18 +5095,18 @@ class ModelBuilder:
         This is the base method for adding shapes; prefer using specific helpers like :meth:`add_shape_sphere` where possible.
 
         Args:
-            body (int): The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body (e.g., static world geometry).
-            type (int): The geometry type of the shape (e.g., `GeoType.BOX`, `GeoType.SPHERE`).
-            xform (Transform | None): The transform of the shape in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
-            cfg (ShapeConfig | None): The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
-            scale (Vec3 | None): The scale of the geometry. The interpretation depends on the shape type. Defaults to `(1.0, 1.0, 1.0)` if `None`.
-            src (Mesh | Any | None): The source geometry data, e.g., a :class:`Mesh` object for `GeoType.MESH`. Defaults to `None`.
-            is_static (bool): If `True`, the shape will have zero mass, and its density property in `cfg` will be effectively ignored for mass calculation. Typically used for fixed, non-movable collision geometry. Defaults to `False`.
-            label (str | None): An optional unique label for identifying the shape. If `None`, a default label is automatically generated (e.g., "shape_N"). Defaults to `None`.
+            body: The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body (e.g., static world geometry).
+            type: The geometry type of the shape (e.g., `GeoType.BOX`, `GeoType.SPHERE`).
+            xform: The transform of the shape in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
+            cfg: The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
+            scale: The scale of the geometry. The interpretation depends on the shape type. Defaults to `(1.0, 1.0, 1.0)` if `None`.
+            src: The source geometry data, e.g., a :class:`Mesh` object for `GeoType.MESH`. Defaults to `None`.
+            is_static: If `True`, the shape will have zero mass, and its density property in `cfg` will be effectively ignored for mass calculation. Typically used for fixed, non-movable collision geometry. Defaults to `False`.
+            label: An optional unique label for identifying the shape. If `None`, a default label is automatically generated (e.g., "shape_N"). Defaults to `None`.
             custom_attributes: Dictionary of custom attribute names to values.
 
         Returns:
-            int: The index of the newly added shape.
+            The index of the newly added shape.
         """
         if xform is None:
             xform = wp.transform()
@@ -4876,9 +5212,9 @@ class ModelBuilder:
                     self.add_shape_collision_filter_pair(shape, child_shape)
 
         if not is_static and cfg.density > 0.0 and body >= 0 and not self.body_lock_inertia[body]:
-            (m, c, I) = compute_inertia_shape(type, scale, src, cfg.density, cfg.is_solid, cfg.margin)
+            (m, c, inertia) = compute_inertia_shape(type, scale, src, cfg.density, cfg.is_solid, cfg.margin)
             com_body = wp.transform_point(xform, c)
-            self._update_body_mass(body, m, I, com_body, xform.q)
+            self._update_body_mass(body, m, inertia, com_body, xform.q)
 
         # Process custom attributes
         if custom_attributes:
@@ -4910,24 +5246,26 @@ class ModelBuilder:
         Plane shapes added via this method are always static (massless).
 
         Args:
-            plane (Vec4 | None): The plane equation `(a, b, c, d)`. If `xform` is `None`, this defines the plane.
-                The normal is `(a,b,c)` and `d` is the offset. Defaults to `(0.0, 0.0, 1.0, 0.0)` (an XY ground plane at Z=0) if `xform` is also `None`.
-            xform (Transform | None): The transform of the plane in the world or parent body's frame. If `None`, transform is derived from `plane`. Defaults to `None`.
-            width (float): The visual/collision extent of the plane along its local X-axis. If `0.0`, considered infinite for collision. Defaults to `10.0`.
-            length (float): The visual/collision extent of the plane along its local Y-axis. If `0.0`, considered infinite for collision. Defaults to `10.0`.
-            body (int): The index of the parent body this shape belongs to. Use -1 for world-static planes. Defaults to `-1`.
-            cfg (ShapeConfig | None): The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
-            label (str | None): An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
+            plane: The plane equation `(a, b, c, d)`. If `xform` is `None`, this defines the plane.
+                The normal is `(a,b,c)`. If `(a,b,c)` is unit-length, `d` is the negative signed offset from the
+                origin along that normal, so `(0.0, 0.0, 1.0, -h)` defines the plane `z = h`. Defaults to
+                `(0.0, 0.0, 1.0, 0.0)` (an XY ground plane at Z=0) if `xform` is also `None`.
+            xform: The transform of the plane in the world or parent body's frame. If `None`, transform is derived from `plane`. Defaults to `None`.
+            width: The visual/collision extent of the plane along its local X-axis. If `0.0`, considered infinite for collision. Defaults to `10.0`.
+            length: The visual/collision extent of the plane along its local Y-axis. If `0.0`, considered infinite for collision. Defaults to `10.0`.
+            body: The index of the parent body this shape belongs to. Use -1 for world-static planes. Defaults to `-1`.
+            cfg: The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
+            label: An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
             custom_attributes: Dictionary of custom attribute values for SHAPE frequency attributes.
 
         Returns:
-            int: The index of the newly added shape.
+            The index of the newly added shape.
         """
         if xform is None:
             assert plane is not None, "Either xform or plane must be provided"
             # compute position and rotation from plane equation
-            # For plane equation ax + by + cz + d = 0, the closest point to origin is -(d/||n||) * (n/||n||)
-            # where n = (a, b, c). Both the normal and d need to be normalized.
+            # For plane equation ax + by + cz + d = 0, the closest point to the origin is
+            # -(d/||n||) * (n/||n||), so the signed offset along the normalized normal is -d/||n||.
             normal = np.array(plane[:3])
             norm = np.linalg.norm(normal)
             normal /= norm
@@ -4959,12 +5297,12 @@ class ModelBuilder:
         """Adds a ground plane collision shape to the model.
 
         Args:
-            height (float): The vertical offset of the ground plane along the up-vector axis. Positive values raise the plane, negative values lower it. Defaults to `0.0`.
-            cfg (ShapeConfig | None): The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
-            label (str | None): An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
+            height: The vertical offset of the ground plane along the up-vector axis. Positive values raise the plane, negative values lower it. Defaults to `0.0`.
+            cfg: The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
+            label: An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
 
         Returns:
-            int: The index of the newly added shape.
+            The index of the newly added shape.
         """
         return self.add_shape_plane(
             plane=(*self.up_vector, -height),
@@ -4987,16 +5325,16 @@ class ModelBuilder:
         """Adds a sphere collision shape or site to a body.
 
         Args:
-            body (int): The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
-            xform (Transform | None): The transform of the sphere in the parent body's local frame. The sphere is centered at this transform's position. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
-            radius (float): The radius of the sphere. Defaults to `1.0`.
-            cfg (ShapeConfig | None): The configuration for the shape's properties. If `None`, uses :attr:`default_shape_cfg` (or :attr:`default_site_cfg` when `as_site=True`). If `as_site=True` and `cfg` is provided, a copy is made and site invariants are enforced via `mark_as_site()`. Defaults to `None`.
-            as_site (bool): If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
-            label (str | None): An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
+            body: The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
+            xform: The transform of the sphere in the parent body's local frame. The sphere is centered at this transform's position. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
+            radius: The radius of the sphere. Defaults to `1.0`.
+            cfg: The configuration for the shape's properties. If `None`, uses :attr:`default_shape_cfg` (or :attr:`default_site_cfg` when `as_site=True`). If `as_site=True` and `cfg` is provided, a copy is made and site invariants are enforced via `mark_as_site()`. Defaults to `None`.
+            as_site: If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
+            label: An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
             custom_attributes: Dictionary of custom attribute names to values.
 
         Returns:
-            int: The index of the newly added shape or site.
+            The index of the newly added shape or site.
         """
         if cfg is None:
             cfg = self.default_site_cfg if as_site else self.default_shape_cfg
@@ -5004,7 +5342,7 @@ class ModelBuilder:
             cfg = cfg.copy()
             cfg.mark_as_site()
 
-        scale: Any = wp.vec3(radius, 0.0, 0.0)
+        scale: Vec3 = wp.vec3(radius, 0.0, 0.0)
         return self.add_shape(
             body=body,
             type=GeoType.SPHERE,
@@ -5037,18 +5375,18 @@ class ModelBuilder:
             which provides accurate collision detection for all convex shape pairs.
 
         Args:
-            body (int): The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
-            xform (Transform | None): The transform of the ellipsoid in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
-            a (float): The semi-axis of the ellipsoid along its local X-axis. Defaults to `1.0`.
-            b (float): The semi-axis of the ellipsoid along its local Y-axis. Defaults to `0.75`.
-            c (float): The semi-axis of the ellipsoid along its local Z-axis. Defaults to `0.5`.
-            cfg (ShapeConfig | None): The configuration for the shape's properties. If `None`, uses :attr:`default_shape_cfg` (or :attr:`default_site_cfg` when `as_site=True`). If `as_site=True` and `cfg` is provided, a copy is made and site invariants are enforced via `mark_as_site()`. Defaults to `None`.
-            as_site (bool): If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
-            label (str | None): An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
+            body: The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
+            xform: The transform of the ellipsoid in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
+            a: The semi-axis of the ellipsoid along its local X-axis. Defaults to `1.0`.
+            b: The semi-axis of the ellipsoid along its local Y-axis. Defaults to `0.75`.
+            c: The semi-axis of the ellipsoid along its local Z-axis. Defaults to `0.5`.
+            cfg: The configuration for the shape's properties. If `None`, uses :attr:`default_shape_cfg` (or :attr:`default_site_cfg` when `as_site=True`). If `as_site=True` and `cfg` is provided, a copy is made and site invariants are enforced via `mark_as_site()`. Defaults to `None`.
+            as_site: If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
+            label: An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
             custom_attributes: Dictionary of custom attribute names to values.
 
         Returns:
-            int: The index of the newly added shape or site.
+            The index of the newly added shape or site.
 
         Example:
             Create an ellipsoid with different semi-axes:
@@ -5103,18 +5441,18 @@ class ModelBuilder:
         The box is centered at its local origin as defined by `xform`.
 
         Args:
-            body (int): The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
-            xform (Transform | None): The transform of the box in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
-            hx (float): The half-extent of the box along its local X-axis. Defaults to `0.5`.
-            hy (float): The half-extent of the box along its local Y-axis. Defaults to `0.5`.
-            hz (float): The half-extent of the box along its local Z-axis. Defaults to `0.5`.
-            cfg (ShapeConfig | None): The configuration for the shape's properties. If `None`, uses :attr:`default_shape_cfg` (or :attr:`default_site_cfg` when `as_site=True`). If `as_site=True` and `cfg` is provided, a copy is made and site invariants are enforced via `mark_as_site()`. Defaults to `None`.
-            as_site (bool): If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
-            label (str | None): An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
+            body: The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
+            xform: The transform of the box in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
+            hx: The half-extent of the box along its local X-axis. Defaults to `0.5`.
+            hy: The half-extent of the box along its local Y-axis. Defaults to `0.5`.
+            hz: The half-extent of the box along its local Z-axis. Defaults to `0.5`.
+            cfg: The configuration for the shape's properties. If `None`, uses :attr:`default_shape_cfg` (or :attr:`default_site_cfg` when `as_site=True`). If `as_site=True` and `cfg` is provided, a copy is made and site invariants are enforced via `mark_as_site()`. Defaults to `None`.
+            as_site: If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
+            label: An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
             custom_attributes: Dictionary of custom attribute names to values.
 
         Returns:
-            int: The index of the newly added shape or site.
+            The index of the newly added shape or site.
         """
         if cfg is None:
             cfg = self.default_site_cfg if as_site else self.default_shape_cfg
@@ -5149,17 +5487,17 @@ class ModelBuilder:
         The capsule is centered at its local origin as defined by `xform`. Its length extends along the Z-axis.
 
         Args:
-            body (int): The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
-            xform (Transform | None): The transform of the capsule in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
-            radius (float): The radius of the capsule's hemispherical ends and its cylindrical segment. Defaults to `1.0`.
-            half_height (float): The half-length of the capsule's central cylindrical segment (excluding the hemispherical ends). Defaults to `0.5`.
-            cfg (ShapeConfig | None): The configuration for the shape's properties. If `None`, uses :attr:`default_shape_cfg` (or :attr:`default_site_cfg` when `as_site=True`). If `as_site=True` and `cfg` is provided, a copy is made and site invariants are enforced via `mark_as_site()`. Defaults to `None`.
-            as_site (bool): If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
-            label (str | None): An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
+            body: The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
+            xform: The transform of the capsule in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
+            radius: The radius of the capsule's hemispherical ends and its cylindrical segment. Defaults to `1.0`.
+            half_height: The half-length of the capsule's central cylindrical segment (excluding the hemispherical ends). Defaults to `0.5`.
+            cfg: The configuration for the shape's properties. If `None`, uses :attr:`default_shape_cfg` (or :attr:`default_site_cfg` when `as_site=True`). If `as_site=True` and `cfg` is provided, a copy is made and site invariants are enforced via `mark_as_site()`. Defaults to `None`.
+            as_site: If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
+            label: An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
             custom_attributes: Dictionary of custom attribute names to values.
 
         Returns:
-            int: The index of the newly added shape or site.
+            The index of the newly added shape or site.
         """
         if cfg is None:
             cfg = self.default_site_cfg if as_site else self.default_shape_cfg
@@ -5199,17 +5537,17 @@ class ModelBuilder:
         The cylinder is centered at its local origin as defined by `xform`. Its length extends along the Z-axis.
 
         Args:
-            body (int): The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
-            xform (Transform | None): The transform of the cylinder in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
-            radius (float): The radius of the cylinder. Defaults to `1.0`.
-            half_height (float): The half-length of the cylinder along the Z-axis. Defaults to `0.5`.
-            cfg (ShapeConfig | None): The configuration for the shape's properties. If `None`, uses :attr:`default_shape_cfg` (or :attr:`default_site_cfg` when `as_site=True`). If `as_site=True` and `cfg` is provided, a copy is made and site invariants are enforced via `mark_as_site()`. Defaults to `None`.
-            as_site (bool): If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
-            label (str | None): An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
+            body: The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
+            xform: The transform of the cylinder in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
+            radius: The radius of the cylinder. Defaults to `1.0`.
+            half_height: The half-length of the cylinder along the Z-axis. Defaults to `0.5`.
+            cfg: The configuration for the shape's properties. If `None`, uses :attr:`default_shape_cfg` (or :attr:`default_site_cfg` when `as_site=True`). If `as_site=True` and `cfg` is provided, a copy is made and site invariants are enforced via `mark_as_site()`. Defaults to `None`.
+            as_site: If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
+            label: An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
             custom_attributes: Dictionary of custom attribute values for SHAPE frequency attributes.
 
         Returns:
-            int: The index of the newly added shape or site.
+            The index of the newly added shape or site.
         """
         if cfg is None:
             cfg = self.default_site_cfg if as_site else self.default_shape_cfg
@@ -5250,17 +5588,17 @@ class ModelBuilder:
         The center of mass is located at -half_height/2 from the origin (1/4 of the total height from the base toward the apex).
 
         Args:
-            body (int): The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
-            xform (Transform | None): The transform of the cone in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
-            radius (float): The radius of the cone's base. Defaults to `1.0`.
-            half_height (float): The half-height of the cone (distance from the geometric center to either the base or apex). The total height is 2*half_height. Defaults to `0.5`.
-            cfg (ShapeConfig | None): The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
-            as_site (bool): If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
-            label (str | None): An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
+            body: The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
+            xform: The transform of the cone in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
+            radius: The radius of the cone's base. Defaults to `1.0`.
+            half_height: The half-height of the cone (distance from the geometric center to either the base or apex). The total height is 2*half_height. Defaults to `0.5`.
+            cfg: The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
+            as_site: If `True`, creates a site (non-colliding reference point) instead of a collision shape. Defaults to `False`.
+            label: An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
             custom_attributes: Dictionary of custom attribute values for SHAPE frequency attributes.
 
         Returns:
-            int: The index of the newly added shape.
+            The index of the newly added shape.
         """
         if cfg is None:
             cfg = self.default_site_cfg if as_site else self.default_shape_cfg
@@ -5297,16 +5635,16 @@ class ModelBuilder:
         """Adds a triangle mesh collision shape to a body.
 
         Args:
-            body (int): The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
-            xform (Transform | None): The transform of the mesh in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
-            mesh (Mesh | None): The :class:`Mesh` object containing the vertex and triangle data. Defaults to `None`.
-            scale (Vec3 | None): The scale of the mesh. Defaults to `None`, in which case the scale is `(1.0, 1.0, 1.0)`.
-            cfg (ShapeConfig | None): The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
-            label (str | None): An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
+            body: The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
+            xform: The transform of the mesh in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
+            mesh: The :class:`Mesh` object containing the vertex and triangle data. Defaults to `None`.
+            scale: The scale of the mesh. Defaults to `None`, in which case the scale is `(1.0, 1.0, 1.0)`.
+            cfg: The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
+            label: An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
             custom_attributes: Dictionary of custom attribute values for SHAPE frequency attributes.
 
         Returns:
-            int: The index of the newly added shape.
+            The index of the newly added shape.
         """
 
         if cfg is None:
@@ -5334,15 +5672,15 @@ class ModelBuilder:
         """Adds a convex hull collision shape to a body.
 
         Args:
-            body (int): The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
-            xform (Transform | None): The transform of the convex hull in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
-            mesh (Mesh | None): The :class:`Mesh` object containing the vertex data for the convex hull. Defaults to `None`.
-            scale (Vec3 | None): The scale of the convex hull. Defaults to `None`, in which case the scale is `(1.0, 1.0, 1.0)`.
-            cfg (ShapeConfig | None): The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
-            label (str | None): An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
+            body: The index of the parent body this shape belongs to. Use -1 for shapes not attached to any specific body.
+            xform: The transform of the convex hull in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
+            mesh: The :class:`Mesh` object containing the vertex data for the convex hull. Defaults to `None`.
+            scale: The scale of the convex hull. Defaults to `None`, in which case the scale is `(1.0, 1.0, 1.0)`.
+            cfg: The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
+            label: An optional unique label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
 
         Returns:
-            int: The index of the newly added shape.
+            The index of the newly added shape.
         """
 
         if cfg is None:
@@ -5360,7 +5698,7 @@ class ModelBuilder:
     def add_shape_heightfield(
         self,
         xform: Transform | None = None,
-        heightfield: Any | None = None,  # Heightfield type, using Any to avoid circular import
+        heightfield: Heightfield | None = None,
         scale: Vec3 | None = None,
         cfg: ShapeConfig | None = None,
         label: str | None = None,
@@ -5373,15 +5711,15 @@ class ModelBuilder:
         equivalent triangle meshes.
 
         Args:
-            xform (Transform | None): The transform of the heightfield in world frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
+            xform: The transform of the heightfield in world frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
             heightfield: The :class:`Heightfield` object containing the elevation grid data. Defaults to `None`.
-            scale (Vec3 | None): The scale of the heightfield. Defaults to `None`, in which case the scale is `(1.0, 1.0, 1.0)`.
-            cfg (ShapeConfig | None): The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
-            label (str | None): An optional label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
+            scale: The scale of the heightfield. Defaults to `None`, in which case the scale is `(1.0, 1.0, 1.0)`.
+            cfg: The configuration for the shape's physical and collision properties. If `None`, :attr:`default_shape_cfg` is used. Defaults to `None`.
+            label: An optional label for identifying the shape. If `None`, a default label is automatically generated. Defaults to `None`.
             custom_attributes: Dictionary of custom attribute values for SHAPE frequency attributes.
 
         Returns:
-            int: The index of the newly added shape.
+            The index of the newly added shape.
         """
         if heightfield is None:
             raise ValueError("add_shape_heightfield() requires a Heightfield instance.")
@@ -5395,6 +5733,87 @@ class ModelBuilder:
             cfg=cfg,
             scale=scale,
             src=heightfield,
+            is_static=True,
+            label=label,
+            custom_attributes=custom_attributes,
+        )
+
+    def add_shape_gaussian(
+        self,
+        body: int,
+        gaussian: Gaussian,
+        xform: Transform | None = None,
+        scale: Vec3 | None = None,
+        cfg: ShapeConfig | None = None,
+        collision_proxy: str | Mesh | None = None,
+        label: str | None = None,
+        custom_attributes: dict[str, Any] | None = None,
+    ) -> int:
+        """Adds a Gaussian splat shape to a body.
+
+        The Gaussian is attached as a ``GeoType.GAUSSIAN`` shape for rendering.
+        Collision is handled separately via *collision_proxy*.
+
+        Args:
+            body: The index of the parent body this shape belongs to.
+                Use ``-1`` for static world geometry.
+            gaussian: The :class:`Gaussian` splat asset.
+            xform: Transform in parent body's local frame. Defaults to identity.
+            scale: 3D scale applied to Gaussian positions. Defaults to ``(1, 1, 1)``.
+            cfg: Shape configuration. If ``None``, uses :attr:`default_shape_cfg`
+                with ``has_shape_collision=False`` (Gaussians are render-only by
+                default).
+            collision_proxy: Collision strategy. Options:
+
+                - ``None``: no collision (render-only).
+                - ``"convex_hull"``: auto-generate convex hull from Gaussian positions.
+                - A :class:`Mesh` instance: use the provided mesh as collision proxy.
+            label: Optional unique label for identifying the shape.
+            custom_attributes: Dictionary of custom attribute values for SHAPE
+                frequency attributes.
+
+        Returns:
+            The index of the Gaussian shape.
+        """
+        if cfg is None:
+            cfg = self.default_shape_cfg.copy()
+        else:
+            cfg = cfg.copy()
+
+        # Gaussian shape is render-only; collisions are represented by optional proxy geometry.
+        proxy_cfg_base = cfg.copy()
+        cfg.has_shape_collision = False
+        cfg.has_particle_collision = False
+        cfg.density = 0.0
+
+        # Optionally add a collision proxy alongside the Gaussian shape
+        if collision_proxy is not None:
+            if isinstance(collision_proxy, str):
+                proxy_mesh = gaussian.compute_proxy_mesh(method=collision_proxy)
+            elif isinstance(collision_proxy, Mesh):
+                proxy_mesh = collision_proxy
+            else:
+                raise TypeError(f"collision_proxy must be None, a string, or a Mesh, got {type(collision_proxy)}")
+
+            proxy_cfg = proxy_cfg_base.copy()
+            proxy_cfg.is_visible = False
+            proxy_cfg.has_shape_collision = True
+            self.add_shape_convex_hull(
+                body=body,
+                xform=xform,
+                mesh=proxy_mesh,
+                scale=scale,
+                cfg=proxy_cfg,
+                label=f"{label or 'gaussian'}_collision_proxy",
+            )
+
+        return self.add_shape(
+            body=body,
+            type=GeoType.GAUSSIAN,
+            xform=xform,
+            cfg=cfg,
+            scale=scale,
+            src=gaussian,
             is_static=True,
             label=label,
             custom_attributes=custom_attributes,
@@ -5420,16 +5839,16 @@ class ModelBuilder:
         - Spatial tendon attachment points (when exported to MuJoCo)
 
         Args:
-            body (int): The index of the parent body this site belongs to. Use -1 for sites not attached to any specific body (for sites defined a at static world position).
-            xform (Transform | None): The transform of the site in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
-            type (int): The geometry type for visualization (e.g., `GeoType.SPHERE`, `GeoType.BOX`). Defaults to `GeoType.SPHERE`.
-            scale (Vec3): The scale/size of the site for visualization. Defaults to `(0.01, 0.01, 0.01)`.
-            label (str | None): An optional unique label for identifying the site. If `None`, a default label is automatically generated. Defaults to `None`.
-            visible (bool): If True, the site will be visible for debugging. If False (default), the site is hidden.
+            body: The index of the parent body this site belongs to. Use -1 for sites not attached to any specific body (for sites defined a at static world position).
+            xform: The transform of the site in the parent body's local frame. If `None`, the identity transform `wp.transform()` is used. Defaults to `None`.
+            type: The geometry type for visualization (e.g., `GeoType.SPHERE`, `GeoType.BOX`). Defaults to `GeoType.SPHERE`.
+            scale: The scale/size of the site for visualization. Defaults to `(0.01, 0.01, 0.01)`.
+            label: An optional unique label for identifying the site. If `None`, a default label is automatically generated. Defaults to `None`.
+            visible: If True, the site will be visible for debugging. If False (default), the site is hidden.
             custom_attributes: Dictionary of custom attribute names to values.
 
         Returns:
-            int: The index of the newly added site (which is stored as a shape internally).
+            The index of the newly added site (which is stored as a shape internally).
 
         Example:
             Add an IMU sensor site to a robot torso::
@@ -5481,7 +5900,7 @@ class ModelBuilder:
         +------------------------+-------------------------------------------------------------------------------+
         | ``"convex_hull"``      | Approximate the mesh with a convex hull (default)                             |
         +------------------------+-------------------------------------------------------------------------------+
-        | ``<remeshing_method>`` | Any remeshing method supported by :func:`newton.geometry.remesh_mesh`         |
+        | ``<remeshing_method>`` | Any remeshing method supported by :func:`newton.utils.remesh_mesh`            |
         +------------------------+-------------------------------------------------------------------------------+
 
         .. note::
@@ -5502,7 +5921,7 @@ class ModelBuilder:
             **remeshing_kwargs: Additional keyword arguments passed to the remeshing function.
 
         Returns:
-            set[int]: A set of indices of the shapes that were successfully remeshed.
+            Indices of the shapes that were successfully remeshed.
         """
         remeshing_methods = [*RemeshingMethod.__args__, "coacd", "vhacd", "bounding_sphere", "bounding_box"]
         if method not in remeshing_methods:
@@ -5679,7 +6098,7 @@ class ModelBuilder:
                 self.shape_type[shape] = GeoType.BOX
                 self.shape_source[shape] = None
                 self.shape_scale[shape] = scale
-                shape_tf = wp.transform(*self.shape_transform[shape])
+                shape_tf = self.shape_transform[shape]
                 self.shape_transform[shape] = shape_tf * tf
                 remeshed_shapes.add(shape)
         elif method == "bounding_sphere":
@@ -5688,16 +6107,33 @@ class ModelBuilder:
                     continue
                 mesh: Mesh = self.shape_source[shape]
                 scale = self.shape_scale[shape]
-                vertices = mesh.vertices * np.array([*scale])
-                center = np.mean(vertices, axis=0)
-                radius = np.max(np.linalg.norm(vertices - center, axis=1))
+                scale_array = np.asarray(scale, dtype=np.float32)
+                vertices = np.asarray(mesh.vertices, dtype=np.float32) * scale_array
+                center = np.mean(vertices, axis=0, dtype=np.float32)
+                radius = float(np.max(np.linalg.norm(vertices - center, axis=1).astype(np.float32, copy=False)))
                 self.shape_type[shape] = GeoType.SPHERE
                 self.shape_source[shape] = None
-                self.shape_scale[shape] = wp.vec3(radius, 0.0, 0.0)
+                self.shape_scale[shape] = (radius, 0.0, 0.0)
                 tf = wp.transform(center, wp.quat_identity())
-                shape_tf = wp.transform(*self.shape_transform[shape])
+                shape_tf = self.shape_transform[shape]
                 self.shape_transform[shape] = shape_tf * tf
                 remeshed_shapes.add(shape)
+
+        # Hide approximated primitives on bodies that have other visible shapes.
+        # Primitives (box, sphere) can't carry visual materials, so they should
+        # not be visible when the body already has dedicated visual geometry.
+        visible_count_per_body = Counter(
+            self.shape_body[i] for i in range(len(self.shape_body)) if self.shape_flags[i] & ShapeFlags.VISIBLE
+        )
+        for shape in remeshed_shapes:
+            if self.shape_type[shape] in (GeoType.MESH, GeoType.CONVEX_MESH):
+                continue
+            if not (self.shape_flags[shape] & ShapeFlags.VISIBLE):
+                continue
+            body = self.shape_body[shape]
+            if visible_count_per_body.get(body, 0) > 1:
+                self.shape_flags[shape] &= ~ShapeFlags.VISIBLE
+                visible_count_per_body[body] -= 1
 
         return remeshed_shapes
 
@@ -5751,15 +6187,15 @@ class ModelBuilder:
                 articulation. Defaults to True to ensure valid simulation models.
 
         Returns:
-            tuple[list[int], list[int]]: (body_indices, joint_indices). For an open chain,
+            A pair ``(body_indices, joint_indices)``. For an open chain,
             ``len(joint_indices) == num_segments - 1``; for a closed loop, ``len(joint_indices) == num_segments``.
 
         Articulations:
             By default (``wrap_in_articulation=True``), the created joints are wrapped into a single
-            articulation, which avoids orphan joints during :meth:`finalize`.
+            articulation, which avoids orphan joints during :meth:`finalize <ModelBuilder.finalize>`.
             If ``wrap_in_articulation=False``, this method will return the created joint indices but will
             not wrap them; callers must place them into one or more articulations (via :meth:`add_articulation`)
-            before calling :meth:`finalize`.
+            before calling :meth:`finalize <ModelBuilder.finalize>`.
 
         Raises:
             ValueError: If ``positions`` and ``quaternions`` lengths are incompatible.
@@ -5952,7 +6388,7 @@ class ModelBuilder:
                 tree (so not all incident body pairs are directly jointed).
 
         Returns:
-            tuple[list[int], list[int]]: (body_indices, joint_indices) where bodies correspond to
+            A pair ``(body_indices, joint_indices)`` where bodies correspond to
             edges in the same order as ``edges``.
         """
         if cfg is None:
@@ -6397,8 +6833,8 @@ class ModelBuilder:
         self.spring_control.append(control)
 
         # compute rest length
-        p = self.particle_q[i]
-        q = self.particle_q[j]
+        p = np.asarray(self.particle_q[i], dtype=np.float32)
+        q = np.asarray(self.particle_q[j], dtype=np.float32)
 
         delta = np.subtract(p, q)
         l = np.sqrt(np.dot(delta, delta))
@@ -7141,7 +7577,7 @@ class ModelBuilder:
             custom_attributes: Dictionary of custom attribute names to values for the particles.
 
         Returns:
-            None
+            Nothing. The builder is updated in place.
         """
 
         # local grid
@@ -7369,12 +7805,13 @@ class ModelBuilder:
         rot: Quat,
         scale: float,
         vel: Vec3,
-        vertices: list[Vec3],
-        indices: list[int],
-        density: float,
-        k_mu: float,
-        k_lambda: float,
-        k_damp: float,
+        mesh: TetMesh | None = None,
+        vertices: list[Vec3] | None = None,
+        indices: list[int] | None = None,
+        density: float | None = None,
+        k_mu: float | nparray | None = None,
+        k_lambda: float | nparray | None = None,
+        k_damp: float | nparray | None = None,
         tri_ke: float = 0.0,
         tri_ka: float = 0.0,
         tri_kd: float = 0.0,
@@ -7385,18 +7822,33 @@ class ModelBuilder:
         edge_kd: float = 0.0,
         particle_radius: float | None = None,
     ) -> None:
-        """Helper to create a tetrahedral model from an input tetrahedral mesh
+        """Helper to create a tetrahedral model from an input tetrahedral mesh.
+
+        Can be called with either a :class:`~newton.TetMesh` object or raw
+        ``vertices``/``indices`` arrays. When both are provided, explicit
+        parameters override the values from the TetMesh.
 
         Args:
-            pos: The position of the solid in world space
-            rot: The orientation of the solid in world space
-            vel: The velocity of the solid in world space
-            vertices: A list of vertex positions, array of 3D points
-            indices: A list of tetrahedron indices, 4 entries per-element, flattened array
-            density: The density per-area of the mesh
-            k_mu: The first elastic Lame parameter
-            k_lambda: The second elastic Lame parameter
-            k_damp: The damping stiffness
+            pos: The position of the solid in world space.
+            rot: The orientation of the solid in world space.
+            scale: Uniform scale applied to vertex positions.
+            vel: The velocity of the solid in world space.
+            mesh: A :class:`~newton.TetMesh` object. When provided, its
+                vertices, indices, material arrays, density, and pre-computed
+                surface triangles are used directly.
+            vertices: A list of vertex positions, array of 3D points.
+                Required if ``mesh`` is not provided.
+            indices: A list of tetrahedron indices, 4 entries per-element,
+                flattened array. Required if ``mesh`` is not provided.
+            density: The density [kg/m^3] of the mesh. Overrides ``mesh.density``
+                if both are provided.
+            k_mu: The first elastic Lame parameter [Pa]. Scalar or per-element
+                array. Overrides ``mesh.k_mu`` if both are provided.
+            k_lambda: The second elastic Lame parameter [Pa]. Scalar or
+                per-element array. Overrides ``mesh.k_lambda`` if both are
+                provided.
+            k_damp: The damping stiffness. Scalar or per-element array.
+                Overrides ``mesh.k_damp`` if both are provided.
             tri_ke: Stiffness for surface mesh triangles. Defaults to 0.0.
             tri_ka: Area stiffness for surface mesh triangles. Defaults to 0.0.
             tri_kd: Damping for surface mesh triangles. Defaults to 0.0.
@@ -7406,35 +7858,88 @@ class ModelBuilder:
                 generated surface mesh. These edges improve collision robustness for VBD solver. Defaults to True.
             edge_ke: Bending edge stiffness used when ``add_surface_mesh_edges`` is True. Defaults to 0.0.
             edge_kd: Bending edge damping used when ``add_surface_mesh_edges`` is True. Defaults to 0.0.
-            particle_radius: particle's contact radius (controls rigidbody-particle contact distance)
+            particle_radius: particle's contact radius (controls rigidbody-particle contact distance).
 
         Note:
+            **Parameter resolution order:** explicit argument > :class:`~newton.TetMesh`
+            attribute > builder default (:attr:`default_tet_density`,
+            :attr:`default_tet_k_mu`, :attr:`default_tet_k_lambda`,
+            :attr:`default_tet_k_damp`).
+
             The generated surface triangles and optional edges are for collision purposes.
             Their stiffness and damping values default to zero so they do not introduce additional
             elastic forces. Set the stiffness parameters above to non-zero values if you
             want the surface to behave like a thin skin.
         """
+        from ..geometry.types import TetMesh  # noqa: PLC0415
+
+        # Resolve parameters: explicit args > mesh attributes > error
+        if mesh is not None:
+            if not isinstance(mesh, TetMesh):
+                raise TypeError(f"mesh must be a TetMesh, got {type(mesh).__name__}")
+            if vertices is None:
+                vertices = mesh.vertices
+            if indices is None:
+                indices = mesh.tet_indices
+            if density is None:
+                density = mesh.density
+            if k_mu is None:
+                k_mu = mesh.k_mu
+            if k_lambda is None:
+                k_lambda = mesh.k_lambda
+            if k_damp is None:
+                k_damp = mesh.k_damp
+
+        if vertices is None or indices is None:
+            raise ValueError("Either 'mesh' or both 'vertices' and 'indices' must be provided.")
+        if density is None:
+            density = self.default_tet_density
+        if k_mu is None:
+            k_mu = self.default_tet_k_mu
+        if k_lambda is None:
+            k_lambda = self.default_tet_k_lambda
+        if k_damp is None:
+            k_damp = self.default_tet_k_damp
+
         num_tets = int(len(indices) / 4)
+        k_mu_arr = np.broadcast_to(np.asarray(k_mu, dtype=np.float32).flatten(), num_tets)
+        k_lambda_arr = np.broadcast_to(np.asarray(k_lambda, dtype=np.float32).flatten(), num_tets)
+        k_damp_arr = np.broadcast_to(np.asarray(k_damp, dtype=np.float32).flatten(), num_tets)
+
+        # Extract custom attributes grouped by frequency, validating against builder registry
+        particle_custom: dict[str, np.ndarray] = {}
+        tet_custom: dict[str, np.ndarray] = {}
+        tri_custom: dict[str, np.ndarray] = {}
+        if mesh is not None and mesh.custom_attributes:
+            for attr_name, (arr, freq) in mesh.custom_attributes.items():
+                registered = self.custom_attributes.get(attr_name)
+                if registered is None:
+                    raise ValueError(
+                        f"TetMesh custom attribute '{attr_name}' is not registered in ModelBuilder. "
+                        f"Register it first via add_custom_attribute()."
+                    )
+                if registered.frequency != freq:
+                    raise ValueError(
+                        f"Frequency mismatch for custom attribute '{attr_name}': TetMesh has "
+                        f"{Model.AttributeFrequency(freq).name} but ModelBuilder expects "
+                        f"{registered.frequency.name}."
+                    )
+                if freq == Model.AttributeFrequency.PARTICLE:
+                    particle_custom[attr_name] = arr
+                elif freq == Model.AttributeFrequency.TETRAHEDRON:
+                    tet_custom[attr_name] = arr
+                elif freq == Model.AttributeFrequency.TRIANGLE:
+                    tri_custom[attr_name] = arr
 
         start_vertex = len(self.particle_q)
 
-        # dict of open faces
-        faces = {}
-
-        def add_face(i, j, k):
-            key = tuple(sorted((i, j, k)))
-
-            if key not in faces:
-                faces[key] = (i, j, k)
-            else:
-                del faces[key]
-
         pos = wp.vec3(pos[0], pos[1], pos[2])
         # add particles
-        for v in vertices:
+        for vi, v in enumerate(vertices):
             p = wp.quat_rotate(rot, wp.vec3(v[0], v[1], v[2]) * scale) + pos
 
-            self.add_particle(p, vel, 0.0, particle_radius)
+            p_custom = {k: arr[vi] for k, arr in particle_custom.items()} if particle_custom else None
+            self.add_particle(p, vel, 0.0, particle_radius, custom_attributes=p_custom)
 
         # add tetrahedra
         for t in range(num_tets):
@@ -7443,7 +7948,17 @@ class ModelBuilder:
             v2 = start_vertex + indices[t * 4 + 2]
             v3 = start_vertex + indices[t * 4 + 3]
 
-            volume = self.add_tetrahedron(v0, v1, v2, v3, k_mu, k_lambda, k_damp)
+            t_custom = {k: arr[t] for k, arr in tet_custom.items()} if tet_custom else None
+            volume = self.add_tetrahedron(
+                v0,
+                v1,
+                v2,
+                v3,
+                float(k_mu_arr[t]),
+                float(k_lambda_arr[t]),
+                float(k_damp_arr[t]),
+                custom_attributes=t_custom,
+            )
 
             # distribute volume fraction to particles
             if volume > 0.0:
@@ -7452,16 +7967,29 @@ class ModelBuilder:
                 self.particle_mass[v2] += density * volume / 4.0
                 self.particle_mass[v3] += density * volume / 4.0
 
-                # build open faces
-                add_face(v0, v2, v1)
-                add_face(v1, v2, v3)
-                add_face(v0, v1, v3)
-                add_face(v0, v3, v2)
+        # Compute surface triangles — reuse pre-computed result from TetMesh
+        # only when the caller did not override the indices.
+        if mesh is not None and indices is mesh.tet_indices and len(mesh.surface_tri_indices) > 0:
+            surface_tri_indices = mesh.surface_tri_indices
+        else:
+            surface_tri_indices = TetMesh.compute_surface_triangles(indices)
 
         # add surface triangles
         start_tri = len(self.tri_indices)
-        for _k, v in faces.items():
-            self.add_triangle(v[0], v[1], v[2], tri_ke, tri_ka, tri_kd, tri_drag, tri_lift)
+        surf = surface_tri_indices.reshape(-1, 3)
+        for ti, tri in enumerate(surf):
+            tr_custom = {k: arr[ti] for k, arr in tri_custom.items()} if tri_custom else None
+            self.add_triangle(
+                start_vertex + int(tri[0]),
+                start_vertex + int(tri[1]),
+                start_vertex + int(tri[2]),
+                tri_ke,
+                tri_ka,
+                tri_kd,
+                tri_drag,
+                tri_lift,
+                custom_attributes=tr_custom,
+            )
         end_tri = len(self.tri_indices)
 
         if add_surface_mesh_edges:
@@ -7478,7 +8006,7 @@ class ModelBuilder:
                         self.add_edge(o1, o2, v1, v2, None, edge_ke, edge_kd)
 
     # incrementally updates rigid body mass with additional mass and inertia expressed at a local to the body
-    def _update_body_mass(self, i, m, I, p, q):
+    def _update_body_mass(self, i: int, m: float, inertia: Mat33, p: Vec3, q: Quat):
         if i == -1:
             return
 
@@ -7496,7 +8024,7 @@ class ModelBuilder:
 
         new_inertia = transform_inertia(
             self.body_mass[i], self.body_inertia[i], com_offset, wp.quat_identity()
-        ) + transform_inertia(m, I, shape_offset, q)
+        ) + transform_inertia(m, inertia, shape_offset, q)
 
         self.body_mass[i] = new_mass
         self.body_inertia[i] = new_inertia
@@ -7549,6 +8077,23 @@ class ModelBuilder:
                 stacklevel=3,
             )
 
+    def _validate_kinematic_joint_attachment(self, child: int, parent: int) -> None:
+        """Validate that kinematic bodies only attach to the world."""
+        if parent == -1 or not (int(self.body_flags[child]) & int(BodyFlags.KINEMATIC)):
+            return
+
+        child_label = self.body_label[child]
+        parent_label = self.body_label[parent]
+        raise ValueError(
+            f"Body {child} ('{child_label}') is kinematic but is attached to parent body {parent} "
+            f"('{parent_label}'). Only root bodies (whose joint parent is the world) can be kinematic."
+        )
+
+    def _validate_kinematic_articulation_joints(self, joint_indices: Iterable[int]) -> None:
+        """Validate that all kinematic joints in an articulation are rooted at the world."""
+        for joint_idx in joint_indices:
+            self._validate_kinematic_joint_attachment(self.joint_child[joint_idx], self.joint_parent[joint_idx])
+
     def _find_articulation_for_body(self, body_id: int) -> int | None:
         """
         Find which articulation (if any) contains the given body.
@@ -7561,7 +8106,7 @@ class ModelBuilder:
             body_id: The body index to search for.
 
         Returns:
-            int: Articulation index if found, or None if body is not in any articulation.
+            The articulation index if found, or ``None`` if the body is not in any articulation.
 
         Algorithm:
             1. Priority 1: Find articulation where body is a child (most common case)
@@ -7730,6 +8275,7 @@ class ModelBuilder:
             parent_articulation = self._check_sequential_composition(parent_body=parent_body)
 
             if parent_articulation is not None:
+                self._validate_kinematic_articulation_joints(joint_indices)
                 # Mark all new joints as belonging to the parent's articulation
                 for joint_idx in joint_indices:
                     self.joint_articulation[joint_idx] = parent_articulation
@@ -7894,7 +8440,7 @@ class ModelBuilder:
         State.validate_extended_attributes(attributes)
         self._requested_state_attributes.update(attributes)
 
-    def set_coloring(self, particle_color_groups):
+    def set_coloring(self, particle_color_groups: Iterable[Iterable[int] | np.ndarray]) -> None:
         """
         Sets coloring information with user-provided coloring.
 
@@ -7910,11 +8456,11 @@ class ModelBuilder:
 
     def color(
         self,
-        include_bending=False,
-        balance_colors=True,
-        target_max_min_color_ratio=1.1,
-        coloring_algorithm=ColoringAlgorithm.MCS,
-    ):
+        include_bending: bool = False,
+        balance_colors: bool = True,
+        target_max_min_color_ratio: float = 1.1,
+        coloring_algorithm: ColoringAlgorithm = ColoringAlgorithm.MCS,
+    ) -> None:
         """
         Runs coloring algorithm to generate coloring information.
 
@@ -7922,8 +8468,10 @@ class ModelBuilder:
         :attr:`body_color_groups` (for rigid bodies) on the builder, which are
         consumed by :class:`newton.solvers.SolverVBD`.
 
-        Call :meth:`color` (or :meth:`set_coloring`) before :meth:`finalize` when using
-        :class:`newton.solvers.SolverVBD`; :meth:`finalize` does not implicitly color the model.
+        Call :meth:`color` (or :meth:`set_coloring`) before
+        :meth:`finalize <ModelBuilder.finalize>` when using
+        :class:`newton.solvers.SolverVBD`; :meth:`finalize <ModelBuilder.finalize>` does not
+        implicitly color the model.
 
         Args:
             include_bending: Whether to include bending edges in the coloring graph. Set to `True` if your
@@ -7934,11 +8482,14 @@ class ModelBuilder:
             balance_colors: Whether to apply the color balancing algorithm to balance the size of each color
             target_max_min_color_ratio: the color balancing algorithm will stop when the ratio between the largest color and
                 the smallest color reaches this value
-            algorithm: Value should be an enum type of ColoringAlgorithm, otherwise it will raise an error. ColoringAlgorithm.mcs means using the MCS coloring algorithm,
-                while ColoringAlgorithm.ordered_greedy means using the degree-ordered greedy algorithm. The MCS algorithm typically generates 30% to 50% fewer colors
-                compared to the ordered greedy algorithm, while maintaining the same linear complexity. Although MCS has a constant overhead that makes it about twice
-                as slow as the greedy algorithm, it produces significantly better coloring results. We recommend using MCS, especially if coloring is only part of the
-                preprocessing.
+            coloring_algorithm: Coloring algorithm to use. `ColoringAlgorithm.MCS` uses
+                maximum cardinality search (MCS), while `ColoringAlgorithm.GREEDY` uses
+                degree-ordered greedy coloring. The MCS algorithm typically generates 30% to
+                50% fewer colors compared to the ordered greedy algorithm, while maintaining
+                the same linear complexity. Although MCS has a constant overhead that makes
+                it about twice as slow as the greedy algorithm, it produces significantly
+                better coloring results. We recommend using MCS, especially if coloring is
+                only part of preprocessing.
 
         Note:
 
@@ -8155,7 +8706,7 @@ class ModelBuilder:
             UserWarning: If any colliding shape has ``gap < 0``.
 
         Returns:
-            bool: True if no shapes with negative gaps, False otherwise.
+            Whether all colliding shapes have non-negative gaps.
         """
         collision_flags_mask = ShapeFlags.COLLIDE_SHAPES | ShapeFlags.COLLIDE_PARTICLES
         shapes_with_bad_gap = []
@@ -8197,6 +8748,22 @@ class ModelBuilder:
         """
         body_count = self.body_count
         joint_count = self.joint_count
+
+        # Validate per-body flags: each body must be either dynamic or
+        # kinematic. Filter masks such as BodyFlags.ALL are not valid stored
+        # body states.
+        if len(self.body_flags) != body_count:
+            raise ValueError(f"Invalid body_flags length: expected {body_count} entries, got {len(self.body_flags)}.")
+        if body_count > 0:
+            body_flags = np.array(self.body_flags, dtype=np.int32)
+            valid_mask = (body_flags == int(BodyFlags.DYNAMIC)) | (body_flags == int(BodyFlags.KINEMATIC))
+            if not np.all(valid_mask):
+                idx = int(np.where(~valid_mask)[0][0])
+                body_label = self.body_label[idx] if idx < len(self.body_label) else f"body_{idx}"
+                raise ValueError(
+                    f"Invalid body flag for body {idx} ('{body_label}'): got {int(body_flags[idx])}, "
+                    f"but expected exactly one of BodyFlags.DYNAMIC or BodyFlags.KINEMATIC."
+                )
 
         # Validate shape_body references: must be in [-1, body_count-1]
         if self.shape_count > 0:
@@ -8345,7 +8912,7 @@ class ModelBuilder:
                 ("joint_effort_limit", self.joint_effort_limit),
                 ("joint_velocity_limit", self.joint_velocity_limit),
                 ("joint_friction", self.joint_friction),
-                ("joint_act_mode", self.joint_act_mode),
+                ("joint_target_mode", self.joint_target_mode),
             ]
             for name, arr in dof_arrays:
                 if len(arr) != self.joint_dof_count:
@@ -8385,13 +8952,14 @@ class ModelBuilder:
         solvers (e.g., MuJoCo) for correct kinematic computations.
 
         This method is public and opt-in because the check has O(n log n) complexity
-        due to topological sorting. It is skipped by default in finalize().
+        due to topological sorting. It is skipped by default in
+        :meth:`finalize <ModelBuilder.finalize>`.
 
         Warns:
             UserWarning: If joints are not in DFS topological order.
 
         Returns:
-            bool: True if joints are correctly ordered, False otherwise.
+            Whether joints are correctly ordered.
         """
         from ..utils import topological_sort  # noqa: PLC0415
 
@@ -8652,6 +9220,7 @@ class ModelBuilder:
     def finalize(
         self,
         device: Devicelike | None = None,
+        *,
         requires_grad: bool = False,
         skip_all_validations: bool = False,
         skip_validation_worlds: bool = False,
@@ -8681,7 +9250,7 @@ class ModelBuilder:
                 articulations. Default is True (opt-in) because this check has O(n log n) complexity.
 
         Returns:
-            Model: A fully constructed Model object containing all simulation data on the specified device.
+            A fully constructed Model object containing all simulation data on the specified device.
 
         Notes:
             - Performs validation and correction of rigid body inertia and mass properties.
@@ -8772,12 +9341,16 @@ class ModelBuilder:
             # build list of ids for geometry sources (meshes, sdfs)
             geo_sources = []
             finalized_geos = {}  # do not duplicate geometry
+            gaussians = []
             for geo in self.shape_source:
                 geo_hash = hash(geo)  # avoid repeated hash computations
                 if geo:
                     if geo_hash not in finalized_geos:
                         if isinstance(geo, Mesh):
                             finalized_geos[geo_hash] = geo.finalize(device=device)
+                        elif isinstance(geo, Gaussian):
+                            finalized_geos[geo_hash] = len(gaussians)
+                            gaussians.append(geo.finalize(device=device))
                         else:
                             finalized_geos[geo_hash] = geo.finalize()
                     geo_sources.append(finalized_geos[geo_hash])
@@ -8787,6 +9360,8 @@ class ModelBuilder:
 
             m.shape_type = wp.array(self.shape_type, dtype=wp.int32)
             m.shape_source_ptr = wp.array(geo_sources, dtype=wp.uint64)
+            m.gaussians_count = len(gaussians)
+            m.gaussians_data = wp.array(gaussians, dtype=Gaussian.Data)
             m.shape_scale = wp.array(self.shape_scale, dtype=wp.vec3, requires_grad=requires_grad)
             m.shape_is_solid = wp.array(self.shape_is_solid, dtype=wp.bool)
             m.shape_margin = wp.array(self.shape_margin, dtype=wp.float32, requires_grad=requires_grad)
@@ -9044,6 +9619,7 @@ class ModelBuilder:
                             target_voxel_size=sdf_target_voxel_size,
                             max_resolution=effective_max_resolution,
                             bake_scale=bake_scale,
+                            device=device,
                         )
 
                 if cache_key is not None:
@@ -9076,7 +9652,14 @@ class ModelBuilder:
 
             # ---------------------
             # heightfield collision data
-            has_heightfields = any(t == GeoType.HFIELD for t in self.shape_type)
+            hfield_count = sum(1 for t in self.shape_type if t == GeoType.HFIELD)
+            has_heightfields = hfield_count > 0
+            if hfield_count > 1:
+                warnings.warn(
+                    "Heightfield-vs-heightfield collision is not supported; "
+                    "contacts between heightfield pairs will be skipped.",
+                    stacklevel=2,
+                )
             if has_heightfields:
                 from ..utils.heightfield import HeightfieldData, create_empty_heightfield_data  # noqa: PLC0415
 
@@ -9259,6 +9842,7 @@ class ModelBuilder:
             m.body_qd = wp.array(self.body_qd, dtype=wp.spatial_vector, requires_grad=requires_grad)
             m.body_com = wp.array(self.body_com, dtype=wp.vec3, requires_grad=requires_grad)
             m.body_label = self.body_label
+            m.body_flags = wp.array(self.body_flags, dtype=wp.int32)
             m.body_world = wp.array(self.body_world, dtype=wp.int32)
 
             # body colors
@@ -9293,7 +9877,7 @@ class ModelBuilder:
 
             # dynamics properties
             m.joint_armature = wp.array(self.joint_armature, dtype=wp.float32, requires_grad=requires_grad)
-            m.joint_act_mode = wp.array(self.joint_act_mode, dtype=wp.int32)
+            m.joint_target_mode = wp.array(self.joint_target_mode, dtype=wp.int32)
             m.joint_target_ke = wp.array(self.joint_target_ke, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_target_kd = wp.array(self.joint_target_kd, dtype=wp.float32, requires_grad=requires_grad)
             m.joint_target_pos = wp.array(self.joint_target_pos, dtype=wp.float32, requires_grad=requires_grad)
@@ -9404,10 +9988,10 @@ class ModelBuilder:
             # set gravity - create per-world gravity array for multi-world support
             if self.world_gravity:
                 # Use per-world gravity from world_gravity list
-                gravity_vecs = [wp.vec3(*g) for g in self.world_gravity]
+                gravity_vecs = self.world_gravity
             else:
                 # Fallback: use scalar gravity for all worlds
-                gravity_vec = wp.vec3(*(g * self.gravity for g in self.up_vector))
+                gravity_vec = tuple(g * self.gravity for g in self.up_vector)
                 gravity_vecs = [gravity_vec] * self.world_count
             m.gravity = wp.array(
                 gravity_vecs,
@@ -9537,7 +10121,7 @@ class ModelBuilder:
             group_b: Second collision group ID
 
         Returns:
-            bool: True if the groups should collide, False otherwise
+            Whether the groups should collide.
         """
         if group_a == 0 or group_b == 0:
             return False
@@ -9561,7 +10145,7 @@ class ModelBuilder:
             collision_group_b: Collision group of second entity
 
         Returns:
-            bool: True if the entities should collide, False otherwise
+            Whether the entities should collide.
         """
         # Check world indices first
         if world_a != -1 and world_b != -1 and world_a != world_b:
@@ -9584,7 +10168,7 @@ class ModelBuilder:
         to ensure consistency between EXPLICIT mode (precomputed pairs) and NXN/SAP modes.
 
         Args:
-            model (Model): The simulation model to which the contact pairs will be assigned.
+            model: The simulation model to which the contact pairs will be assigned.
 
         Side Effects:
             - Sets `model.shape_contact_pairs` to a wp.array of shape pairs (wp.vec2i).
