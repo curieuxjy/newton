@@ -1,17 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 
 import os
 import unittest
@@ -828,13 +816,12 @@ def test_avbd_particle_ground_penalty_grows(test, device):
     test.assertGreater(soft_count, 0)
 
     dt = 1.0 / 60.0
-    vbd._initialize_rigid_bodies(state_in, contacts, dt, update_rigid_history=True)
-    wp.synchronize_device(device)
+    control = model.control()
+    vbd._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid_history=True)
 
     k_before = float(vbd.body_particle_contact_penalty_k.numpy()[0])
 
-    vbd._solve_rigid_body_iteration(state_in, state_out, contacts, dt)
-    wp.synchronize_device(device)
+    vbd._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
 
     k_after = float(vbd.body_particle_contact_penalty_k.numpy()[0])
     test.assertGreater(k_after, k_before)
