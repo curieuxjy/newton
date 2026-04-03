@@ -217,7 +217,7 @@ class FrankaAllegroGraspEnv:
             single_env_builder.joint_target_kd[i] = self.config.franka_damping
             single_env_builder.joint_effort_limit[i] = self.config.franka_effort_limit
             single_env_builder.joint_armature[i] = self.config.franka_armature
-            single_env_builder.joint_act_mode[i] = int(JointTargetMode.POSITION)
+            single_env_builder.joint_target_mode[i] = int(JointTargetMode.POSITION)
 
         # Initial Franka pose - arm extended forward
         franka_init_q = [0.0, -0.5, 0.0, -2.0, 0.0, 1.5, 0.785]
@@ -279,7 +279,7 @@ class FrankaAllegroGraspEnv:
             single_env_builder.joint_target_kd[i] = self.config.hand_damping
             single_env_builder.joint_effort_limit[i] = self.config.hand_effort_limit
             single_env_builder.joint_armature[i] = self.config.hand_armature
-            single_env_builder.joint_act_mode[i] = int(JointTargetMode.POSITION)
+            single_env_builder.joint_target_mode[i] = int(JointTargetMode.POSITION)
 
         # Initial Allegro pose (slightly open)
         allegro_init_q = [0.0, 0.3, 0.3, 0.3] * 4  # 4 fingers
@@ -399,6 +399,17 @@ class FrankaAllegroGraspEnv:
         self.joint_qd_per_env = self.model.joint_qd.shape[0] // self.num_envs
         self.bodies_per_env = self.model.body_q.shape[0] // self.num_envs
 
+        # DEBUG: print joint_q layout to verify cube free joint offset
+        print(f"[DEBUG] joint_q total: {self.model.joint_q.shape[0]}, per_env: {self.joint_q_per_env}")
+        print(f"[DEBUG] franka_dof: {self.franka_dof_count}, allegro_dof: {self.allegro_dof_count}")
+        print(f"[DEBUG] cube_joint_offset assumption: {self.joint_q_per_env - 7}")
+        jq = self.model.joint_q.numpy()
+        env0_q = jq[:self.joint_q_per_env]
+        print(f"[DEBUG] env0 joint_q last 10: {env0_q[-10:]}")
+        print(f"[DEBUG] env0 joint_q[cube_offset:cube_offset+7]: {env0_q[self.joint_q_per_env - 7:]}")
+        print(f"[DEBUG] cube_spawn_pos config: {self.config.cube_spawn_pos}")
+        print(f"[DEBUG] cube_body_idx: {self.cube_body_idx}, total_robot_bodies: {self.total_robot_bodies}")
+
         # Solver
         # Contact buffer sizes: ~30 contacts per env is sufficient for
         # robot + cube + table scene. Large values cause OOM in collision narrowphase.
@@ -428,11 +439,10 @@ class FrankaAllegroGraspEnv:
         # New API: width/height/num_cameras moved from constructor to create_*_output methods
         self.depth_sensor = SensorTiledCamera(
             model=self.model,
-            config=SensorTiledCamera.Config(
-                default_light=True,
-                colors_per_shape=True,
-            ),
+            config=SensorTiledCamera.RenderConfig(),
         )
+        self.depth_sensor.utils.create_default_light()
+        self.depth_sensor.utils.assign_random_colors_per_shape()
 
         # Compute camera rays (new API: width, height as arguments)
         fov_rad = math.radians(self.config.depth_fov)
@@ -440,10 +450,10 @@ class FrankaAllegroGraspEnv:
             self.config.depth_width, self.config.depth_height, fov_rad
         )
 
-        # Create depth output buffer (new API: width, height, num_cameras as arguments)
-        # Output shape is now (num_worlds, num_cameras, height, width)
+        # Create depth output buffer
+        # Output shape is now (num_worlds, camera_count, height, width)
         self.depth_image = self.depth_sensor.create_depth_image_output(
-            self.config.depth_width, self.config.depth_height, num_cameras=1
+            self.config.depth_width, self.config.depth_height, camera_count=1
         )
 
         # Camera transforms will be updated based on EE pose
@@ -462,7 +472,7 @@ class FrankaAllegroGraspEnv:
                 self.model,
                 sensing_obj_shapes="*link3*",  # Fingertip links (fnmatch pattern)
                 counterpart_shapes="*cube*",   # Cube (fnmatch pattern)
-                include_total=True,
+                measure_total=True,
                 verbose=False,
             )
             self.use_contact_sensor = True

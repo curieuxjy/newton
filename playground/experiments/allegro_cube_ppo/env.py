@@ -219,7 +219,7 @@ class AllegroHandCubeEnv:
             hand_builder.joint_target_ke[i] = self.config.hand_stiffness
             hand_builder.joint_target_kd[i] = self.config.hand_damping
             hand_builder.joint_target_pos[i] = 0.0
-            hand_builder.joint_act_mode[i] = int(JointTargetMode.POSITION)
+            hand_builder.joint_target_mode[i] = int(JointTargetMode.POSITION)
 
         # Actuated revolute joints (indices into joint_q)
         actuated_joint_indices = [2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19]

@@ -128,7 +128,7 @@ class VisualizeExample:
             hand_builder.joint_target_ke[i] = 40.0
             hand_builder.joint_target_kd[i] = 2.0
             hand_builder.joint_target_pos[i] = 0.0
-            hand_builder.joint_act_mode[i] = int(JointTargetMode.POSITION)
+            hand_builder.joint_target_mode[i] = int(JointTargetMode.POSITION)
 
         # Store joint limits
         self.joint_lower = torch.tensor(

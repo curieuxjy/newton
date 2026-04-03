@@ -5,6 +5,161 @@
 
 ---
 
+## 2026-04-01 업데이트
+
+### 커밋 범위
+`8c909e42..56d3aa73` (main branch merge)
+
+### 주요 변경 사항
+
+#### 1. ⚠️ `SensorContact` API 간소화 (#2135)
+**커밋**: `08c2c2f0`
+
+`SensorContact`가 대폭 리팩터링됨. 주요 변경:
+
+- **`net_force` 속성 제거** → `total_force` (1D, 총 접촉력)와 `force_matrix` (2D, 상대방별 접촉력)로 분리
+- **`include_total` 파라미터 deprecated** → `measure_total`로 변경 (하위호환 유지, DeprecationWarning 발생)
+- **`sensing_objs` deprecated** → `sensing_obj_idx` + `sensing_obj_type`으로 대체
+- **`counterparts` deprecated** → `counterpart_indices` + `counterpart_type`으로 대체
+- **`reading_indices` deprecated** → `counterpart_indices` 직접 사용
+
+```python
+# Old
+sensor = SensorContact(model, ..., include_total=True)
+forces = sensor.net_force
+
+# New
+sensor = SensorContact(model, ..., measure_total=True)
+total = sensor.total_force       # shape (n_sensing_objs,), or None
+matrix = sensor.force_matrix     # shape (n_sensing_objs, max_counterparts), or None
+```
+
+**영향받는 playground 파일** (수정 완료 ✅):
+- `franka_allegro_grasp/env.py`: `include_total=True` → `measure_total=True`로 변경
+
+#### 2. ⚠️ `SensorTiledCamera` 대규모 리팩터링 (#2175, #2118, #2102, #2270)
+
+여러 커밋에 걸쳐 리팩터링됨:
+
+**#2175 - RenderContext 분리**:
+- `render_context` 속성이 private (`__render_context`)로 변경
+- 새 `sync_transforms(state)` 메서드 추가 (`update()` 호출 시 자동 호출)
+- **`SensorTiledCamera.Config` deprecated** → `SensorTiledCamera.RenderConfig` 사용 권장
+
+```python
+# Old (deprecated, 경고 발생하지만 동작)
+sensor = SensorTiledCamera(model, config=SensorTiledCamera.Config(default_light=True))
+
+# New
+render_config = SensorTiledCamera.RenderConfig(...)
+sensor = SensorTiledCamera(model, config=render_config)
+```
+
+**#2118 - 성능 개선**:
+- `Config`에 `enable_ambient_lighting`, `enable_particles` 옵션 추가
+
+**#2102 - 텍스처 지원**:
+- `Config`에 `enable_textures: bool = False` 옵션 추가
+- `shape_indices`, `shape_materials` 속성 제거
+
+**#2270 - shape_color 지원**:
+- `model.shape_color` 정보 활용하여 렌더링 색상 설정
+
+**영향받는 playground 파일** (수정 완료 ✅):
+- `franka_allegro_grasp/env.py`: `SensorTiledCamera.Config(...)` → `RenderConfig()` + `utils.*` 호출로 마이그레이션
+
+#### 3. ⚠️ `ModelBuilder.add_shape()` keyword-only 인자 변경 (#2219)
+**커밋**: `92a790e6`
+
+`add_shape()` 및 관련 메서드에 `*` 마커 추가로 keyword-only 인자로 변경됨. 또한 새로운 `color` 파라미터 추가.
+
+```python
+# 새 기능: shape에 색상 지정 가능
+builder.add_shape_box(body, hx=0.5, hy=0.5, hz=0.5, color=(1.0, 0.0, 0.0))
+```
+
+- `Model`과 `ModelBuilder`에 `shape_color` 속성 추가
+- ground plane 기본 색상: `(0.125, 0.125, 0.15)`
+
+**영향받는 playground 파일**: keyword argument로 호출하고 있으므로 **영향 없음** ✅
+
+#### 4. `ModelBuilder.inertia_tolerance` 추가 (#2212)
+**커밋**: `caf54d2a`
+
+관성 행렬 검증 허용 오차를 설정 가능하게 함. 기본값 `1e-6`.
+
+```python
+builder = newton.ModelBuilder()
+builder.inertia_tolerance = 1e-5  # 커스텀 허용 오차
+```
+
+**영향**: playground에 직접 영향 없음
+
+#### 5. `ViewerBase` public export (#2187)
+**커밋**: `cc3d62b3`
+
+`newton.viewer`에서 `ViewerBase` 클래스가 public으로 export됨. 커스텀 뷰어 구현 시 사용 가능.
+
+#### 6. Contact 미분 가능성/설정 가능성 개선 (#2164, #2167)
+- **#2164**: 접촉력 자동미분 호환성 개선 (내부 변경, API 변경 없음)
+- **#2167**: Contact reduction 알고리즘 설정 가능하게 변경
+
+#### 7. 빌드 시스템 변경 (#2251)
+**커밋**: `2bd8ed0c`
+
+빌드 백엔드가 `hatchling` → `uv_build`로 변경. `uv sync` 재실행 필요할 수 있음.
+
+#### 8. 의존성 변경
+- **plyfile → Open3D** (#2100): PLY 파일 로딩이 `open3d`로 변경 (`Gaussian.from_file()`)
+- **pygments 2.20.0** (#2273): ReDoS 취약점 수정
+- **requests 2.33.0** (#2247): 보안 수정
+
+#### 9. 기타 버그 수정
+- `cecf8f06`: World replication order가 terrain grid order와 일치하도록 수정
+- `22a40d7d`: 사전 계산된 shape AABB 이슈 수정
+- `3a7786b7`: Windows ViewerGL VSync 수정
+- `a3c6e338`: FK child-origin velocity transport 수정 (translated joints)
+- `8b8b17ee`: Loop joint coordinate mapping 수정
+- `84673ba8`: Issue #2071 수정
+- `3284a2e3`: Heightfield raw pointer 저장 제거
+
+#### 10. ⚠️ `joint_act_mode` → `joint_target_mode` 속성 이름 변경
+2026-03-11 업데이트의 `ActuatorMode → JointTargetMode` 변경 시 속성 이름도 함께 변경되었으나, 당시 playground 코드 수정에서 누락됨.
+
+```python
+# Old
+builder.joint_act_mode[i] = int(JointTargetMode.POSITION)
+
+# New
+builder.joint_target_mode[i] = int(JointTargetMode.POSITION)
+```
+
+**영향받는 playground 파일** (모두 수정 완료 ✅):
+- `franka_allegro_grasp/env.py`: 2개소
+- `franka_allegro/example_franka_allegro.py`: 1개소
+- `load_allegro_official.py`: 1개소
+- `allegro_cube_ppo/env.py`: 1개소
+- `allegro_cube_ppo/visualize.py`: 1개소
+
+### Playground 영향 요약
+
+| 파일 | 영향 | 상태 |
+|------|------|------|
+| `franka_allegro_grasp/env.py` | `include_total` → `measure_total`, `Config` → `RenderConfig`, `joint_act_mode` → `joint_target_mode` | ✅ 수정 완료 |
+| `franka_allegro/example_franka_allegro.py` | `joint_act_mode` → `joint_target_mode` | ✅ 수정 완료 |
+| `allegro_cube_ppo/env.py` | `joint_act_mode` → `joint_target_mode` | ✅ 수정 완료 |
+| `allegro_cube_ppo/visualize.py` | `joint_act_mode` → `joint_target_mode` | ✅ 수정 완료 |
+| `load_allegro_official.py` | `joint_act_mode` → `joint_target_mode` | ✅ 수정 완료 |
+| `franka_allegro_grasp/visualize.py` | 영향 없음 | ✅ |
+
+### 권장 조치
+1. ~~`franka_allegro_grasp/env.py`: `include_total=True` → `measure_total=True` 변경~~ ✅ 완료
+2. ~~`franka_allegro_grasp/env.py`: `SensorTiledCamera.Config` → `RenderConfig` 마이그레이션~~ ✅ 완료
+3. ~~`joint_act_mode` → `joint_target_mode` 전체 수정~~ ✅ 완료
+4. `uv sync` 재실행 (빌드 백엔드 변경으로 인해)
+
+---
+
 ## 2026-03-11 업데이트
 
 ### 커밋 범위

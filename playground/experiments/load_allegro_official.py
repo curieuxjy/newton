@@ -49,7 +49,7 @@ class Example:
             builder.joint_target_ke[i] = 150.0  # P 게인
             builder.joint_target_kd[i] = 5.0    # D 게인
             builder.joint_target_pos[i] = 0.0   # 목표 위치
-            builder.joint_act_mode[i] = int(JointTargetMode.POSITION)
+            builder.joint_target_mode[i] = int(JointTargetMode.POSITION)
 
         builder.add_ground_plane()
         self.model = builder.finalize()
