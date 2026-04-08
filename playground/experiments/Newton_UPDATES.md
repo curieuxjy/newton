@@ -5,6 +5,162 @@
 
 ---
 
+## 2026-04-07 업데이트
+
+### 커밋 범위
+`56d3aa73..upstream/main` (newton-physics/newton main, 22 commits)
+
+### 주요 변경 사항
+
+#### 1. ⚠️ Warp 배열 어노테이션 문법 변경 (#2282) — 컨벤션 변경
+**커밋**: `402838fb`
+
+`wp.array(dtype=X)` 형태의 파라미터/타입 어노테이션이 bracket 문법으로 마이그레이션됨.
+`AGENTS.md`에도 반영됨:
+
+```python
+# Old (parenthesized form)
+arr: wp.array(dtype=wp.vec3)
+
+# New (bracket form)
+arr: wp.array[wp.vec3]
+arr2d: wp.array2d[float]
+arr_any: wp.array[Any]
+# 1-D는 wp.array1d 가 아니라 wp.array[X] 사용
+```
+
+**영향**: 새로 작성하는 playground 커널/함수 시그니처는 bracket 문법을 사용해야 함.
+기존 코드는 동작은 하지만 점진적으로 전환 권장.
+
+#### 2. ⚠️ `ModelBuilder.add_shape_ellipsoid()` 파라미터 이름 변경 (#2261)
+**커밋**: `33ec7180`
+
+`a, b, c` → `rx, ry, rz`로 변경 (semi-axis 의미 명확화). 구 이름은 keyword로
+여전히 동작하지만 `DeprecationWarning` 발생.
+
+```python
+# Old
+builder.add_shape_ellipsoid(body, a=1.0, b=0.75, c=0.5)
+# New
+builder.add_shape_ellipsoid(body, rx=1.0, ry=0.75, rz=0.5)
+```
+
+**영향받는 playground 파일**: 없음 (grep 결과 사용처 없음).
+
+#### 3. ⚠️ `ModelBuilder.add_shape_gaussian()` 파라미터 순서 변경 (#2261)
+`xform`이 `gaussian`보다 앞으로 이동하여 다른 `add_shape_*` 메서드와 일관성 맞춤.
+`Gaussian`을 두 번째 위치 인자로 전달하는 것은 `DeprecationWarning`과 함께 동작.
+
+```python
+# Recommended
+builder.add_shape_gaussian(body, xform=..., gaussian=g)
+```
+
+**영향받는 playground 파일**: 없음.
+
+#### 4. ⚠️ Body armature deprecated (#2285)
+**커밋**: `9b9fa658`
+
+`ModelBuilder.default_body_armature`, `ModelBuilder.add_link()`/`add_body()`의
+`armature` 인자, USD `newton:armature` 속성이 deprecated. 대신 `inertia`에 직접
+isotropic artificial inertia를 더하는 방식 권장.
+
+```python
+# Old
+builder.add_body(armature=0.01, ...)
+# New: 등가 isotropic inertia를 inertia 행렬에 직접 추가
+```
+
+**영향받는 playground 파일**: 없음. playground는 `builder.joint_armature[i]`
+(joint armature)만 사용하며 이는 영향 없음:
+- `franka_allegro_grasp/env.py:219, 281`
+- `kuka_allegro_lift/env.py:139, 203`
+- `franka_allegro/example_franka_allegro.py:88, 161`
+
+#### 5. ✨ `SensorContact`에 friction(접선력) 분해 추가 (#2233)
+**커밋**: `97a05175`
+
+`SensorContact`가 normal/friction 분해를 지원. 새 속성:
+- `total_force_friction: wp.array[wp.vec3] | None` — 사용 객체별 총 마찰력
+- `force_matrix_friction: wp.array2d[wp.vec3] | None` — 상대방별 마찰력
+
+`measure_total=True`로 생성하면 `total_force`와 함께 `total_force_friction`도 채워지고,
+counterparts를 지정하면 `force_matrix_friction`도 채워짐. `contact_normal` 기준으로
+접선 성분(`force - (force·n)·n`)이 계산됨.
+
+**영향**: `franka_allegro_grasp/env.py`에서 grasping 품질 평가 시 마찰력만 따로
+관찰하고 싶다면 사용 가능 (현재 코드는 영향 없음, 옵트인).
+
+#### 6. ✨ `SensorTiledCamera`: ray-depth → forward-depth 유틸 추가 (#2286)
+**커밋**: `8532e015`
+
+ray-cast depth(카메라 원점에서 hit point까지 거리)를 forward depth(카메라 z축 투영)로
+변환하는 유틸 함수 추가. `franka_allegro_grasp/view_depth.py`에서 NumPy로 변환하던
+부분을 표준 유틸로 교체 가능.
+
+#### 7. ✨ `SensorTiledCamera`가 `model.shape_color` 지원 (#2270)
+**커밋**: `e77b5449`
+
+`assign_random_colors_per_world/per_shape()` 대신 `ModelBuilder.add_shape_*(color=...)`
+또는 `Model.shape_color` 직접 쓰기로 색상 지정. 후자는 deprecated.
+
+#### 8. ✨ Viewer: `set_visible_worlds()` 추가 (#2267)
+**커밋**: `7e036f54`
+
+런타임에 표시할 world subset을 지정할 수 있음. 다환경 학습 시 일부 env만 시각화에 유용.
+
+```python
+viewer.set_visible_worlds([0, 5, 10])  # only render these worlds
+```
+
+#### 9. ✨ Viewer: 비활성 particle 필터링 (#2209)
+**커밋**: `04e4be25`
+
+비활성화된 particle은 viewer에서 자동 제외. MPM 등 입자 기반 sim에 영향.
+
+#### 10. ✨ Examples CLI: `--warp-config KEY=VALUE` 옵션 추가 (#2271)
+**커밋**: `d26dcbde`
+
+`python -m newton.examples ... --warp-config cache_kernels=False` 같이 Warp 설정을
+CLI에서 직접 오버라이드 가능.
+
+#### 11. 🔧 기타 변경
+- **Mesh.create_terrain()/create_heightfield()**: `compute_normals`, `compute_uvs`
+  옵션 추가 (#2261)
+- **`collide_plane_cylinder()`**: 파라미터 `cylinder_center` → `cylinder_pos` rename (#2261)
+- **`SolverBase.update_contacts()`**: 선택적 `state` 파라미터 추가 (Kamino/MuJoCo
+  솔버와 시그니처 정렬) (#2261)
+- **`SolverImplicitMPM.Config`**: `solver`, `warmstart_mode` 등 string 필드를
+  `Literal` 타입으로 강화 (#2261)
+- **GJK Nesterov acceleration 롤백** (#2291): 일부 씬에서 회귀 발생하여 되돌림.
+  접촉 정확도가 미묘하게 달라질 수 있음
+- **VBD self-contact barrier C2 continuity 수정** (#2235)
+- **Per-DOF step-response 다이내믹스 테스트 추가** (#2169)
+- **RJ45 plug-socket insertion 예제 추가** (#1863): SDF contact + latch joint 데모
+- **Allegro hand 예제 모션 진폭 감소** (#2229)
+- **`warp-lang` 1.12.0 → 1.12.1** (#2328): minor bump, `uv sync` 권장
+- **`.. deprecated::` 디렉티브에 버전 번호 추가** (#2309)
+
+### 영향받는 playground 파일 요약
+
+| 파일 | 변경 필요 | 비고 |
+|---|---|---|
+| `franka_allegro_grasp/env.py` | ❌ | joint armature 사용, body armature 아님 |
+| `franka_allegro_grasp/view_depth.py` | (선택) | #2286 forward-depth util로 교체 가능 |
+| `franka_allegro_grasp/visualize.py` | ❌ | 영향 없음 |
+| `franka_allegro/example_franka_allegro.py` | ❌ | joint armature 사용 |
+| `kuka_allegro_lift/*` | ❌ | joint armature 사용 |
+| `allegro_cube_ppo/*` | ❌ | 영향 없음 |
+
+### 액션 아이템
+
+- [ ] `uv sync` 로 `warp-lang 1.12.1` 반영
+- [ ] (선택) 새 코드는 `wp.array[X]` bracket 문법 사용
+- [ ] (선택) `view_depth.py` 를 새 forward-depth util로 마이그레이션
+- [ ] (선택) `franka_allegro_grasp` 학습 시 friction force 관찰 — `total_force_friction` 활용
+
+---
+
 ## 2026-04-01 업데이트
 
 ### 커밋 범위
